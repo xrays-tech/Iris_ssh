@@ -1,0 +1,59 @@
+# SSH Gateway configuration sample — covers every field in propose.md §5.2.
+#
+# The gateway reads this from $SSHGW_CONFIG, the first CLI argument, or
+# /etc/ssh-gateway/config.toml (in that order). All fields shown here are the
+# documented defaults; omitted optional values fall back to these.
+
+[listen]
+addr = "0.0.0.0:2222"
+
+# One entry per host key the gateway offers during KEX. Multiple algorithms are
+# offered simultaneously (multi-key, propose §5.3). `state` is "active" (used to
+# sign) or "passive" (advertised for learning, not primarily signed with).
+[host_keys]
+keys = [
+  { path = "/etc/ssh-gw/host_ed25519", state = "active" },
+  { path = "/etc/ssh-gw/host_rsa", state = "active" },
+]
+
+[relay]
+window_size = "1MB"     # initial channel window, both legs (256KB..8MB)
+max_packet = "32KB"     # max single packet payload (≤65535)
+outbound_guard = true   # per-channel outbound Semaphore fuse (D5)
+env_allowlist = []      # empty = pass env through (M1); non-empty filters names
+
+# Gateway → backend authentication.
+[backend]
+private_key = "/etc/ssh-gw/backend_root_ed25519"   # default key
+# credential_map maps a backend username to its key path (overrides private_key).
+credential_map = { root = "/etc/ssh-gw/backend_root_ed25519" }
+host_key_policy = "pinned"     # "pinned" (prod) | "accept-new" (onboarding)
+
+# Opt-in connection pool (off by default: one backend connection per session).
+[pool]
+enabled = false
+channels_per_conn = 8          # sshd MaxSessions-safe bound (≤8)
+keepalive_interval = "15s"
+keepalive_timeout = "5s"
+keepalive_max_miss = 2
+
+# External control plane (resolve + authorize).
+[control_plane]
+url = "https://cp.internal"
+cache_ttl = "30s"
+timeout = "2s"
+# fail_open = false  # uncomment to serve stale grants when the CP is down
+
+[limits]
+max_sessions = 10000
+max_sessions_per_ip = 20
+auth_timeout = "30s"
+
+[shutdown]
+drain_wait = "60s"
+disconnect_flush = "3s"
+hard_deadline = "30s"
+
+# Read-only observability endpoints: /healthz /readyz /metrics.
+[metrics]
+addr = "127.0.0.1:9090"

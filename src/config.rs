@@ -29,6 +29,7 @@ pub struct GatewayConfig {
     pub control_plane: ControlPlaneConfig,
     pub limits: LimitsConfig,
     pub shutdown: ShutdownConfig,
+    pub metrics: MetricsConfig,
 }
 
 /// One host key file the gateway offers during KEX.
@@ -117,6 +118,12 @@ pub struct ShutdownConfig {
     pub hard_deadline: Duration,
 }
 
+/// Address the read-only `/healthz`, `/readyz` and `/metrics` server binds to.
+#[derive(Debug, Clone)]
+pub struct MetricsConfig {
+    pub addr: std::net::SocketAddr,
+}
+
 // --------------------------------------------------------------------------
 // Raw TOML structures (fields still strings, validated afterwards).
 // --------------------------------------------------------------------------
@@ -135,6 +142,18 @@ struct RawConfig {
     limits: RawLimits,
     #[serde(default)]
     shutdown: RawShutdown,
+    #[serde(default)]
+    metrics: RawMetrics,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMetrics {
+    #[serde(default = "default_metrics_addr")]
+    addr: String,
+}
+
+fn default_metrics_addr() -> String {
+    "127.0.0.1:9090".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +288,14 @@ fn default_hard_deadline() -> String {
     "30s".to_owned()
 }
 
+impl Default for RawMetrics {
+    fn default() -> Self {
+        RawMetrics {
+            addr: default_metrics_addr(),
+        }
+    }
+}
+
 // Manual `Default` impls so an entirely-absent `[pool]` / `[limits]` /
 // `[shutdown]` section yields the documented legal defaults (a derived
 // `Default` would produce empty strings / zeros that then fail validation).
@@ -340,24 +367,26 @@ pub fn parse_bytes(field: &str, value: &str) -> std::result::Result<u32, ConfigE
 pub fn parse_duration(field: &str, value: &str) -> std::result::Result<Duration, ConfigError> {
     let invalid = || ConfigError::Invalid {
         field: field.to_owned(),
-        reason: format!("cannot parse duration {value:?} (expected e.g. \"30s\", \"1500ms\", \"5m\")"),
+        reason: format!(
+            "cannot parse duration {value:?} (expected e.g. \"30s\", \"1500ms\", \"5m\")"
+        ),
     };
 
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
-    let (num_part, unit_multiplier_ms): (String, u64) =
-        if let Some(rest) = lower.strip_suffix("ms") {
-            (rest.to_owned(), 1)
-        } else if let Some(rest) = lower.strip_suffix('s') {
-            (rest.to_owned(), 1000)
-        } else if let Some(rest) = lower.strip_suffix('m') {
-            (rest.to_owned(), 60_000)
-        } else if let Some(rest) = lower.strip_suffix('h') {
-            (rest.to_owned(), 3_600_000)
-        } else {
-            // Bare number = seconds.
-            (lower.clone(), 1000)
-        };
+    let (num_part, unit_multiplier_ms): (String, u64) = if let Some(rest) = lower.strip_suffix("ms")
+    {
+        (rest.to_owned(), 1)
+    } else if let Some(rest) = lower.strip_suffix('s') {
+        (rest.to_owned(), 1000)
+    } else if let Some(rest) = lower.strip_suffix('m') {
+        (rest.to_owned(), 60_000)
+    } else if let Some(rest) = lower.strip_suffix('h') {
+        (rest.to_owned(), 3_600_000)
+    } else {
+        // Bare number = seconds.
+        (lower.clone(), 1000)
+    };
 
     let num_part = num_part.trim();
     let base: u64 = num_part.parse().map_err(|_| invalid())?;
@@ -395,12 +424,11 @@ impl GatewayConfig {
     /// The validation core, expressed purely in terms of [`ConfigError`] so every
     /// rule can be exercised in isolation and reports the offending field.
     fn validate(raw: RawConfig) -> std::result::Result<Self, ConfigError> {
-        let listen_addr = SocketAddr::from_str(raw.listen.addr.trim()).map_err(|_| {
-            ConfigError::Invalid {
+        let listen_addr =
+            SocketAddr::from_str(raw.listen.addr.trim()).map_err(|_| ConfigError::Invalid {
                 field: "listen.addr".into(),
                 reason: format!("not a valid socket address: {:?}", raw.listen.addr),
-            }
-        })?;
+            })?;
 
         if raw.host_keys.keys.is_empty() {
             return Err(ConfigError::Invalid {
@@ -423,7 +451,9 @@ impl GatewayConfig {
                 other => {
                     return Err(ConfigError::Invalid {
                         field: format!("{field}.state"),
-                        reason: format!("unknown state {other:?} (expected \"active\" or \"passive\")"),
+                        reason: format!(
+                            "unknown state {other:?} (expected \"active\" or \"passive\")"
+                        ),
                     });
                 }
             };
@@ -443,7 +473,10 @@ impl GatewayConfig {
                 reason: "must be within [256KB, 8MB]".into(),
             });
         }
-        let max_packet = parse_bytes("relay.max_packet", raw.relay.max_packet.as_deref().unwrap_or("32KB"))?;
+        let max_packet = parse_bytes(
+            "relay.max_packet",
+            raw.relay.max_packet.as_deref().unwrap_or("32KB"),
+        )?;
         if max_packet == 0 || max_packet > 65535 {
             return Err(ConfigError::Invalid {
                 field: "relay.max_packet".into(),
@@ -492,8 +525,14 @@ impl GatewayConfig {
         let pool = PoolConfig {
             enabled: raw.pool.enabled,
             channels_per_conn: raw.pool.channels_per_conn,
-            keepalive_interval: parse_duration("pool.keepalive_interval", &raw.pool.keepalive_interval)?,
-            keepalive_timeout: parse_duration("pool.keepalive_timeout", &raw.pool.keepalive_timeout)?,
+            keepalive_interval: parse_duration(
+                "pool.keepalive_interval",
+                &raw.pool.keepalive_interval,
+            )?,
+            keepalive_timeout: parse_duration(
+                "pool.keepalive_timeout",
+                &raw.pool.keepalive_timeout,
+            )?,
             keepalive_max_miss: raw.pool.keepalive_max_miss,
             idle_ping_threshold: Duration::from_secs(30),
         };
@@ -509,7 +548,10 @@ impl GatewayConfig {
             cache_ttl: parse_duration("control_plane.cache_ttl", &raw.control_plane.cache_ttl)?,
             timeout: parse_duration("control_plane.timeout", &raw.control_plane.timeout)?,
             fail_open: raw.control_plane.fail_open,
-            cache_ttl_jitter: parse_duration("control_plane.cache_ttl_jitter", &raw.control_plane.cache_ttl_jitter)?,
+            cache_ttl_jitter: parse_duration(
+                "control_plane.cache_ttl_jitter",
+                &raw.control_plane.cache_ttl_jitter,
+            )?,
         };
 
         let limits = LimitsConfig {
@@ -526,9 +568,18 @@ impl GatewayConfig {
 
         let shutdown = ShutdownConfig {
             drain_wait: parse_duration("shutdown.drain_wait", &raw.shutdown.drain_wait)?,
-            disconnect_flush: parse_duration("shutdown.disconnect_flush", &raw.shutdown.disconnect_flush)?,
+            disconnect_flush: parse_duration(
+                "shutdown.disconnect_flush",
+                &raw.shutdown.disconnect_flush,
+            )?,
             hard_deadline: parse_duration("shutdown.hard_deadline", &raw.shutdown.hard_deadline)?,
         };
+
+        let metrics_addr =
+            SocketAddr::from_str(raw.metrics.addr.trim()).map_err(|_| ConfigError::Invalid {
+                field: "metrics.addr".into(),
+                reason: format!("not a valid socket address: {:?}", raw.metrics.addr),
+            })?;
 
         Ok(GatewayConfig {
             listen_addr,
@@ -539,6 +590,7 @@ impl GatewayConfig {
             control_plane,
             limits,
             shutdown,
+            metrics: MetricsConfig { addr: metrics_addr },
         })
     }
 }
@@ -621,9 +673,15 @@ mod tests {
     #[test]
     fn duration_parsing_handles_units() {
         assert_eq!(parse_duration("f", "15s").unwrap(), Duration::from_secs(15));
-        assert_eq!(parse_duration("f", "1500ms").unwrap(), Duration::from_millis(1500));
+        assert_eq!(
+            parse_duration("f", "1500ms").unwrap(),
+            Duration::from_millis(1500)
+        );
         assert_eq!(parse_duration("f", "5m").unwrap(), Duration::from_secs(300));
-        assert_eq!(parse_duration("f", "2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(
+            parse_duration("f", "2h").unwrap(),
+            Duration::from_secs(7200)
+        );
         assert_eq!(parse_duration("f", "30").unwrap(), Duration::from_secs(30));
         assert!(parse_duration("f", "nope").is_err());
     }
@@ -677,14 +735,19 @@ mod tests {
         let bad = minimal_toml().replace("window_size = \"1MB\"", "window_size = \"128KB\"");
         let err = GatewayConfig::parse(&bad).unwrap_err();
         match err {
-            Error::Config(ConfigError::Invalid { field, .. }) => assert_eq!(field, "relay.window_size"),
+            Error::Config(ConfigError::Invalid { field, .. }) => {
+                assert_eq!(field, "relay.window_size")
+            }
             _ => panic!("expected relay.window_size error, got {err:?}"),
         }
     }
 
     #[test]
     fn bad_host_key_policy_rejected() {
-        let bad = minimal_toml().replace("host_key_policy = \"pinned\"", "host_key_policy = \"trust\"");
+        let bad = minimal_toml().replace(
+            "host_key_policy = \"pinned\"",
+            "host_key_policy = \"trust\"",
+        );
         assert!(GatewayConfig::parse(&bad).is_err());
     }
 
@@ -708,8 +771,14 @@ mod tests {
             url = "https://cp"
         "#;
         let cfg = GatewayConfig::parse(toml).expect("valid");
-        assert_eq!(cfg.backend.key_for_user("root"), Some(&PathBuf::from("/keys/root_ed")));
-        assert_eq!(cfg.backend.key_for_user("deploy"), Some(&PathBuf::from("/keys/deploy_ed")));
+        assert_eq!(
+            cfg.backend.key_for_user("root"),
+            Some(&PathBuf::from("/keys/root_ed"))
+        );
+        assert_eq!(
+            cfg.backend.key_for_user("deploy"),
+            Some(&PathBuf::from("/keys/deploy_ed"))
+        );
         assert_eq!(cfg.backend.key_for_user("other"), None);
     }
 }

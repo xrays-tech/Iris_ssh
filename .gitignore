@@ -2,6 +2,13 @@
 .slim/deepwork/
 .slim/clonedeps/repos/
 
+# downloaded dependency crate snapshots (reference only)
+/dl/
+
+# OS / editor noise
+.DS_Store
+
 # python bytecode from scripts/mock_control_plane.py
 __pycache__/
 *.pyc
+

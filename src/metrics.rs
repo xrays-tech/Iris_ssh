@@ -7,8 +7,8 @@
 //! keeps the binary lean. A [`Metrics`] handle is cheap to clone (it wraps an
 //! [`Arc`]) and is shared across all legs.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// A [`Metrics`] handle shared by every session and background task.
 #[derive(Clone, Default)]
@@ -65,13 +65,13 @@ struct Histogram {
 impl Histogram {
     /// Buckets suited to sub-millisecond-to-seconds latencies.
     const BOUNDS: &'static [u64] = &[
-        500,     // 0.5ms
-        1_000,   // 1ms
-        5_000,   // 5ms
-        10_000,  // 10ms
-        50_000,  // 50ms
-        100_000, // 100ms
-        500_000, // 500ms
+        500,       // 0.5ms
+        1_000,     // 1ms
+        5_000,     // 5ms
+        10_000,    // 10ms
+        50_000,    // 50ms
+        100_000,   // 100ms
+        500_000,   // 500ms
         1_000_000, // 1s
         5_000_000, // 5s
     ];
@@ -79,7 +79,10 @@ impl Histogram {
     fn new() -> Self {
         Histogram {
             bucket_bounds_us: Histogram::BOUNDS,
-            bucket_counts: Histogram::BOUNDS.iter().map(|_| AtomicU64::new(0)).collect(),
+            bucket_counts: Histogram::BOUNDS
+                .iter()
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             inf_count: AtomicU64::new(0),
             count: AtomicU64::new(0),
             sum_us: AtomicU64::new(0),
@@ -111,12 +114,18 @@ impl Histogram {
             out.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {cumulative}\n"));
         }
         let inf = self.inf_count.load(Ordering::Relaxed);
-        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {}\n", cumulative + inf));
+        out.push_str(&format!(
+            "{name}_bucket{{le=\"+Inf\"}} {}\n",
+            cumulative + inf
+        ));
         out.push_str(&format!(
             "{name}_sum {}\n",
             self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0
         ));
-        out.push_str(&format!("{name}_count {}\n", self.count.load(Ordering::Relaxed)));
+        out.push_str(&format!(
+            "{name}_count {}\n",
+            self.count.load(Ordering::Relaxed)
+        ));
     }
 }
 
@@ -135,29 +144,34 @@ impl Metrics {
     /// Record a session that has fully terminated.
     pub fn session_ended(&self) {
         // Guard against underflow if `session_ended` is ever mis-paired.
-        let _ = self
-            .inner
-            .active_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        let _ =
+            self.inner
+                .active_sessions
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
     }
 
     /// Bytes currently resident in the gateway's relays (best-effort gauge).
     pub fn add_inflight(&self, bytes: usize) {
-        self.inner.relay_inflight_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.inner
+            .relay_inflight_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Release a previously accounted inflight allocation.
     pub fn sub_inflight(&self, bytes: usize) {
-        let _ = self
-            .inner
-            .relay_inflight_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(bytes)));
+        let _ = self.inner.relay_inflight_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(bytes)),
+        );
     }
 
     pub fn auth_offered(&self) {
-        self.inner.auth_offered_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .auth_offered_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn auth_accept(&self) {
@@ -177,50 +191,72 @@ impl Metrics {
     }
 
     pub fn resolve_cache_hit(&self) {
-        self.inner.resolve_cache_hit_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .resolve_cache_hit_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn resolve_cache_miss(&self) {
-        self.inner.resolve_cache_miss_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .resolve_cache_miss_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn resolve_circuit_open(&self) {
-        self.inner.resolve_circuit_open_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .resolve_circuit_open_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn resolve_latency(&self, latency: std::time::Duration) {
-        self.inner.resolve_latency_us.observe_us(latency.as_micros() as u64);
+        self.inner
+            .resolve_latency_us
+            .observe_us(latency.as_micros() as u64);
     }
 
     pub fn window_exhausted(&self) {
-        self.inner.window_exhausted_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .window_exhausted_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn backend_dial_ok(&self) {
-        self.inner.backend_dial_ok_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .backend_dial_ok_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn backend_dial_fail(&self) {
-        self.inner.backend_dial_fail_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .backend_dial_fail_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn backend_dial_latency(&self, latency: std::time::Duration) {
-        self.inner.backend_dial_latency_us.observe_us(latency.as_micros() as u64);
+        self.inner
+            .backend_dial_latency_us
+            .observe_us(latency.as_micros() as u64);
     }
 
     pub fn pool_dead_detected(&self) {
-        self.inner.pool_dead_detected_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pool_dead_detected_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn pool_conn_tracked(&self) {
-        self.inner.pool_tracked_conns.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pool_tracked_conns
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn pool_conn_released(&self) {
-        let _ = self
-            .inner
-            .pool_tracked_conns
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+        let _ =
+            self.inner
+                .pool_tracked_conns
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
     }
 
     /// Record a session termination by SSH disconnect reason code.
@@ -238,34 +274,94 @@ impl Metrics {
     /// Render all metrics into the Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(2048);
-        push_gauge(&mut out, "sshgw_active_sessions", self.inner.active_sessions.load(Ordering::Relaxed));
+        push_gauge(
+            &mut out,
+            "sshgw_active_sessions",
+            self.inner.active_sessions.load(Ordering::Relaxed),
+        );
         push_gauge(
             &mut out,
             "sshgw_relay_inflight_bytes",
             self.inner.relay_inflight_bytes.load(Ordering::Relaxed),
         );
-        push_counter(&mut out, "sshgw_auth_offered_total", &self.inner.auth_offered_total);
-        push_counter(&mut out, "sshgw_auth_accept_total", &self.inner.auth_accept_total);
-        push_counter(&mut out, "sshgw_auth_reject_total", &self.inner.auth_reject_total);
-        push_counter(&mut out, "sshgw_resolve_ok_total", &self.inner.resolve_ok_total);
-        push_counter(&mut out, "sshgw_resolve_err_total", &self.inner.resolve_err_total);
-        push_counter(&mut out, "sshgw_resolve_cache_hit_total", &self.inner.resolve_cache_hit_total);
-        push_counter(&mut out, "sshgw_resolve_cache_miss_total", &self.inner.resolve_cache_miss_total);
-        push_counter(&mut out, "sshgw_resolve_circuit_open_total", &self.inner.resolve_circuit_open_total);
-        push_counter(&mut out, "sshgw_window_exhausted_total", &self.inner.window_exhausted_total);
-        push_counter(&mut out, "sshgw_backend_dial_ok_total", &self.inner.backend_dial_ok_total);
-        push_counter(&mut out, "sshgw_backend_dial_fail_total", &self.inner.backend_dial_fail_total);
-        push_counter(&mut out, "sshgw_pool_dead_detected_total", &self.inner.pool_dead_detected_total);
-        push_gauge(&mut out, "sshgw_pool_tracked_conns", self.inner.pool_tracked_conns.load(Ordering::Relaxed));
+        push_counter(
+            &mut out,
+            "sshgw_auth_offered_total",
+            &self.inner.auth_offered_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_auth_accept_total",
+            &self.inner.auth_accept_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_auth_reject_total",
+            &self.inner.auth_reject_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_resolve_ok_total",
+            &self.inner.resolve_ok_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_resolve_err_total",
+            &self.inner.resolve_err_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_resolve_cache_hit_total",
+            &self.inner.resolve_cache_hit_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_resolve_cache_miss_total",
+            &self.inner.resolve_cache_miss_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_resolve_circuit_open_total",
+            &self.inner.resolve_circuit_open_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_window_exhausted_total",
+            &self.inner.window_exhausted_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_backend_dial_ok_total",
+            &self.inner.backend_dial_ok_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_backend_dial_fail_total",
+            &self.inner.backend_dial_fail_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_pool_dead_detected_total",
+            &self.inner.pool_dead_detected_total,
+        );
+        push_gauge(
+            &mut out,
+            "sshgw_pool_tracked_conns",
+            self.inner.pool_tracked_conns.load(Ordering::Relaxed),
+        );
 
         for (code, counter) in self.inner.disconnect_reason.iter().enumerate().skip(1) {
             let v = counter.load(Ordering::Relaxed);
             if v > 0 {
-                out.push_str(&format!("sshgw_disconnect_reason_total{{reason=\"{code}\"}} {v}\n"));
+                out.push_str(&format!(
+                    "sshgw_disconnect_reason_total{{reason=\"{code}\"}} {v}\n"
+                ));
             }
         }
 
-        self.inner.resolve_latency_us.render("sshgw_resolve_latency_seconds", &mut out);
+        self.inner
+            .resolve_latency_us
+            .render("sshgw_resolve_latency_seconds", &mut out);
         self.inner
             .backend_dial_latency_us
             .render("sshgw_backend_dial_latency_seconds", &mut out);

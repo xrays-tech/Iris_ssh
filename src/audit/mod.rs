@@ -16,14 +16,14 @@
 //! [`AuditRecord`] carries who/when/target/bytes/duration/exit/class as required
 //! by propose.md §5.5.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
 
 use crate::metrics::Metrics;
-use crate::types::{Fingerprint, Grant, SessionId};
+use crate::types::{Grant, SessionId};
 
 /// Coarse category recorded for a relayed channel's work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -262,7 +262,7 @@ pub fn record_to_json(record: &AuditRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Policy, Principal, Target};
+    use crate::types::{Fingerprint, Policy, Principal, Target};
 
     fn test_grant() -> Grant {
         Grant {
@@ -285,7 +285,10 @@ mod tests {
 
     #[test]
     fn classifies_rsync_exec_as_rsync() {
-        assert_eq!(classify_exec("rsync --server -vlogDtpre.iLsfxC . /dst"), CommandClass::Rsync);
+        assert_eq!(
+            classify_exec("rsync --server -vlogDtpre.iLsfxC . /dst"),
+            CommandClass::Rsync
+        );
     }
 
     #[test]
@@ -302,20 +305,35 @@ mod tests {
 
     #[test]
     fn subsystem_sftp_classified_as_sftp() {
-        assert_eq!(CommandInfo::Subsystem("sftp".into()).classify(), CommandClass::Sftp);
+        assert_eq!(
+            CommandInfo::Subsystem("sftp".into()).classify(),
+            CommandClass::Sftp
+        );
         // Non-sftp subsystems are bucketed generic.
-        assert_eq!(CommandInfo::Subsystem("netconf".into()).classify(), CommandClass::Exec);
+        assert_eq!(
+            CommandInfo::Subsystem("netconf".into()).classify(),
+            CommandClass::Exec
+        );
     }
 
     #[test]
     fn interactive_shell_classified_as_interactive() {
-        assert_eq!(CommandInfo::Interactive.classify(), CommandClass::Interactive);
+        assert_eq!(
+            CommandInfo::Interactive.classify(),
+            CommandClass::Interactive
+        );
     }
 
     #[test]
     fn redaction_masks_password_assignments() {
-        assert_eq!(redact_command("mysql --password=sekret -h db"), "mysql --password=*** -h db");
-        assert_eq!(redact_command("echo token=hunter2 now"), "echo token=*** now");
+        assert_eq!(
+            redact_command("mysql --password=sekret -h db"),
+            "mysql --password=*** -h db"
+        );
+        assert_eq!(
+            redact_command("echo token=hunter2 now"),
+            "echo token=*** now"
+        );
         // Non-secret commands are untouched.
         assert_eq!(redact_command("cat /etc/hosts"), "cat /etc/hosts");
     }

@@ -11,7 +11,7 @@ name = "ssh_gateway"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ssh-gateway"
+name = "ssh-gw"
 path = "src/main.rs"
 
 [dependencies]

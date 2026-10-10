@@ -52,7 +52,9 @@ pub fn parse_principal(raw: &str) -> Result<Principal, crate::error::ResolveErro
             ));
         }
     }
-    if let Some(bad) = chars.find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-')) {
+    if let Some(bad) =
+        chars.find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-'))
+    {
         return Err(invalid(
             raw,
             &format!("contains a disallowed character {bad:?}"),
@@ -252,7 +254,10 @@ mod tests {
 
     #[test]
     fn host_key_policy_parse_accepts_known_values() {
-        assert_eq!(HostKeyPolicy::parse("pinned").unwrap(), HostKeyPolicy::Pinned);
+        assert_eq!(
+            HostKeyPolicy::parse("pinned").unwrap(),
+            HostKeyPolicy::Pinned
+        );
         assert_eq!(
             HostKeyPolicy::parse("accept-new").unwrap(),
             HostKeyPolicy::AcceptNew

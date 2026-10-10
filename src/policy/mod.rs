@@ -153,7 +153,7 @@ pub fn tcp_forwarding_allowed(grant: &Grant) -> ForwardDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Fingerprint, Principal, Policy, Target};
+    use crate::types::{Fingerprint, Policy, Principal, Target};
 
     fn grant_with(policy: Policy) -> Grant {
         Grant {

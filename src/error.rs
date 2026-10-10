@@ -72,8 +72,21 @@ pub enum BackendError {
         source: russh::keys::Error,
     },
 
+    #[error("failed to load host private key {path:?}: {source}")]
+    LoadHostKey {
+        path: std::path::PathBuf,
+        #[source]
+        source: russh::keys::Error,
+    },
+
     #[error("backend private key file {path:?} has unsafe permissions {perms:#o}; expected 0o600")]
     UnsafeKeyPermissions {
+        path: std::path::PathBuf,
+        perms: u32,
+    },
+
+    #[error("host private key file {path:?} has unsafe permissions {perms:#o}; expected 0o600")]
+    UnsafeHostKeyPermissions {
         path: std::path::PathBuf,
         perms: u32,
     },
