@@ -18,16 +18,32 @@
 //! ## Memory bound (§3.6)
 //!
 //! The authoritative uplink bound is russh's client-channel window
-//! (`ChannelWriteHalf::data_bytes` blocks when the send window is exhausted —
-//! the "#7 components" of `crate::relay::tests::outbound_window` cover the
-//! case). [`OutboundWindow`] *Calibration-free* storm-drain: it mirrors the
-//! backend's advertised send window and blocks lavishly in the `data` callback
-//! before bytes ever enter the buffer, so gateway memory stays bounded even if
-//! the library's internal behaviour changes.
+//! (`ChannelWriteHalf::data_bytes` blocks when the send window is exhausted).
+//! [`OutboundWindow`] is the defense-in-depth fuse the design mandates
+//! (§3.6 / D5) — it mirrors the backend's advertised send window with a
+//! `tokio::sync::Semaphore` and blocks the `data` callback *before* bytes enter
+//! the pipeline, so gateway memory stays bounded even if the library's internal
+//! buffering behaviour changes. Because a semaphore is a *fair, wake-free-by-
+//! construction* primitive — `add_permits`/`acquire` hand the waiter its permit
+//! atomically rather than relying on a `Notified` that is only registered on
+//! first poll — the "wake-up lost in the lock-release → first-poll window" race
+//! that plagued a hand-rolled `Mutex + Notify` fuse cannot happen here.
+//!
+//! ## Liveness coupling (§3.5 / P0-2)
+//!
+//! The down-pump owns the *only* reader of the backend channel. When it ends
+//! (backend died, `Close`, or the client leg broke) it calls
+//! [`OutboundWindow::close`], which wakes every blocked `acquire` with an error
+//! so the server's serial `data` callback can never wedge the whole session on
+//! a dead backend. On an *abnormal* backend death the pump additionally sends
+//! the client a protocol-level `SSH_MSG_DISCONNECT[BY_APPLICATION]` goodbye
+//! (§3.8 destroy semantics) instead of a silent TCP reset.
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, Semaphore};
 
 use russh::client::Msg as ClientMsg;
 use russh::{ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
@@ -87,69 +103,133 @@ impl ReplyRouter {
     }
 }
 
-use std::collections::VecDeque;
+/// Returned by [`OutboundWindow::acquire`] when the window has been closed —
+/// i.e. the backend connection is gone and no further uplink bytes can flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowClosed;
+
+impl std::fmt::Display for WindowClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("uplink window closed (backend connection lost)")
+    }
+}
+
+impl std::error::Error for WindowClosed {}
+
+/// The permit ceiling an *uncalibrated* window starts with. `u32::MAX` is far
+/// below tokio's `Semaphore::MAX_PERMITS` on 64-bit, and in practice a send is
+/// bounded by the negotiated max packet size, so this never over-reserves.
+const WINDOW_PERMIT_CEILING: u32 = u32::MAX;
+
+/// Description advertised to the client when the backend connection is lost
+/// (propose §3.8 destroy semantics).
+pub const BACKEND_LOST_MESSAGE: &str = "backend connection lost, please retry";
 
 /// Per-channel uplink fuse mirroring the backend send window (§3.6, D5).
 ///
-/// It starts *uncalibrated* (`u32::MAX` permits) so it never blocks before the
-/// backend has told us its real window via the first `WINDOW_ADJUST`; from then
-/// on it mirrors the backend's advertised available window and blocks the
-/// `data` callback when the window is exhausted. Backpressure therefore never
-/// regresses throughput and still guarantees a hard in-gateway ceiling.
+/// It starts *uncalibrated* (`WINDOW_PERMIT_CEILING` permits) so it never blocks
+/// before the backend has told us its real window; from then on it mirrors the
+/// backend's advertised available window and blocks the `data` callback when
+/// exhausted. [`close`](OutboundWindow::close) permanently unblocks and rejects
+/// every waiter.
 pub struct OutboundWindow {
-    available: Mutex<u32>,
-    notify: Notify,
+    /// Available uplink permits, mirroring the backend send window.
+    sem: Semaphore,
+    /// Set once the backend is known-dead; checked before mutating the
+    /// semaphore so a closed fuse never issues further `add`/`forget`.
+    closed: AtomicBool,
 }
 
 impl OutboundWindow {
     /// An uncalibrated window that never blocks until first calibrated.
     pub fn uncalibrated() -> Self {
         OutboundWindow {
-            available: Mutex::new(u32::MAX),
-            notify: Notify::new(),
+            sem: Semaphore::new(WINDOW_PERMIT_CEILING as usize),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Whether a send of `n` bytes would currently exceed the available window.
     pub fn would_exhaust(&self, n: usize) -> bool {
-        let available = self.load();
-        (n as u64) > available as u64
+        (n as u64) > self.sem.available_permits() as u64
     }
 
     /// Block until at least `n` permits are available, then consume them.
-    pub async fn acquire(&self, n: usize) {
-        loop {
-            let notified = {
-                let mut available = self.lock();
-                if (n as u64) <= (*available) as u64 {
-                    *available = available.saturating_sub(n as u32);
-                    return;
+    ///
+    /// Returns [`WindowClosed`] as soon as the window is closed, so a dead
+    /// backend can never leave a caller awaiting forever.
+    pub async fn acquire(&self, n: usize) -> Result<(), WindowClosed> {
+        // Early exit: a closed window rejects immediately (no permit churn).
+        if self.is_closed() {
+            return Err(WindowClosed);
+        }
+        // An empty send needs no budget.
+        if n == 0 {
+            return Ok(());
+        }
+        let wanted = n as u32;
+        match self.sem.acquire_many(wanted).await {
+            // Consume the permits permanently: the window is recalibrated only
+            // by an explicit `note_window`, never by the caller releasing.
+            Ok(permit) => {
+                permit.forget();
+                if self.is_closed() {
+                    // Closed while we were waiting: the permits we just took are
+                    // gone for good, but the caller must not proceed.
+                    return Err(WindowClosed);
                 }
-                self.notify.notified()
-            };
-            notified.await;
+                Ok(())
+            }
+            // The semaphore was closed while we were waiting.
+            Err(_) => Err(WindowClosed),
         }
     }
 
-    /// Apply a backend `WINDOW_ADJUST` carrying the new absolute available
-    /// window (russh reports the absolute size, not a delta).
+    /// Apply a backend `WINDOW_ADJUST`.
+    ///
+    /// russh reports the **absolute** remaining send window — `new_size` is the
+    /// cumulative `recipient_window_size + amount`, less what was just flushed
+    /// (client `encrypted.rs`) — i.e. exactly how many bytes may be sent *now*.
+    /// So the fuse must **set** its free-permit count to that absolute value, not
+    /// apply a delta on top of what this window already handed out. Doing the
+    /// latter silently subtracts every in-flight acquisition from each report and
+    /// drives the free count to zero under sustained load, wedging `data`.
+    ///
+    /// Permits currently held by in-flight `acquire`s are *not* part of
+    /// `available_permits()`, so correcting against that value converges on the
+    /// backend's truth regardless of how much is in flight. Idempotent and
+    /// race-free because the semaphore — not a hand-rolled notify — holds the
+    /// waiters.
     pub fn note_window(&self, new_available: u32) {
-        {
-            let mut available = self.lock();
-            *available = new_available;
+        // A closed fuse must never be replenished.
+        if self.is_closed() {
+            return;
         }
-        self.notify.notify_waiters();
+        let current = self.sem.available_permits() as u64;
+        let target = u64::from(new_available);
+        if target > current {
+            self.sem.add_permits((target - current) as usize);
+        } else if target < current {
+            self.sem.forget_permits((current - target) as usize);
+        }
     }
 
-    fn load(&self) -> u32 {
-        *self.lock()
+    /// Permanently close the window: every pending and future `acquire` returns
+    /// [`WindowClosed`]. Called by the down-pump as soon as the backend channel
+    /// ends, so a dead backend cannot wedge the server's serial `data` callback.
+    pub fn close(&self) {
+        // Ordering matters: flip our own flag first so `note_window` can never
+        // touch the semaphore after it is closed.
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return; // already closed — idempotent
+        }
+        // Wakes every waiter with an `AcquireError`; subsequent acquires fail
+        // fast on the `closed` flag above.
+        self.sem.close();
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, u32> {
-        match self.available.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -242,6 +322,15 @@ impl ChannelRelay {
 /// `up` is the server session handle for the client leg, `router` routes
 /// SUCCESS/FAILURE back to the originating callbacks, `window` is replenished by
 /// `WINDOW_ADJUST`, and `bytes` tallies traffic for the audit record.
+///
+/// **Liveness coupling (P0-2 / P1-3):** this task owns the only reader of the
+/// backend channel, so it is the authority on whether the backend is alive. On
+/// every exit path it calls [`OutboundWindow::close`], which wakes any `data`
+/// callback blocked on an exhausted window. On an *abnormal* exit — the backend
+/// channel ended without a `Close` message, i.e. the connection died rather than
+/// the command finishing — it additionally tells the whole client leg goodbye
+/// with `SSH_MSG_DISCONNECT[BY_APPLICATION]` (§3.8 destroy semantics) and logs
+/// the reason at ERROR, instead of leaving the client staring at a silent close.
 pub async fn pump_backend_to_client(
     mut backend: BackendReader,
     up: russh::server::Handle,
@@ -249,12 +338,18 @@ pub async fn pump_backend_to_client(
     router: ReplyRouter,
     window: std::sync::Arc<OutboundWindow>,
     bytes: std::sync::Arc<ByteCounters>,
+    metrics: Metrics,
 ) {
+    // Distinguishes "backend closed this channel normally" from "the backend
+    // connection went away" (P1-3: reason + DISCONNECT[11]).
+    let mut stop_reason: &'static str = "backend channel closed";
+
     while let Some(msg) = backend.wait().await {
         match msg {
             ChannelMsg::Data { data } => {
                 let n = data.len();
                 if up.data(client_id, data).await.is_err() {
+                    stop_reason = "client leg write failed";
                     break;
                 }
                 bytes.add_down(n);
@@ -262,6 +357,7 @@ pub async fn pump_backend_to_client(
             ChannelMsg::ExtendedData { data, ext } => {
                 let n = data.len();
                 if up.extended_data(client_id, ext, data).await.is_err() {
+                    stop_reason = "client leg write failed";
                     break;
                 }
                 bytes.add_down(n);
@@ -292,6 +388,10 @@ pub async fn pump_backend_to_client(
                 let _ = up.eof(client_id).await;
             }
             ChannelMsg::Close => {
+                // Normal channel teardown (the command finished / the backend
+                // closed its side): no fabricated reason, no session-wide
+                // disconnect (I4).
+                stop_reason = "backend closed channel";
                 let _ = up.close(client_id).await;
                 break;
             }
@@ -300,9 +400,41 @@ pub async fn pump_backend_to_client(
             }
         }
     }
-    // Backend channel ended: close the coupled client channel (§3.5 coupled
-    // close). No fabricated exit status is injected (I4).
+    // `wait()` returning `None` without a preceding `Close` message: the backend
+    // channel stream ended because the *connection* died, not because the
+    // command finished. That is the abnormal case (P1-3).
+    let backend_died = !matches!(
+        stop_reason,
+        "backend closed channel" | "client leg write failed"
+    );
+
+    if backend_died {
+        // Audit trail + metric for the disconnect-reason histogram (§3.8).
+        metrics.backend_lost();
+        metrics.disconnect_reason(11); // SSH_DISCONNECT_BY_APPLICATION
+        tracing::error!(
+            target: "relay",
+            ?client_id,
+            reason = stop_reason,
+            "backend connection lost; disconnecting client leg"
+        );
+        // §3.8 destroy semantics: tell the client *why*, with a protocol-level
+        // goodbye rather than a silent close / TCP reset.
+        let _ = up
+            .disconnect(
+                russh::Disconnect::ByApplication,
+                BACKEND_LOST_MESSAGE.to_owned(),
+                "en".to_owned(),
+            )
+            .await;
+    }
+
+    // Always: close the coupled client channel (§3.5 coupled close) and, above
+    // all, unblock any `data` callback awaiting this window (P0-2). Without the
+    // close, a backend that died mid-send would wedge the server's serial event
+    // loop until the (configurable) inactivity timeout fires.
     let _ = up.close(client_id).await;
+    window.close();
 }
 
 /// Forward an `exec` request (raw command bytes), enqueuing the reply slot
@@ -356,15 +488,24 @@ mod tests {
     async fn uncalibrated_window_never_blocks() {
         let w = OutboundWindow::uncalibrated();
         // An uncalibrated window must not block a large send.
-        w.acquire(1_000_000).await;
+        w.acquire(1_000_000).await.expect("uncalibrated acquire");
         assert!(!w.would_exhaust(10));
     }
 
     #[tokio::test]
-    async fn window_acquire_blocks_until_adjust_then_resumes() {
+    async fn acquire_takes_zero_bytes_without_blocking() {
+        let w = OutboundWindow::uncalibrated();
+        w.note_window(0); // fully exhaust it
+        w.acquire(0)
+            .await
+            .expect("a zero-length send needs no budget");
+    }
+
+    #[tokio::test]
+    async fn window_acquire_blocks_until_replenish_then_resumes() {
         let w = std::sync::Arc::new(OutboundWindow::uncalibrated());
         w.note_window(5);
-        w.acquire(5).await; // drains the window
+        w.acquire(5).await.expect("drain the window");
         assert!(w.would_exhaust(1));
 
         let probe = {
@@ -377,23 +518,145 @@ mod tests {
             "acquire should block on an exhausted window"
         );
 
-        // A WINDOW_ADJUST replenishes and unblocks.
+        // A WINDOW_ADJUST replenishes the window (add-permits) and unblocks the
+        // waiter — with no reliance on a `Notified` being registered in time.
         w.note_window(10);
         tokio::time::timeout(Duration::from_secs(1), probe)
             .await
             .expect("acquire unblocks after window adjust")
-            .expect("task join");
+            .expect("task join")
+            .expect("acquire succeeds once permits arrive");
     }
 
     #[tokio::test]
-    async fn window_note_sets_absolute_not_incremental() {
+    async fn window_note_sets_absolute_remaining_window() {
+        // russh reports the ABSOLUTE remaining send window, so the fuse sets its
+        // free permits to that value — in-flight acquisitions must not be
+        // double-subtracted (that regression wedged `data` under sustained load).
+        let w = OutboundWindow::uncalibrated();
+        w.note_window(2_000_000); // initial window the backend advertised
+        w.acquire(40).await.expect("send 40");
+        // The backend consumed and acked: it now reports 1_500_000 absolute
+        // remaining. The 40 already in flight must NOT be subtracted again.
+        w.note_window(1_500_000);
+        w.acquire(1_499_990)
+            .await
+            .expect("the full remaining window is sendable");
+        // 10 bytes of the reported window remain free.
+        assert!(!w.would_exhaust(10));
+        assert!(w.would_exhaust(11));
+    }
+
+    #[tokio::test]
+    async fn window_note_can_grow_the_free_budget() {
+        let w = OutboundWindow::uncalibrated();
+        w.note_window(1000);
+        w.acquire(900).await.expect("send 900");
+        w.note_window(4000); // backend opened much more window
+        assert!(!w.would_exhaust(4000));
+        w.acquire(4000)
+            .await
+            .expect("the widened window is fully usable");
+    }
+
+    #[tokio::test]
+    async fn repeated_note_window_is_idempotent_not_cumulative() {
         let w = OutboundWindow::uncalibrated();
         w.note_window(100);
-        w.acquire(40).await;
-        // An absolute adjust replaces our accounting with the backend's truth.
-        w.note_window(7);
-        assert!(!w.would_exhaust(7));
-        assert!(w.would_exhaust(8));
+        w.note_window(100); // same absolute report repeated
+        w.note_window(100);
+        assert!(!w.would_exhaust(100), "a repeat must not add permits again");
+        assert!(w.would_exhaust(101));
+    }
+
+    #[tokio::test]
+    async fn window_note_shrink_is_clamped_and_never_panics() {
+        let w = OutboundWindow::uncalibrated();
+        w.note_window(100);
+        w.acquire(90).await.expect("send 90");
+        // Real windows only grow, but a backwards report must clamp rather than
+        // underflow or panic: the free count tracks the reported absolute value.
+        w.note_window(5);
+        assert!(!w.would_exhaust(5), "the reported 5 bytes are all sendable");
+        assert!(w.would_exhaust(6));
+    }
+
+    #[tokio::test]
+    async fn close_unblocks_a_waiting_acquire() {
+        // P0-2 core: a backend that dies while `data()` awaits window must not
+        // freeze the channel. Closing the window must wake the waiter with an
+        // error, deterministically, on the first try.
+        let w = std::sync::Arc::new(OutboundWindow::uncalibrated());
+        w.note_window(4);
+        w.acquire(4).await.expect("drain the window");
+
+        let probe = {
+            let w = w.clone();
+            tokio::spawn(async move { w.acquire(1).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!probe.is_finished(), "acquire must block while exhausted");
+
+        // Backend died → pump closes the window.
+        w.close();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), probe)
+            .await
+            .expect("close must wake the waiter")
+            .expect("task join");
+        assert_eq!(outcome, Err(WindowClosed));
+    }
+
+    #[tokio::test]
+    async fn closed_window_rejects_new_acquires_and_ignores_windows() {
+        let w = OutboundWindow::uncalibrated();
+        w.close();
+        assert_eq!(w.acquire(1).await, Err(WindowClosed));
+        // A late WINDOW_ADJUST must not resurrect a closed window.
+        w.note_window(u32::MAX);
+        assert_eq!(w.acquire(1).await, Err(WindowClosed));
+        // Closing twice is idempotent.
+        w.close();
+        assert!(w.is_closed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_blocked_waiters_are_all_woken_by_incremental_replenish() {
+        // P0-1 stress: this is exactly the race the oracle flagged in the old
+        // hand-rolled fuse. `N` tasks block on an exhausted window; the window is
+        // then fed one permit at a time (each `WINDOW_ADJUST` adds exactly one
+        // permit, so exactly one waiter must be released). If any wakeup were
+        // lost between "lock released" and "first poll", the corresponding task
+        // would hang forever and the timeout would fire. The semaphore hands the
+        // permit to a registered waiter atomically, so it cannot be lost.
+        let w = std::sync::Arc::new(OutboundWindow::uncalibrated());
+        w.note_window(0); // fully exhausted
+
+        let waiters = 50usize;
+        let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(waiters);
+        for _ in 0..waiters {
+            let w = std::sync::Arc::clone(&w);
+            let woken = std::sync::Arc::clone(&woken);
+            tasks.push(tokio::spawn(async move {
+                w.acquire(1).await.expect("window must not close mid-wait");
+                woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        // Let every task reach the blocking `acquire` before we start feeding.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for k in 1..=(waiters as u32) {
+            w.note_window(k); // +1 permit → must wake exactly one waiter
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        for t in tasks {
+            tokio::time::timeout(Duration::from_secs(5), t)
+                .await
+                .expect("a waiter was stranded — the window lost a wakeup")
+                .expect("task join");
+        }
+        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), waiters);
     }
 
     #[tokio::test]

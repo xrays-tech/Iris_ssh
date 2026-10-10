@@ -21,6 +21,7 @@ use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertifi
 use crate::error::{BackendError, Result};
 use crate::metrics::Metrics;
 use crate::policy::HostKeyVerifier;
+use crate::pool::DialCircuitBreaker;
 use crate::types::Grant;
 
 /// Unix file mode bit that must be clear for a private key to be considered
@@ -182,6 +183,10 @@ pub struct BackendDialer {
     client_config: Arc<client::Config>,
     metrics: Metrics,
     dial_timeout: Duration,
+    /// Per-target dial circuit breaker (§3.8): after `threshold` consecutive
+    /// dial failures a target is short-circuited so repeated channel opens don't
+    /// pile onto a dead backend.
+    dial_breaker: DialCircuitBreaker,
 }
 
 impl BackendDialer {
@@ -218,11 +223,30 @@ impl BackendDialer {
             client_config: Arc::new(client_config),
             metrics,
             dial_timeout: config.control_plane.timeout,
+            dial_breaker: DialCircuitBreaker::new(
+                config.pool.circuit_failure_threshold,
+                config.pool.circuit_reset_timeout,
+            ),
         }
     }
 
+    /// The breaker key for a grant's target (one breaker per `host:port`).
+    fn breaker_key(grant: &Grant) -> String {
+        format!("{}:{}", grant.target.host, grant.target.port)
+    }
+
     /// Establish an authenticated backend session for the grant's target.
+    ///
+    /// Fail-fast gate: if the per-target dial breaker is open, this returns
+    /// [`BackendError::CircuitOpen`] without touching the network, so a dead
+    /// backend can't stall every channel open. Every outcome feeds the breaker.
     pub async fn connect(&self, grant: &Grant) -> Result<Handle<BackendClient>> {
+        let key = Self::breaker_key(grant);
+        if !self.dial_breaker.allows(&key) {
+            self.metrics.backend_dial_fail();
+            return Err(BackendError::CircuitOpen { target: key }.into());
+        }
+
         let started = std::time::Instant::now();
         let addr = (grant.target.host.as_str(), grant.target.port);
         let last_rejection: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -234,6 +258,7 @@ impl BackendDialer {
             .await
             .map_err(|_| {
                 self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(&key);
                 BackendError::Dial {
                     addr: format!("{}:{}", grant.target.host, grant.target.port),
                     source: Box::new(crate::error::Error::Invariant(
@@ -243,20 +268,22 @@ impl BackendDialer {
             })?
             .map_err(|e| {
                 self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(&key);
                 self.dial_error(grant, last_rejection, e)
             })?;
 
         // Authenticate with the backend key for the target user.
-        let key = self
+        let key_for_user = self
             .credentials
             .for_user(&grant.target.user)
             .ok_or_else(|| {
                 self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(&key);
                 BackendError::Auth {
                     user: grant.target.user.clone(),
                 }
             })?;
-        let pkwha = PrivateKeyWithHashAlg::new(key, None);
+        let pkwha = PrivateKeyWithHashAlg::new(key_for_user, None);
 
         let mut handle = handle;
         match handle
@@ -266,10 +293,13 @@ impl BackendDialer {
             Ok(AuthResult::Success) => {
                 self.metrics.backend_dial_ok();
                 self.metrics.backend_dial_latency(started.elapsed());
+                // A full handshake succeeded: the target is healthy again.
+                self.dial_breaker.record_success(&key);
                 Ok(handle)
             }
             Ok(_) => {
                 self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(&key);
                 Err(BackendError::Auth {
                     user: grant.target.user.clone(),
                 }
@@ -277,6 +307,7 @@ impl BackendDialer {
             }
             Err(e) => {
                 self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(&key);
                 Err(BackendError::Auth {
                     user: format!("{} ({e})", grant.target.user),
                 }
@@ -401,5 +432,123 @@ mod tests {
             v.verify("SHA256:whatever"),
             HostKeyVerdict::Rejected { .. }
         ));
+    }
+
+    // ---- P1-1: dial circuit-breaker wiring ----
+
+    fn test_grant(host: &str) -> Grant {
+        Grant {
+            principal: crate::types::Principal::parse("alex_host1").unwrap(),
+            fingerprint: crate::types::Fingerprint::new("SHA256:fp"),
+            target: crate::types::Target {
+                host: host.to_owned(),
+                port: 22,
+                user: "root".to_owned(),
+            },
+            policy: crate::types::Policy::default(),
+        }
+    }
+
+    /// Build a dialer whose breaker trips after `fail_threshold` failures with a
+    /// `reset` window, using a throwaway local config.
+    fn dialer_with(fail_threshold: u32, reset: Duration) -> BackendDialer {
+        let assets = std::env::temp_dir().join(format!(
+            "sshgw-dialer-{}-{}",
+            std::process::id(),
+            unique_nonce("d")
+        ));
+        std::fs::create_dir_all(&assets).unwrap();
+        let host = assets.join("host");
+        let backend = assets.join("backend");
+        for p in [&host, &backend] {
+            let mut rng = rand::rng();
+            let key = PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+            let body = key
+                .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                .unwrap();
+            {
+                let f = std::fs::File::create(p).unwrap();
+                let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
+            }
+            std::fs::write(p, body).unwrap();
+        }
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [ {{ path = "{}", state = "active" }} ]
+            [backend]
+            private_key = "{}"
+            host_key_policy = "accept-new"
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [pool]
+            circuit_failure_threshold = {fail_threshold}
+            circuit_reset_timeout = "{}s"
+        "#,
+            host.to_string_lossy(),
+            backend.to_string_lossy(),
+            reset.as_secs(),
+        );
+        let config = crate::config::GatewayConfig::parse(&toml).unwrap();
+        let credentials = Arc::new(CredentialStore::load(&config).unwrap());
+        let verifier = Arc::new(HostKeyVerifier::new(HostKeyPolicy::AcceptNew, Vec::new()));
+        let dialer = BackendDialer::new(&config, credentials, verifier, Metrics::default());
+        drop(std::fs::remove_dir_all(&assets));
+        dialer
+    }
+
+    #[test]
+    fn breaker_key_is_host_and_port() {
+        let g = test_grant("10.1.2.3");
+        assert_eq!(BackendDialer::breaker_key(&g), "10.1.2.3:22");
+    }
+
+    #[test]
+    fn open_breaker_makes_connect_fail_fast_without_network() {
+        // P1-1: once the per-target breaker has tripped, `connect` must fail with
+        // `CircuitOpen` *before* any socket work. A closed/refused port proves we
+        // never dialled (a real dial would return Dial/Timeout, not CircuitOpen).
+        let dialer = dialer_with(2, Duration::from_secs(60));
+        let grant = test_grant("10.1.2.3");
+        dialer
+            .dial_breaker
+            .record_failure(&BackendDialer::breaker_key(&grant));
+        dialer
+            .dial_breaker
+            .record_failure(&BackendDialer::breaker_key(&grant));
+
+        let outcome = futures_now_block_on(dialer.connect(&grant));
+        let err = match outcome {
+            Ok(_) => panic!("connect must not dial a target with an open breaker"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Backend(BackendError::CircuitOpen { .. })
+            ),
+            "expected a fast CircuitOpen, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn breaker_is_per_target_not_global() {
+        let dialer = dialer_with(1, Duration::from_secs(60));
+        let key_a = BackendDialer::breaker_key(&test_grant("10.0.0.1"));
+        let key_b = BackendDialer::breaker_key(&test_grant("10.0.0.2"));
+        dialer.dial_breaker.record_failure(&key_a);
+        assert!(!dialer.dial_breaker.allows(&key_a), "A's breaker is open");
+        assert!(dialer.dial_breaker.allows(&key_b), "B is unaffected by A");
+    }
+
+    /// Minimal blocking bridge for the (non-async) failure-path assertions above.
+    fn futures_now_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
     }
 }

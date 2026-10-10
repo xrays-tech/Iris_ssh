@@ -30,12 +30,19 @@ credential_map = { root = "/etc/ssh-gw/backend_root_ed25519" }
 host_key_policy = "pinned"     # "pinned" (prod) | "accept-new" (onboarding)
 
 # Opt-in connection pool (off by default: one backend connection per session).
+# The dial circuit breaker and per-connection channel cap are active regardless
+# of `enabled` (they guard the per-session dial path); `enabled` toggles the
+# cross-session reuse machinery.
 [pool]
 enabled = false
 channels_per_conn = 8          # sshd MaxSessions-safe bound (≤8)
 keepalive_interval = "15s"
 keepalive_timeout = "5s"
 keepalive_max_miss = 2
+# Dial circuit breaker (§3.8): after this many consecutive dial failures to one
+# `host:port`, further channel opens to it fail fast for the reset window.
+circuit_failure_threshold = 5
+circuit_reset_timeout = "30s"
 
 # External control plane (resolve + authorize).
 [control_plane]
@@ -47,7 +54,18 @@ timeout = "2s"
 [limits]
 max_sessions = 10000
 max_sessions_per_ip = 20
+# Upper bound on the whole authentication phase. Together with
+# `auth_rejection_pad` and max_auth_attempts this bounds how long an
+# unauthenticated peer can occupy a session. "0s" disables the initial-probe
+# back-off (dev/test convenience).
 auth_timeout = "30s"
+# Constant-time padding applied on *each* auth rejection, so a rejected key's
+# latency doesn't leak why it was rejected. Deliberately independent of
+# auth_timeout (originally the two were conflated, stalling every client ~30s).
+auth_rejection_pad = "1s"
+# Idle-session garbage collection; also the effective deadline for a peer that
+# stalls mid-authentication (russh has no dedicated auth-phase timeout knob).
+inactivity_timeout = "600s"
 
 [shutdown]
 drain_wait = "60s"

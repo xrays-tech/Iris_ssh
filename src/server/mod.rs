@@ -235,27 +235,31 @@ pub struct AuthRejectionTiming {
     pub ongoing: Duration,
 }
 
-/// Decouple russh's *initial* none-probe delay from its *ongoing* rejection
-/// delay (defect-A fix).
+/// Decouple russh's auth-timing knobs (defect-A fix, P1-2 hardening).
 ///
 /// russh applies `auth_rejection_time_initial.unwrap_or(auth_rejection_time)`
-/// to the very first "none" probe (`server/encrypted.rs`). Mapping
-/// `limits.auth_timeout` (default 30s) straight into `auth_rejection_time`
-/// without an explicit `_initial` therefore delayed the *first* probe of every
-/// legitimate client by the full 30s before authentication could even begin.
+/// to the very first "none" probe (`server/encrypted.rs`). Historically
+/// `limits.auth_timeout` (default 30s) was mapped straight into
+/// `auth_rejection_time` with no explicit `_initial`, so every legitimate client
+/// stalled on the full 30s before auth could even begin, and each *rejected*
+/// attempt also burned 30s. That conflated two unrelated concerns:
 ///
-/// **Alignment with propose.md §5.2 `limits.auth_timeout`:** `auth_timeout`
-/// stays the dominant auth-phase timing constant — it remains the ongoing
-/// per-rejection padding (the anti-bruteforce rate limit) *and* the ceiling on
-/// the initial delay. The initial none-probe delay is derived as
-/// `min(auth_timeout, 1s)`, mirroring russh's own 1s default, so a legit client
-/// sees no long cold start while an attacker's repeated bad keys are still
-/// throttled to roughly one attempt per `auth_timeout`.
-pub fn auth_rejection_timing(auth_timeout: Duration) -> AuthRejectionTiming {
-    let initial = auth_timeout.min(Duration::from_secs(1));
+/// * **`auth_timeout`** — the auth-phase budget (propose §5.2 `limits.auth_timeout`).
+///   Enforced as the ceiling on the initial probe (and, together with
+///   `max_auth_attempts`, the total time an unauthenticated peer can occupy a
+///   session).
+/// * **`auth_rejection_pad`** — the constant-time padding per rejection
+///   (anti-timing leak / anti-bruteforce), default 1s (russh's own default), not
+///   inherited from `auth_timeout`.
+pub fn auth_rejection_timing(
+    auth_timeout: Duration,
+    rejection_pad: Duration,
+) -> AuthRejectionTiming {
     AuthRejectionTiming {
-        initial,
-        ongoing: auth_timeout,
+        // The initial probe must be fast, but never longer than the budget.
+        initial: auth_timeout.min(rejection_pad),
+        // Ongoing rejections use the dedicated pad — independent of auth_timeout.
+        ongoing: rejection_pad,
     }
 }
 
@@ -323,7 +327,8 @@ impl GatewayContext {
 
         let interceptor: Arc<dyn SubsystemInterceptor> = Arc::new(PassThroughInterceptor);
 
-        let auth_timing = auth_rejection_timing(config.limits.auth_timeout);
+        let auth_timing =
+            auth_rejection_timing(config.limits.auth_timeout, config.limits.auth_rejection_pad);
         let server_config = ServerConfig {
             keys,
             window_size: config.relay.window_size,
@@ -334,11 +339,12 @@ impl GatewayContext {
             methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
             // Decoupled anti-timing paddings (see `auth_rejection_timing`): the
             // initial none-probe must be fast so a legit client isn't stalled by
-            // the full auth_timeout; ongoing rejections keep the anti-bruteforce
-            // padding.
+            // the full auth_timeout; ongoing rejections use the dedicated pad.
             auth_rejection_time: auth_timing.ongoing,
             auth_rejection_time_initial: Some(auth_timing.initial),
-            inactivity_timeout: Some(Duration::from_secs(3600)),
+            // Idle-session GC; also the deadline for a peer that stalls mid-auth
+            // (no dedicated auth-phase knob exists in russh 0.64.1).
+            inactivity_timeout: Some(config.limits.inactivity_timeout),
             ..ServerConfig::default()
         };
 
@@ -724,6 +730,21 @@ impl server::Handler for GatewaySession {
             }
         };
 
+        // Per-connection channel cap (§3.8 / sshd MaxSessions): one backend
+        // connection carries this session's channels, so refuse to open more than
+        // the configured (hard-capped) limit rather than overloading the backend.
+        if !crate::pool::can_open_channel(self.relays.len(), self.ctx.config.pool.channels_per_conn)
+        {
+            tracing::warn!(
+                target: "server",
+                channels = self.relays.len(),
+                limit = self.ctx.config.pool.channels_per_conn,
+                "per-connection channel limit reached; refusing new channel"
+            );
+            reply.reject(ChannelOpenFailure::ResourceShortage).await;
+            return Ok(());
+        }
+
         match self.open_backend_channel().await {
             Ok(Some((backend_read, backend_write))) => {
                 let client_id = channel.id();
@@ -748,6 +769,7 @@ impl server::Handler for GatewaySession {
                     router.clone(),
                     Arc::clone(&window),
                     Arc::clone(&bytes),
+                    self.ctx.metrics.clone(),
                 ));
 
                 let relay = ChannelRelay::new(
@@ -776,17 +798,45 @@ impl server::Handler for GatewaySession {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        let n = data.len();
+        // Snapshot the window handle without holding a borrow of `self.relays`
+        // across the (blocking) acquire below.
+        let window = match self.relays.get(&channel) {
+            Some(r) => {
+                r.note_would_exhaust(n);
+                Arc::clone(&r.window)
+            }
+            None => return Ok(()),
+        };
+
+        if self.ctx.config.relay.outbound_guard {
+            // P0-2: the down-pump closes the window the instant the backend dies,
+            // so this await can never wedge the session's serial event loop on a
+            // dead backend. On close, drop the relay and close the client channel
+            // natively (I4) — no fabricated output or exit code.
+            if let Err(relay::WindowClosed) = window.acquire(n).await {
+                tracing::info!(
+                    target: "server",
+                    %channel,
+                    "uplink window closed (backend gone); dropping relay and closing channel"
+                );
+                self.relays.remove(&channel);
+                if let Some(entry) = &self.entry {
+                    entry.forget_channel(channel);
+                }
+                session.close(channel).map_err(Error::Ssh)?;
+                return Ok(());
+            }
+        }
+
+        // The relay is still present: the serial handler cannot have been
+        // re-entered during our await, and nothing else removes relays.
         let relay = match self.relays.get(&channel) {
             Some(r) => r,
             None => return Ok(()),
         };
-        let n = data.len();
-        relay.note_would_exhaust(n);
-        if self.ctx.config.relay.outbound_guard {
-            relay.window.acquire(n).await;
-        }
         relay.bytes.add_up(n);
         let owned = Bytes::copy_from_slice(data);
         if let Err(e) = relay.backend.data_bytes(owned).await {
@@ -1462,29 +1512,26 @@ mod tests {
 
     #[test]
     fn auth_rejection_timing_decouples_initial_from_ongoing() {
-        // Default schema value (30s): the initial none-probe must NOT inherit the
-        // full 30s — a legitimate client would otherwise stall before auth.
-        let t = auth_rejection_timing(Duration::from_secs(30));
+        // Default schema values: auth_timeout=30s, pad=1s. The initial none-probe
+        // must NOT inherit the full 30s (a legit client would stall before auth),
+        // and a rejected attempt must NOT burn 30s either — the pad governs that.
+        let t = auth_rejection_timing(Duration::from_secs(30), Duration::from_secs(1));
+        assert_eq!(
+            t.initial,
+            Duration::from_secs(1),
+            "initial probe delay is the pad, not the auth_timeout"
+        );
         assert_eq!(
             t.ongoing,
-            Duration::from_secs(30),
-            "ongoing padding preserves anti-bruteforce"
-        );
-        assert!(
-            t.initial <= Duration::from_secs(1),
-            "initial none-probe delay must be small, got {:?}",
-            t.initial
-        );
-        assert_ne!(
-            t.initial,
-            Duration::from_secs(30),
-            "initial must never be the full auth_timeout"
+            Duration::from_secs(1),
+            "ongoing rejection padding is the dedicated pad, not the auth_timeout"
         );
 
-        // A tiny auth_timeout is honoured as the ceiling (never inflated past it).
-        let t = auth_rejection_timing(Duration::from_millis(200));
+        // The auth_timeout still caps the initial delay (never inflated past it).
+        let t = auth_rejection_timing(Duration::from_millis(200), Duration::from_secs(1));
         assert_eq!(t.initial, Duration::from_millis(200));
-        assert_eq!(t.ongoing, Duration::from_millis(200));
+        // The ongoing pad is independent of auth_timeout and stays at 1s.
+        assert_eq!(t.ongoing, Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -1499,9 +1546,16 @@ mod tests {
                 result: Ok(ok_response()),
             }),
         );
-        // Sanity: the mapping under test produced a small initial delay.
-        let server_initial = ctx.server_config.auth_rejection_time_initial;
-        assert_eq!(server_initial, Some(Duration::from_secs(1)));
+        // Sanity: the mapping under test produced a small initial delay and a
+        // small ongoing pad (P1-2), not the full auth_timeout.
+        assert_eq!(
+            ctx.server_config.auth_rejection_time_initial,
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            ctx.server_config.auth_rejection_time,
+            Duration::from_secs(1)
+        );
 
         let mut client = handshake(ctx).await;
         let started = std::time::Instant::now();

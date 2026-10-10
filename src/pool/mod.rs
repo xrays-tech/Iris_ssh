@@ -1,4 +1,5 @@
-//! Backend connection pool (propose.md §3.8, M2) — opt-in, off by default (D9).
+//! Backend connection pool capabilities (propose.md §3.8, M2) — wired into the
+//! per-session dial path, opt-in reuse off by default (D9).
 //!
 //! ## Scope note (russh reality vs. design)
 //!
@@ -8,20 +9,32 @@
 //! an `await` (forbidden by D11). The default mode is therefore **one backend
 //! connection per client session, reused across that session's channels** — which
 //! is exactly what `server`'s `ensure_backend` does and covers the ControlMaster
-//! (scp/rsync) reuse case. This module delivers the pool's *capabilities* as
-//! pure, testable logic and the plumbing for idle reuse within that constraint:
+//! (scp/rsync) reuse case.
 //!
+//! What is **wired into production paths** today:
+//!
+//! * **Dial circuit breaker** — [`DialCircuitBreaker`] gates
+//!   [`crate::backend::BackendDialer::connect`]:
+//!   a target with `pool.circuit_failure_threshold` consecutive dial failures is
+//!   short-circuited for `pool.circuit_reset_timeout`, so channel opens fail fast
+//!   instead of piling onto a dead backend. This is the MS2 "熔断生效" gate for
+//!   the backend dial path (the control-plane path has its own breaker in
+//!   [`crate::resolve`]).
+//! * **Per-connection channel limit** — [`can_open_channel`] guards
+//!   `server::channel_open_session`: a session whose backend connection already
+//!   carries `pool.channels_per_conn` channels (capped at
+//!   [`MAX_CHANNELS_PER_CONN_HARD_LIMIT`], the sshd `MaxSessions`-safe bound)
+//!   fails further opens with `ResourceShortage`.
 //! * **Health / liveness** — the client leg sets `keepalive_interval` +
 //!   `keepalive_max` (see `BackendDialer`), so russh emits
-//!   `keepalive@openssh.com` and closes a dead connection on its own; a caller
-//!   checks `handle.is_closed()` before reuse. [`Liveness`] models the
-//!   consecutive-miss bookkeeping for metrics and for a custom transport.
-//! * **Circuit breaker** — reuse [`crate::resolve::CircuitBreaker`]; this module
-//!   wraps it per-target for dial failures.
-//! * **Per-connection channel limit** — [`can_open_channel`] enforces the sshd
-//!   `MaxSessions`-safe bound (≤ `channels_per_conn`).
-//! * **Idle reuse policy** — [`should_ping_before_reuse`] decides when an idle
-//!   connection must be probed before checkout (§3.8).
+//!   `keepalive@openssh.com` and closes a dead connection on its own;
+//!   [`Liveness`] models the same consecutive-miss bookkeeping for a custom
+//!   transport or richer metrics.
+//!
+//! [`should_ping_before_reuse`] remains a *policy* helper for the idle-reuse
+//! path (§3.8); with cross-session reuse disabled it is exercised by tests
+//! rather than the runtime, and is kept so enabling reuse later needs no new
+//! logic.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

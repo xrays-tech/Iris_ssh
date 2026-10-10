@@ -101,6 +101,11 @@ pub enum BackendError {
         source: Box<Error>,
     },
 
+    /// The per-target dial circuit breaker is open (§3.8): recent dials to this
+    /// target failed, so requests fail fast instead of piling onto a dead backend.
+    #[error("backend dial circuit open for {target}: repeated recent failures")]
+    CircuitOpen { target: String },
+
     #[error("backend authentication as {user:?} failed")]
     Auth { user: String },
 

@@ -88,6 +88,10 @@ pub struct PoolConfig {
     pub keepalive_interval: Duration,
     pub keepalive_timeout: Duration,
     pub keepalive_max_miss: u32,
+    /// Number of consecutive dial failures that trips the per-target breaker.
+    pub circuit_failure_threshold: u32,
+    /// How long an open circuit stays open before a probe is allowed through.
+    pub circuit_reset_timeout: Duration,
     /// Idle connections older than this are pinged before reuse.
     pub idle_ping_threshold: Duration,
 }
@@ -108,7 +112,18 @@ pub struct ControlPlaneConfig {
 pub struct LimitsConfig {
     pub max_sessions: usize,
     pub max_sessions_per_ip: usize,
+    /// Upper bound on the whole authentication phase. Combined with
+    /// `auth_rejection_pad` and russh's `max_auth_attempts` this bounds how long
+    /// an unauthenticated peer can occupy a session. `0s` disables the
+    /// initial-probe back-off (dev/test convenience).
     pub auth_timeout: Duration,
+    /// Constant-time padding applied on each auth rejection (russh
+    /// `auth_rejection_time`), so a rejected key's latency doesn't leak *why* it
+    /// was rejected. Independent of `auth_timeout`: default 1s, not 30s.
+    pub auth_rejection_pad: Duration,
+    /// Idle-connection garbage-collection timeout (russh `inactivity_timeout`).
+    /// Also the effective deadline for a peer that stalls mid-authentication.
+    pub inactivity_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +222,10 @@ struct RawPool {
     keepalive_timeout: String,
     #[serde(default = "default_keepalive_max_miss")]
     keepalive_max_miss: u32,
+    #[serde(default = "default_circuit_failure_threshold")]
+    circuit_failure_threshold: u32,
+    #[serde(default = "default_circuit_reset_timeout")]
+    circuit_reset_timeout: String,
 }
 
 fn default_pool_enabled() -> bool {
@@ -223,6 +242,12 @@ fn default_keepalive_timeout() -> String {
 }
 fn default_keepalive_max_miss() -> u32 {
     2
+}
+fn default_circuit_failure_threshold() -> u32 {
+    5
+}
+fn default_circuit_reset_timeout() -> String {
+    "30s".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +281,10 @@ struct RawLimits {
     max_sessions_per_ip: usize,
     #[serde(default = "default_auth_timeout")]
     auth_timeout: String,
+    #[serde(default = "default_auth_rejection_pad")]
+    auth_rejection_pad: String,
+    #[serde(default = "default_inactivity_timeout")]
+    inactivity_timeout: String,
 }
 
 fn default_max_sessions() -> usize {
@@ -266,6 +295,12 @@ fn default_max_sessions_per_ip() -> usize {
 }
 fn default_auth_timeout() -> String {
     "30s".to_owned()
+}
+fn default_auth_rejection_pad() -> String {
+    "1s".to_owned()
+}
+fn default_inactivity_timeout() -> String {
+    "600s".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +342,8 @@ impl Default for RawPool {
             keepalive_interval: default_keepalive_interval(),
             keepalive_timeout: default_keepalive_timeout(),
             keepalive_max_miss: default_keepalive_max_miss(),
+            circuit_failure_threshold: default_circuit_failure_threshold(),
+            circuit_reset_timeout: default_circuit_reset_timeout(),
         }
     }
 }
@@ -317,6 +354,8 @@ impl Default for RawLimits {
             max_sessions: default_max_sessions(),
             max_sessions_per_ip: default_max_sessions_per_ip(),
             auth_timeout: default_auth_timeout(),
+            auth_rejection_pad: default_auth_rejection_pad(),
+            inactivity_timeout: default_inactivity_timeout(),
         }
     }
 }
@@ -522,6 +561,12 @@ impl GatewayConfig {
                 reason: "must be within [1, 8] (sshd MaxSessions constraint)".into(),
             });
         }
+        if raw.pool.circuit_failure_threshold == 0 {
+            return Err(ConfigError::Invalid {
+                field: "pool.circuit_failure_threshold".into(),
+                reason: "must be >= 1".into(),
+            });
+        }
         let pool = PoolConfig {
             enabled: raw.pool.enabled,
             channels_per_conn: raw.pool.channels_per_conn,
@@ -534,6 +579,11 @@ impl GatewayConfig {
                 &raw.pool.keepalive_timeout,
             )?,
             keepalive_max_miss: raw.pool.keepalive_max_miss,
+            circuit_failure_threshold: raw.pool.circuit_failure_threshold,
+            circuit_reset_timeout: parse_duration(
+                "pool.circuit_reset_timeout",
+                &raw.pool.circuit_reset_timeout,
+            )?,
             idle_ping_threshold: Duration::from_secs(30),
         };
 
@@ -558,6 +608,14 @@ impl GatewayConfig {
             max_sessions: raw.limits.max_sessions,
             max_sessions_per_ip: raw.limits.max_sessions_per_ip,
             auth_timeout: parse_duration("limits.auth_timeout", &raw.limits.auth_timeout)?,
+            auth_rejection_pad: parse_duration(
+                "limits.auth_rejection_pad",
+                &raw.limits.auth_rejection_pad,
+            )?,
+            inactivity_timeout: parse_duration(
+                "limits.inactivity_timeout",
+                &raw.limits.inactivity_timeout,
+            )?,
         };
         if limits.max_sessions == 0 || limits.max_sessions_per_ip == 0 {
             return Err(ConfigError::Invalid {
@@ -656,6 +714,33 @@ mod tests {
         assert_eq!(cfg.shutdown.hard_deadline, Duration::from_secs(30));
         assert_eq!(cfg.limits.auth_timeout, Duration::from_secs(30));
         assert_eq!(cfg.pool.keepalive_interval, Duration::from_secs(15));
+        // P1-2 / P1-1 defaults: the auth rejection pad is deliberately NOT the
+        // auth_timeout, and the dial breaker has its own knobs.
+        assert_eq!(cfg.limits.auth_rejection_pad, Duration::from_secs(1));
+        assert_eq!(cfg.limits.inactivity_timeout, Duration::from_secs(600));
+        assert_eq!(cfg.pool.circuit_failure_threshold, 5);
+        assert_eq!(cfg.pool.circuit_reset_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn auth_rejection_pad_and_inactivity_timeout_are_overridable() {
+        let toml = minimal_toml().replace(
+            "max_sessions_per_ip = 20",
+            "max_sessions_per_ip = 20\n            auth_timeout = \"0s\"\n            auth_rejection_pad = \"250ms\"\n            inactivity_timeout = \"120s\"",
+        );
+        let cfg = GatewayConfig::parse(&toml).expect("valid config");
+        assert_eq!(cfg.limits.auth_timeout, Duration::ZERO);
+        assert_eq!(cfg.limits.auth_rejection_pad, Duration::from_millis(250));
+        assert_eq!(cfg.limits.inactivity_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn zero_circuit_failure_threshold_is_rejected() {
+        let bad = minimal_toml().replace(
+            "channels_per_conn = 8",
+            "channels_per_conn = 8\n            circuit_failure_threshold = 0",
+        );
+        assert!(GatewayConfig::parse(&bad).is_err());
     }
 
     #[test]

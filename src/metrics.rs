@@ -38,6 +38,8 @@ struct MetricsInner {
     window_exhausted_total: AtomicU64,
     backend_dial_ok_total: AtomicU64,
     backend_dial_fail_total: AtomicU64,
+    /// Backend connections lost mid-session (coupled-close / DISCONNECT[11]).
+    backend_lost_total: AtomicU64,
 
     // pool health
     pool_dead_detected_total: AtomicU64,
@@ -232,6 +234,13 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A backend connection died while relays were still attached to it.
+    pub fn backend_lost(&self) {
+        self.inner
+            .backend_lost_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn backend_dial_latency(&self, latency: std::time::Duration) {
         self.inner
             .backend_dial_latency_us
@@ -338,6 +347,11 @@ impl Metrics {
             &mut out,
             "sshgw_backend_dial_fail_total",
             &self.inner.backend_dial_fail_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_backend_lost_total",
+            &self.inner.backend_lost_total,
         );
         push_counter(
             &mut out,
