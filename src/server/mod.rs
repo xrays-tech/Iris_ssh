@@ -222,6 +222,43 @@ impl GatewayServer {
     }
 }
 
+/// The two russh auth-timing knobs, computed once from config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthRejectionTiming {
+    /// Padding sleep after the **initial "none" probe** — the unauthenticated
+    /// method negotiation every SSH client (incl. OpenSSH) issues before real
+    /// auth (russh `Config::auth_rejection_time_initial`).
+    pub initial: Duration,
+    /// Padding sleep after each **subsequent rejection** (bad/denied key, etc.)
+    /// — russh's constant-time anti-timing / anti-bruteforce lever
+    /// (`Config::auth_rejection_time`).
+    pub ongoing: Duration,
+}
+
+/// Decouple russh's *initial* none-probe delay from its *ongoing* rejection
+/// delay (defect-A fix).
+///
+/// russh applies `auth_rejection_time_initial.unwrap_or(auth_rejection_time)`
+/// to the very first "none" probe (`server/encrypted.rs`). Mapping
+/// `limits.auth_timeout` (default 30s) straight into `auth_rejection_time`
+/// without an explicit `_initial` therefore delayed the *first* probe of every
+/// legitimate client by the full 30s before authentication could even begin.
+///
+/// **Alignment with propose.md §5.2 `limits.auth_timeout`:** `auth_timeout`
+/// stays the dominant auth-phase timing constant — it remains the ongoing
+/// per-rejection padding (the anti-bruteforce rate limit) *and* the ceiling on
+/// the initial delay. The initial none-probe delay is derived as
+/// `min(auth_timeout, 1s)`, mirroring russh's own 1s default, so a legit client
+/// sees no long cold start while an attacker's repeated bad keys are still
+/// throttled to roughly one attempt per `auth_timeout`.
+pub fn auth_rejection_timing(auth_timeout: Duration) -> AuthRejectionTiming {
+    let initial = auth_timeout.min(Duration::from_secs(1));
+    AuthRejectionTiming {
+        initial,
+        ongoing: auth_timeout,
+    }
+}
+
 impl GatewayContext {
     /// Build the full shared context from a validated [`GatewayConfig`].
     ///
@@ -286,6 +323,7 @@ impl GatewayContext {
 
         let interceptor: Arc<dyn SubsystemInterceptor> = Arc::new(PassThroughInterceptor);
 
+        let auth_timing = auth_rejection_timing(config.limits.auth_timeout);
         let server_config = ServerConfig {
             keys,
             window_size: config.relay.window_size,
@@ -294,7 +332,12 @@ impl GatewayContext {
             // Only public-key auth is offered; password/none are rejected by the
             // handler regardless.
             methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
-            auth_rejection_time: config.limits.auth_timeout,
+            // Decoupled anti-timing paddings (see `auth_rejection_timing`): the
+            // initial none-probe must be fast so a legit client isn't stalled by
+            // the full auth_timeout; ongoing rejections keep the anti-bruteforce
+            // padding.
+            auth_rejection_time: auth_timing.ongoing,
+            auth_rejection_time_initial: Some(auth_timing.initial),
             inactivity_timeout: Some(Duration::from_secs(3600)),
             ..ServerConfig::default()
         };
@@ -1083,33 +1126,65 @@ mod tests {
         }
     }
 
-    /// Write a fresh key to a 0600 temp file and return its path.
-    fn write_key_file() -> String {
-        let mut rng = rand::rng();
-        let key =
-            russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
-        let body = key
-            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
-            .unwrap();
-        let path = std::env::temp_dir().join(format!(
+    /// RAII guard that deletes the temp key files it created when dropped —
+    /// defect-B: no leaked `sshgw-*` files after `cargo test`. The gateway
+    /// loads every key into memory during `build_with_client`, so deleting the
+    /// files once the context is built is safe.
+    struct TestKeyGuard(Vec<std::path::PathBuf>);
+
+    impl TestKeyGuard {
+        fn new() -> Self {
+            TestKeyGuard(Vec::new())
+        }
+
+        /// Create a 0600 ed25519 key file and register it for cleanup.
+        fn add_key(&mut self) -> String {
+            let path = new_temp_key_path();
+            let mut rng = rand::rng();
+            let key =
+                russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+            let body = key
+                .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                .unwrap();
+            {
+                let f = std::fs::File::create(&path).unwrap();
+                let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
+            }
+            std::fs::write(&path, body).unwrap();
+            self.0.push(path.clone());
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TestKeyGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    fn new_temp_key_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
             "sshgw-ctx-{}-{}.key",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0)
-        ));
-        {
-            let f = std::fs::File::create(&path).unwrap();
-            let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
-        }
-        std::fs::write(&path, body).unwrap();
-        path.to_string_lossy().into_owned()
+        ))
     }
 
-    fn test_ctx(control_plane: Arc<FixControlPlane>) -> Arc<GatewayContext> {
-        let host_key = write_key_file();
-        let backend_key = write_key_file();
+    /// Build a gateway context over freshly-created temp keys (registered in
+    /// `keys` for RAII cleanup). The keys are read into memory during this call,
+    /// so the guard may safely delete the files immediately afterwards.
+    fn build_test_ctx(
+        keys: &mut TestKeyGuard,
+        auth_timeout: &str,
+        control_plane: Arc<FixControlPlane>,
+    ) -> Arc<GatewayContext> {
+        let host_key = keys.add_key();
+        let backend_key = keys.add_key();
         let toml = format!(
             r#"
             [listen]
@@ -1122,11 +1197,28 @@ mod tests {
             [control_plane]
             url = "http://127.0.0.1:1"
             [limits]
-            auth_timeout = "0s"
+            auth_timeout = "{auth_timeout}"
         "#
         );
         let config = GatewayConfig::parse(&toml).unwrap();
         GatewayContext::build_with_client(config, control_plane).unwrap()
+    }
+
+    /// Default test context (fast `auth_timeout = "0s"`) with leak-free keys.
+    fn test_ctx(control_plane: Arc<FixControlPlane>) -> Arc<GatewayContext> {
+        let mut keys = TestKeyGuard::new();
+        build_test_ctx(&mut keys, "0s", control_plane)
+        // `keys` drops here — the key files are already loaded into memory.
+    }
+
+    /// A test context with an explicit `auth_timeout` (for the defect-A timing
+    /// regression test, which uses the schema default of 30s).
+    fn test_ctx_with_auth_timeout(
+        auth_timeout: &str,
+        control_plane: Arc<FixControlPlane>,
+    ) -> Arc<GatewayContext> {
+        let mut keys = TestKeyGuard::new();
+        build_test_ctx(&mut keys, auth_timeout, control_plane)
     }
 
     fn random_client_key() -> russh::keys::PrivateKey {
@@ -1363,6 +1455,69 @@ mod tests {
         assert!(
             matches!(result, Ok(russh::client::AuthResult::Failure { .. })),
             "unauthorized principal must not authenticate, got {result:?}"
+        );
+    }
+
+    // ---- defect-A: auth-timeout / rejection-delay decoupling ----
+
+    #[test]
+    fn auth_rejection_timing_decouples_initial_from_ongoing() {
+        // Default schema value (30s): the initial none-probe must NOT inherit the
+        // full 30s — a legitimate client would otherwise stall before auth.
+        let t = auth_rejection_timing(Duration::from_secs(30));
+        assert_eq!(
+            t.ongoing,
+            Duration::from_secs(30),
+            "ongoing padding preserves anti-bruteforce"
+        );
+        assert!(
+            t.initial <= Duration::from_secs(1),
+            "initial none-probe delay must be small, got {:?}",
+            t.initial
+        );
+        assert_ne!(
+            t.initial,
+            Duration::from_secs(30),
+            "initial must never be the full auth_timeout"
+        );
+
+        // A tiny auth_timeout is honoured as the ceiling (never inflated past it).
+        let t = auth_rejection_timing(Duration::from_millis(200));
+        assert_eq!(t.initial, Duration::from_millis(200));
+        assert_eq!(t.ongoing, Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn default_auth_timeout_has_no_cold_start_on_the_none_probe() {
+        // Regression test for defect A: with the schema default auth_timeout of
+        // 30s, a *realistic* authentication flow — the initial "none" probe every
+        // SSH client sends, followed by a real public-key auth — must complete in
+        // well under 3s, not ~30s.
+        let ctx = test_ctx_with_auth_timeout(
+            "30s",
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        );
+        // Sanity: the mapping under test produced a small initial delay.
+        let server_initial = ctx.server_config.auth_rejection_time_initial;
+        assert_eq!(server_initial, Some(Duration::from_secs(1)));
+
+        let mut client = handshake(ctx).await;
+        let started = std::time::Instant::now();
+
+        // 1) The initial "none" probe (OpenSSH always sends this first).
+        let _ = client.authenticate_none("alex_host1").await;
+        // 2) Then the real public-key authentication, which must succeed.
+        let key = random_client_key();
+        let pkwha = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None);
+        let auth = client.authenticate_publickey("alex_host1", pkwha).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(auth.unwrap(), russh::client::AuthResult::Success);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "auth took {elapsed:?}: the initial none-probe is being padded by the full auth_timeout (defect A)"
         );
     }
 }

@@ -312,7 +312,24 @@ mod tests {
     use crate::types::HostKeyPolicy;
     use std::io::Write;
 
-    fn write_temp_key(perms: u32, content: &str) -> std::path::PathBuf {
+    /// A temp key file that deletes itself on drop (defect-B: no leaked
+    /// `sshgw-test-key-*` files after `cargo test`).
+    struct TempKeyPath(std::path::PathBuf);
+
+    impl std::ops::Deref for TempKeyPath {
+        type Target = std::path::PathBuf;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TempKeyPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write_temp_key(perms: u32, content: &str) -> TempKeyPath {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "sshgw-test-key-{}-{}",
@@ -326,7 +343,7 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f.sync_all().unwrap();
-        path
+        TempKeyPath(path)
     }
 
     fn unique_nonce(seed: &str) -> u64 {
@@ -342,8 +359,8 @@ mod tests {
     fn rejects_key_with_group_or_other_permissions() {
         // A syntactically valid but world-readable key must be refused.
         let content = format!("nonsense-{}-perms-test\n", unique_nonce("x"));
-        let path = write_temp_key(0o644, &content);
-        let err = load_private_key_checked(&path, false).unwrap_err();
+        let temp = write_temp_key(0o644, &content);
+        let err = load_private_key_checked(&temp, false).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -351,7 +368,6 @@ mod tests {
             ),
             "expected unsafe-permissions rejection, got {err:?}"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -362,10 +378,9 @@ mod tests {
         let openssh = key
             .to_openssh(russh::keys::ssh_key::LineEnding::LF)
             .expect("encode");
-        let path = write_temp_key(0o600, &openssh);
-        let loaded = load_private_key_checked(&path, false).expect("0600 key loads");
+        let temp = write_temp_key(0o600, &openssh);
+        let loaded = load_private_key_checked(&temp, false).expect("0600 key loads");
         assert_eq!(loaded.algorithm(), key.algorithm());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
