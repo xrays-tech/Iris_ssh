@@ -77,6 +77,7 @@ SSHD_LOG="$WORK_DIR/sshd.log"
 SSHD_PIDFILE="$WORK_DIR/sshd.pid"
 CP_RULES="$WORK_DIR/cp_rules.json"
 CP_LOG="$WORK_DIR/control_plane.log"
+CP_ACCESS_LOG="$WORK_DIR/cp_access.log"
 CP_PIDFILE="$WORK_DIR/cp.pid"
 GW_CONFIG="$WORK_DIR/gateway.toml"
 GW_LOG="$WORK_DIR/gateway.log"
@@ -93,6 +94,10 @@ REMOTE_MODE=0
 SSHD_UP=0
 GW_PORT="$(alloc_port)"
 CP_PORT="$(alloc_port)"
+# The gateway serves /healthz, /readyz and /metrics on [metrics] addr. Its
+# built-in default (127.0.0.1:9090) collides with unrelated host daemons on this
+# machine (e.g. ClashX on 9090), so we always allocate a free port and pin it.
+METRICS_PORT="$(alloc_port)"
 SSHD_PORT=""
 
 if [ -n "${SSH_GW_BACKEND_TARGET:-}" ]; then
@@ -171,19 +176,30 @@ host_key_policy = "accept-new"
 enabled = false
 
 [control_plane]
-url = "http://${CP_ADDR}:${CP_PORT}"
+# The gateway POSTs this URL verbatim (no path is appended — src/resolve/mod.rs
+# calls client.post(&self.url)), so it must be the full /api/v1/resolve endpoint.
+url = "http://${CP_ADDR}:${CP_PORT}/api/v1/resolve"
 cache_ttl = "30s"
 timeout = "2s"
 
 [limits]
 max_sessions = 10000
 max_sessions_per_ip = 20
-auth_timeout = "30s"
+# src maps limits.auth_timeout -> russh ServerConfig::auth_rejection_time
+# (src/server/mod.rs), i.e. the brute-force delay before an auth FAILURE is sent.
+# russh also keys the initial `none`-probe delay to auth_rejection_time_initial,
+# which the gateway leaves None (-> falls back to auth_rejection_time). With the
+# 30s default every connect stalls ~30s before auth even begins, so tests pin 0s:
+# no brute-force damping, fast fail — the suite never needs it.
+auth_timeout = "0s"
 
 [shutdown]
 drain_wait = "2s"
 disconnect_flush = "3s"
 hard_deadline = "30s"
+
+[metrics]
+addr = "${GW_ADDR}:${METRICS_PORT}"
 EOF
 }
 
@@ -207,6 +223,7 @@ export IT_WORK_DIR='${WORK_DIR}'
 export IT_ASSET_DIR='${ASSET_DIR}'
 export GW_ADDR='${GW_ADDR}'
 export GW_PORT='${GW_PORT}'
+export GW_METRICS_PORT='${METRICS_PORT}'
 export GW_PID='${GW_PID}'
 export GATEWAY_UP='${GATEWAY_UP}'
 export SSHD_ADDR='${SSHD_ADDR}'
@@ -273,6 +290,7 @@ fi
 # ---------------------------------------------------------------------------
 python3 "$SCRIPT_DIR/mock_control_plane.py" \
   --port "$CP_PORT" --rules "$CP_RULES" --pidfile "$CP_PIDFILE" \
+  --access-log "$CP_ACCESS_LOG" \
   >"$CP_LOG" 2>&1 &
 CP_PID=$!
 if wait_http_ok "http://${CP_ADDR}:${CP_PORT}/healthz" 20; then
@@ -286,7 +304,13 @@ fi
 # ---------------------------------------------------------------------------
 # Start gateway (skipped in selftest mode / when binary missing)
 # ---------------------------------------------------------------------------
-GW_BIN="${SSH_GW_BIN:-$REPO_ROOT/target/debug/ssh-gw}"
+# Resolve default gateway binary, honouring a global CARGO_TARGET_DIR so the
+# harness finds the binary where this environment's cargo actually put it.
+DEFAULT_BIN="$REPO_ROOT/target/debug/ssh-gw"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  DEFAULT_BIN="${CARGO_TARGET_DIR%/}/debug/ssh-gw"
+fi
+GW_BIN="${SSH_GW_BIN:-$DEFAULT_BIN}"
 if [ "$SELFTEST" = "0" ]; then
   if [ ! -x "$GW_BIN" ]; then
     # Only auto-build for the default binary path and when the operator did not
@@ -305,9 +329,13 @@ if [ "$SELFTEST" = "0" ]; then
     "$GW_BIN" --config "$GW_CONFIG" >"$GW_LOG" 2>&1 &
     GW_PID=$!
     sleep 0.3
-    if pid_alive "$GW_PID" && wait_tcp_open "$GW_ADDR" "$GW_PORT" 20; then
+    # Readiness = SSH listener open AND the observability /healthz answering.
+    # The healthz probe doubles as an early tripwire for a metrics bind failure.
+    if pid_alive "$GW_PID" \
+       && wait_tcp_open "$GW_ADDR" "$GW_PORT" 20 \
+       && wait_http_ok "http://${GW_ADDR}:${METRICS_PORT}/healthz" 20; then
       GATEWAY_UP=1
-      log "gateway up on ${GW_ADDR}:${GW_PORT} (pid $GW_PID)"
+      log "gateway up on ${GW_ADDR}:${GW_PORT} (healthz :${METRICS_PORT}, pid $GW_PID)"
     else
       tail_log "$GW_LOG" 40
       log_err "gateway exited at startup or did not listen — gateway cases BLOCKED"
@@ -319,7 +347,12 @@ if [ "$SELFTEST" = "0" ]; then
 fi
 
 write_run_env
-export IT_WORK_DIR IT_ASSET_DIR GW_ADDR GW_PORT GW_PID GATEWAY_UP
+# Export the case-visible contract. IT_WORK_DIR/IT_ASSET_DIR are the names cases
+# consume; the orchestrator holds them as WORK_DIR/ASSET_DIR, so map explicitly
+# (`export IT_WORK_DIR` alone would export an unset name).
+export IT_WORK_DIR="$WORK_DIR"
+export IT_ASSET_DIR="$ASSET_DIR"
+export GW_ADDR GW_PORT GW_METRICS_PORT GW_PID GATEWAY_UP
 export SSHD_ADDR SSHD_PORT SSHD_UP CP_ADDR CP_PORT
 export USER_KEY="$ASSET_DIR/user_ed25519" PRINCIPAL DENIED_PRINCIPAL NOTFOUND_PRINCIPAL
 export BACKEND_HOST BACKEND_PORT BACKEND_USER

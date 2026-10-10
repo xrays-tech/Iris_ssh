@@ -123,8 +123,8 @@ rss_kb() {
 tail_log() {
   local f="$1" n="${2:-40}"
   if [ -f "$f" ]; then
-    printf '----- tail -n %s %s -----\n' "$n" "$f" >&2
+    printf '%s\n' "----- tail -n $n $f -----" >&2
     tail -n "$n" "$f" >&2 || true
-    printf '----- end %s -----\n' "$f" >&2
+    printf '%s\n' "----- end $f -----" >&2
   fi
 }

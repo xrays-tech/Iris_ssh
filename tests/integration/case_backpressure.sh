@@ -31,8 +31,12 @@ rm -f "$stop_flag" "$sample_file"
 ) &
 sampler_pid=$!
 
-# --- Slow backend reader (no quote chars so it survives verbatim over ssh). ---
-read -r -d '' READER <<'PY' || true
+# --- Slow backend reader. The reader is Python, but ssh hands the command to the
+# backend user's login shell (zsh here), which would choke on raw Python source.
+# We base64-encode it and invoke `python3 -c` via command substitution on the
+# remote, so the source survives zsh/sh quoting untouched AND stdin stays the
+# `yes` data stream. (/usr/bin/python3 is on the ssh command PATH.)
+read -r -d '' READER_SRC <<'PY' || true
 import os, time
 buf = 65536
 target = 40 * 1024 * 1024
@@ -48,11 +52,18 @@ while True:
     if expect > elapsed:
         time.sleep(min(expect - elapsed, 0.05))
 PY
+READER_B64="$(printf '%s' "$READER_SRC" | base64 | tr -d '\n')"
+REMOTE_READER='python3 -c "$(printf %s '"$READER_B64"' | base64 -d)"'
 
 bp_out="$IT_WORK_DIR/bp.out"
 rc=0
-yes | head -c "$vol" | run_with_timeout 180 \
-  ssh "${SSH_OPTS[@]}" "$TARGET" "$READER" >"$bp_out" 2>&1 || rc=$?
+# Producer: head -c N /dev/zero emits exactly N bytes then EOFs and exits 0.
+# (Using `yes | head` would make `yes` die on SIGPIPE=141 once head closes,
+# which pipefail then surfaces as the pipeline status even though the stream
+# succeeded. /dev/zero is not a process, so there is no SIGPIPE noise and rc
+# reflects the relayed command's true exit.)
+head -c "$vol" /dev/zero | run_with_timeout 180 \
+  ssh "${SSH_OPTS[@]}" "$TARGET" "$REMOTE_READER" >"$bp_out" 2>&1 || rc=$?
 
 touch "$stop_flag"
 wait "$sampler_pid" 2>/dev/null || true
@@ -61,6 +72,8 @@ wait "$sampler_pid" 2>/dev/null || true
 # correctly and actually drained the upstream, exercising back-pressure).
 assert_not_contains "$(cat "$bp_out" 2>/dev/null)" "Traceback" "backend reader clean"
 assert_not_contains "$(cat "$bp_out" 2>/dev/null)" "command not found" "reader present"
+assert_not_contains "$(cat "$bp_out" 2>/dev/null)" "parse error" "reader not shell-mangled"
+assert_not_contains "$(cat "$bp_out" 2>/dev/null)" "No such file" "reader interpreter present"
 # rc==0 means the stream completed cleanly through the gateway.
 assert_eq "$rc" "0" "backpressure stream completed (rc)"
 

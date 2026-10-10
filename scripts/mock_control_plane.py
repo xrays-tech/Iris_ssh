@@ -44,9 +44,10 @@ from typing import Any, Dict, List, Optional
 
 
 class State:
-    def __init__(self, rules_path: str) -> None:
+    def __init__(self, rules_path: str, access_log: str = "") -> None:
         self.lock = threading.Lock()
         self.requests: List[Dict[str, Any]] = []
+        self.access_log = access_log
         self.rules: Dict[str, Dict[str, Any]] = {
             "resolve": {},
             "default": {"status": 404, "error": "not found"},
@@ -66,6 +67,13 @@ class State:
     def record(self, entry: Dict[str, Any]) -> None:
         with self.lock:
             self.requests.append(entry)
+        if self.access_log:
+            # best-effort on-disk trace so requests survive CP restarts for debug
+            try:
+                with open(self.access_log, "a") as fh:
+                    fh.write(json.dumps(entry) + "\n")
+            except OSError:
+                pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -130,9 +138,10 @@ def main() -> None:
     ap.add_argument("--rules", required=True, help="path to rules JSON")
     ap.add_argument("--pidfile", default="")
     ap.add_argument("--bind", default="127.0.0.1")
+    ap.add_argument("--access-log", default="", help="append each request as a JSON line")
     args = ap.parse_args()
 
-    state = State(args.rules)
+    state = State(args.rules, args.access_log)
     if args.pidfile:
         with open(args.pidfile, "w") as fh:
             fh.write(str(os.getpid()))
