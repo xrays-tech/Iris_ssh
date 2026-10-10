@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Programmable mock control plane for the ssh-gateway black-box suite.
+
+Contract (propose.md §3.1 / task spec):
+    POST /api/v1/resolve
+        request  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA256:.."}
+        200      {"target":{"host","port","user"},"policy":{...}}
+        403 / 404 / 429 / 500 / 503  {"error":"..."}
+
+The response for each principal is fully driven by a JSON *rules* file so the
+orchestrator (which knows dynamically-allocated backend ports) can bake the real
+target in before starting the server:
+
+    {
+      "resolve": {
+        "<principal>": {
+            "status": 200,
+            "target": {"host":"127.0.0.1","port":22222,"user":"alex"},
+            "policy": {"agent_forwarding":false,"tcp_forwarding":false,
+                       "recording":false,"ttl":60},
+            "delay_ms": 0            # optional: simulate control-plane latency
+        },
+        "<denied>": {"status":403,"error":"principal not authorized"}
+      },
+      "default": {"status":404,"error":"principal not found"}
+    }
+
+Endpoints:
+    GET  /healthz   -> {"ok":true}            (readiness probe)
+    GET  /__log     -> JSON array of requests seen (debugging only)
+    POST /api/v1/resolve
+
+Self-contained: stdlib only, graceful SIGTERM, binds a configurable port.
+"""
+import argparse
+import json
+import os
+import signal
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, List, Optional
+
+
+class State:
+    def __init__(self, rules_path: str) -> None:
+        self.lock = threading.Lock()
+        self.requests: List[Dict[str, Any]] = []
+        self.rules: Dict[str, Dict[str, Any]] = {
+            "resolve": {},
+            "default": {"status": 404, "error": "not found"},
+        }
+        if rules_path and os.path.exists(rules_path):
+            with open(rules_path) as fh:
+                loaded = json.load(fh)
+            self.rules["resolve"] = loaded.get("resolve", {})
+            self.rules["default"] = loaded.get(
+                "default", {"status": 404, "error": "not found"}
+            )
+            # tolerate a flat {principal: rule, ...} dialect too (defensive).
+            for key, value in loaded.items():
+                if key not in ("resolve", "default"):
+                    self.rules["resolve"][key] = value
+
+    def record(self, entry: Dict[str, Any]) -> None:
+        with self.lock:
+            self.requests.append(entry)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format: str, *args: Any) -> None:  # silence access log
+        pass
+
+    def _send(self, code: int, obj: Dict[str, Any]) -> None:
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        state: State = self.server.state  # type: ignore[attr-defined]
+        if self.path == "/healthz":
+            self._send(200, {"ok": True})
+        elif self.path == "/__log":
+            with state.lock:
+                data = list(state.requests)
+            self._send(200, {"requests": data})
+        else:
+            self._send(404, {"error": "unknown path"})
+
+    def do_POST(self) -> None:
+        state: State = self.server.state  # type: ignore[attr-defined]
+        if self.path != "/api/v1/resolve":
+            self._send(404, {"error": "unknown path"})
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            req = json.loads(raw.decode("utf-8")) if raw else {}
+        except ValueError:
+            self._send(400, {"error": "bad json"})
+            return
+        principal = req.get("principal", "")
+        rule = state.rules["resolve"].get(principal, state.rules["default"])
+        state.record({"t": time.time(), "body": req, "verdict": rule.get("status")})
+        delay = rule.get("delay_ms", 0)
+        if delay:
+            time.sleep(delay / 1000.0)
+        status = int(rule.get("status", 404))
+        obj = {k: v for k, v in rule.items() if k not in ("status", "delay_ms")}
+        self._send(status, obj)
+
+
+class ControlPlane(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr: Any, state: State) -> None:
+        self.state = state
+        ThreadingHTTPServer.__init__(self, addr, Handler)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--rules", required=True, help="path to rules JSON")
+    ap.add_argument("--pidfile", default="")
+    ap.add_argument("--bind", default="127.0.0.1")
+    args = ap.parse_args()
+
+    state = State(args.rules)
+    if args.pidfile:
+        with open(args.pidfile, "w") as fh:
+            fh.write(str(os.getpid()))
+
+    httpd = ControlPlane((args.bind, args.port), state)
+
+    def _term(signum: int, frame: Optional[Any]) -> None:
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _term)
+    signal.signal(signal.SIGINT, _term)
+
+    sys.stderr.write("[mock-cp] listening on %s:%d rules=%s\n"
+                     % (args.bind, args.port, args.rules))
+    sys.stderr.flush()
+    try:
+        httpd.serve_forever(poll_interval=0.2)
+    finally:
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()

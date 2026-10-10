@@ -1,0 +1,7 @@
+/target
+.slim/deepwork/
+.slim/clonedeps/repos/
+
+# python bytecode from scripts/mock_control_plane.py
+__pycache__/
+*.pyc

@@ -1,0 +1,5 @@
+!.slim/
+!.slim/deepwork/
+!.slim/deepwork/**
+!.slim/clonedeps.json
+.slim/clonedeps/repos/
