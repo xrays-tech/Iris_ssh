@@ -28,6 +28,34 @@
 ## scp 吞吐损耗 ~88% 的归因（记录项，供调优）
 - 数据路径两段加密（客户端→网关、网关→后端）+ 网关内 await 转发 + `max_packet=32KB` 较小 → 本地回环下包数放大，吞吐受限。
 - 已知可调维度：`[relay] max_packet`（SFTP 大读取可调 256KB）、`window_size`；连接复用（ControlMaster/池）摊薄建立成本。
+
+## M2-U6 调优结论（2026-10-12，含外部调研 + 门禁裁决）
+**目标测判**：单连接 scp 吞吐损耗 ≤15% **判定为当前架构限制（双隧道 + russh），非可调参达成**。
+
+### 实测与试验摘要
+- cod-5 尝试数据路径调度重构（mpsc + sender task + `Arc<Mutex<BackendWriter>>`）：**损耗 85.6% vs 基线 ~82-85%，收益 ≈ 0**（wire 噪声内）。
+- `max_packet`（32KB→128KB）、`window_size`（1MB→8MB）、`outbound_guard` 扫描：影响 **<1%**。
+- **@oracle 门禁裁决：回退该调度重构**（破坏 I1 保序 / D11 锁纪律 / §3.6 有界内存，且实测零收益），保留 tap 枚举化语义与本文档。回退提交 `d6c4eb5`。
+
+### 外部调研关键发现（lib-1，2026-10-12）
+| 发现 | 依据 |
+|---|---|
+| **27 MB/s 大概率不是「双重加密」必然结果**——russh 单跳回环可达 400~580 MB/s | russh PR #653 基准表 |
+| **同构双会话终结中继 can 吞吐≈直连**：russh 作者自己的 warpgate，rsync 经网关≈直连≈ProxyJump | warpgate issue #479 |
+| **最被忽视开关：russh 两腿 `nodelay` 默认 false（Nagle 开）**，本项目未设置 | russh server/client `Config` 源码（成本 2 行，免费试） |
+| bssh（基于 russh 的 SFTP server）同机调优后 71→437 MiB/s（6.2x），钥匙=写路径流水化 + 构建（lto=fat、target-cpu） | bssh issue #187 / PR #224 |
+| SSH 无「会话内免二次加密」标准钩子；免一跳=ProxyJump 直通（内层 SSH 密文透传）或可信后端裸 TCP（需威胁建模） | OpenSSH PROTOCOL / RFC 4254 |
+| 换库（libssh2/OpenSSH 子进程）ROI 低；russh 单跳已远超需求 | crates.io / 无公开双跳基准 |
+
+### 建议的下一步（按性价比，均「需实测」）
+1. **双腿 `nodelay=true`**（各 1 行）→ 重跑。Nagle×2 + 延迟 ACK 是经典微停顿源。
+2. **腿 A/B 隔离诊断**：A=OpenSSH scp→russh server（只 echo 不接后端）；B=russh client 单通道→sshd；C=双跳——定位 27 MB/s 落在哪条腿。
+3. **cipher A/B**：默认协商 chacha20-poly1305（软件实现）；用 `Preferred` 提前 `aes-gcm`（Apple Silicon 有 AES 加速）对比。
+4. **写路径流水化**（read-ahead + 单写者按序，仿 bssh 6.2x 经验）——须保持 I1~I4 保序。
+5. 若仍 <60 MB/s 再评估架构级：ProxyJump 引导（候选 A，省一跳加密，UX/审计需产品决策）或可信后端直通（候选 C，需威胁建模评审）。
+6. 长期 KPI 转向**连接级**：ControlMaster 复用摊薄、每连接建立成本、并发会话容量——与 propose §六 容量/稳定性意图一致。
+
+> 参照基线（长期）：direct scp ~186-216 MB/s，via ~26-27 MB/s（损耗 ~85%）。此值存为构建/环境参照，不再作迭代吞吐门禁。
 - **结论**：这是本机回环小窗配置下的基线记录，非门禁阻断；目标 ≤15% 在调优预算（M2-U6）内推进，未达成前如实归档。
 
 ## 复现

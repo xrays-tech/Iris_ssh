@@ -40,3 +40,11 @@
 - **状态**：M3 为满足证书授权语义，`auth_publickey_offered` 不再早期拒绝未授权裸钥，改为「无条件 Accept + 预热」、最终授权推迟到签名后回调（有 `max_auth_attempts=10` + `auth_rejection_pad` + resolver 熔断兜底）。
 - **影响**：每个未授权 probe 也会触发一次控制面 resolve 预热 miss，量级可控。
 - **处置**：建议在 /metrics 观察 probe 期 resolve QPS 占比，必要时优化预热策略。
+
+## 7. 单连接 scp 吞吐为架构限制（M2-U6 关闭决议）
+
+- **状态**：`docs/perf-report.md`（M2-U6 结论）+ 外部调研（lib-1）。经网关单连接 scp 吞吐 ~26-27 MB/s，相对直连 ~186-216 MB/s **损耗 ~85%**，目标 ≤15% **判定为当前架构不可达成**（双隧道「终结+重建」双重加解密 + russh 逐包开销）。
+- **已试验**：数据路径调度重构（mpsc+sender task）→ 零收益，经 @oracle 裁决回退（提交 `d6c4eb5`）；`max_packet`/`window_size` 扫描影响 <1%。
+- **调研提示的关键机会（未落地，需实测）**：russh 单跳回环可达 400~580 MB/s；同构双会话中继（warpgate）rsync≈直连；**两份被忽视的低成本项第一是双腿 `nodelay=true`（当前 Nagle 开）**，其次是腿 A/B 隔离诊断、cipher A/B（aes-gcm vs chacha20）、写路径流水化（仿 bssh 6.2x 经验）。
+- **影响**：粗略说「经网关 scp 比直连慢 ~6 倍」属预期特性，非故障；容量规划按此基准（连接级 KPI：ControlMaster 复用、每连接建立成本、并发会话容量）而非单连接吞吐。
+- **触发条件 / 处置**：若单连接吞吐成为业务硬需求 → 架构级选项：ProxyJump 直通引导（客户端 `-J`，内层 SSH 密文透传省一跳加密，UX/审计需产品决策）或可信后端裸 TCP 直通（需威胁建模评审）。参照基线见 perf-report 末尾。
