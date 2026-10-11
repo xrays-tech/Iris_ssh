@@ -115,6 +115,29 @@ assert_ne() {
     fail "$3: expected != [$2]"; fi
 }
 
+# ---------------------------------------------------------------------------
+# RSS monitor: sample a target pid's RSS to a file until a stop flag appears.
+# Used by the backpressure / slow-link / rekey cases to assert bounded memory.
+# ---------------------------------------------------------------------------
+RSS_MON_PID=""
+rss_monitor_start() {   # rss_monitor_start <pid> <samplefile> <stopflag>
+  local pid="$1" sf="$2" stop="$3"
+  rm -f "$sf" "$stop"
+  ( while [ ! -f "$stop" ]; do
+      printf '%s %s\n' "$(date +%s)" "$(rss_kb "$pid")" >>"$sf" 2>/dev/null || true
+      sleep 0.5
+    done ) &
+  RSS_MON_PID=$!
+}
+rss_monitor_stop() {    # rss_monitor_stop <stopflag>
+  touch "$1"
+  [ -n "$RSS_MON_PID" ] && wait "$RSS_MON_PID" 2>/dev/null || true
+  RSS_MON_PID=""
+}
+rss_stats() {           # rss_stats <samplefile> -> prints "max min count"
+  awk 'NF>=2{v=$2+0; if(n==0||v>mx)mx=v; if(n==0||v<mn)mn=v; n++} END{print mx+0, mn+0, n+0}' "$1" 2>/dev/null || echo "0 0 0"
+}
+
 # assert_ordered <label> <file> <s1> <s2> ... : strings appear in order (by line).
 assert_ordered() {
   local label="$1" file="$2"; shift 2

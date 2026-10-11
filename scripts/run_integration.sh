@@ -445,12 +445,18 @@ ALL_CASES=(
   case_exit_status
   case_exec_no_pty
   case_pty_shell
+  case_ordering_matrix
   case_stderr
   case_sftp
   case_scp
   case_auth_denied_403
   case_port_forward_denied
   case_backpressure
+  case_backpressure_down
+  case_slow_link
+  case_rekey_midstream
+  case_backend_lost
+  case_control_plane_failopen
   case_graceful_shutdown
 )
 
