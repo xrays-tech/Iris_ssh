@@ -125,6 +125,11 @@ fn check_key_permissions(path: &std::path::Path, is_host_key: bool) -> Result<()
 
 /// Compute the canonical `SHA256:` fingerprint of a backend host key. Exposed as
 /// a pure helper so the pinning value can be logged/asserted.
+//
+// M4: @cert-authority — for a Certificate, this currently fingerprints the
+// *inner* key (placeholder). A host-cert trust path must instead verify
+// `cert.signature_key()` against a trusted CA set (see docs/known-limitations.md).
+// TODO(M4): replace inner-key fingerprint with CA-set verification + tests.
 pub fn host_key_fingerprint(key: &PublicKeyOrCertificate) -> String {
     let public = match key {
         PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),

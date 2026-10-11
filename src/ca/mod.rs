@@ -44,8 +44,12 @@ pub struct CertificateAuthority {
 
 impl CertificateAuthority {
     /// Build a CA set from config, loading and 0600-checking every private key
-    /// involved. No trusted CA keys and no signing key means the caller passed an
-    /// invalid config (the config layer rejects that), so it fails loud here too.
+    /// involved. An empty set — no trusted CA keys and no signing key — is a
+    /// valid "certificate auth disabled" configuration (the config layer accepts
+    /// it); only the contradictory combination of a signing key without any
+    /// trusted CA key is rejected at the config layer.
+    /// In the empty case this yields a CA that trusts nothing and can never
+    /// issue, so certificate authentication is effectively disabled loudly.
     pub fn load(config: &crate::config::CaConfig) -> Result<Self> {
         let mut trusted_ca = Vec::with_capacity(config.trusted_ca_keys.len());
         for path in &config.trusted_ca_keys {
