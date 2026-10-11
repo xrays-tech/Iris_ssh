@@ -5,8 +5,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
 
+# IT_WORK_DIR is gateway-host-local (download destination, logs); REMOTE_TMP_DIR
+# is the backend-side scratch the file is actually placed on via the gateway.
 local_file="$IT_WORK_DIR/sftp_payload.local"
-remote_file="$IT_WORK_DIR/sftp_payload.remote"
+remote_file="$REMOTE_TMP_DIR/sftp_payload.remote"
 down_file="$IT_WORK_DIR/sftp_payload.down"
 sftp_log="$IT_WORK_DIR/sftp.log"
 

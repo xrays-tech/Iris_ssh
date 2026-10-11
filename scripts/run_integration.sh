@@ -38,6 +38,13 @@
 #       modes — the graceful-drain behaviour under test is the gateway's, not the
 #       backend's, so remote mode is unaffected.
 #
+# Remote path semantics (REMOTE_TMP_DIR): cases place files on the BACKEND via
+#   the gateway, so the *backend-side* temp path is distinct from the gateway-host
+#   work dir. The harness exports REMOTE_TMP_DIR for that:
+#     - local mode : REMOTE_TMP_DIR = $WORK_DIR (backend IS localhost, dir exists)
+#     - remote mode: a unique /tmp/sshgw-it-<stamp>-<pid> on the backend, created
+#       up front via the backend key and rm -rf'd at cleanup (only that path).
+#
 # Exit code: 1 if any case FAILs; 0 otherwise (BLOCKED cases do not fail, so the
 # gate stays green while the src/ lane is still landing).
 set -euo pipefail
@@ -147,6 +154,41 @@ else
   BACKEND_PORT="$SSHD_PORT"
 fi
 
+# Direct-to-backend ssh options (used only in remote mode: to mkdir/cleanup the
+# backend-side temp dir). The backend key is already authorized on the remote
+# (the gateway authenticates with it), so the harness can log in the same way —
+# mirrors infra_selftest's `-i "$ASSET_DIR/backend_ed25519"` usage.
+BACKEND_LOGIN="${BACKEND_USER}@${BACKEND_HOST}"
+SSH_BACKEND_OPTS=(
+  -p "$BACKEND_PORT"
+  -i "$ASSET_DIR/backend_ed25519"
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o IdentitiesOnly=yes
+  -o ConnectTimeout=15
+  -o LogLevel=ERROR
+)
+
+# Backend-side temp dir (paths cases place *on the backend* through the gateway).
+# Local mode: the work dir (backend is localhost, so it already exists). Remote
+# mode: a unique /tmp path on the backend, created + verified now and cleaned in
+# cleanup(). Distinct from $WORK_DIR, which is gateway-host-local only.
+if [ "$REMOTE_MODE" = "1" ]; then
+  REMOTE_TMP_DIR="/tmp/sshgw-it-${STAMP}-$$"
+  log "remote backend: creating writable tmp dir ${BACKEND_LOGIN}:${REMOTE_TMP_DIR}"
+  if ssh "${SSH_BACKEND_OPTS[@]}" "$BACKEND_LOGIN" \
+       "mkdir -p '$REMOTE_TMP_DIR' && test -w '$REMOTE_TMP_DIR' && echo ok" \
+       >"$WORK_DIR/remote_tmp.out" 2>&1 \
+     && grep -q '^ok$' "$WORK_DIR/remote_tmp.out"; then
+    log "remote tmp dir ready: ${BACKEND_LOGIN}:${REMOTE_TMP_DIR}"
+  else
+    tail_log "$WORK_DIR/remote_tmp.out" 20
+    die "could not create/write remote tmp dir on ${BACKEND_LOGIN}:${REMOTE_TMP_DIR} (is backend_ed25519.pub in the remote authorized_keys?)"
+  fi
+else
+  REMOTE_TMP_DIR="$WORK_DIR"
+fi
+
 # ---------------------------------------------------------------------------
 # Write configs
 # ---------------------------------------------------------------------------
@@ -244,6 +286,7 @@ write_run_env() {
   cat > "$RUN_ENV" <<EOF
 export IT_WORK_DIR='${WORK_DIR}'
 export IT_ASSET_DIR='${ASSET_DIR}'
+export REMOTE_TMP_DIR='${REMOTE_TMP_DIR}'
 export GW_ADDR='${GW_ADDR}'
 export GW_PORT='${GW_PORT}'
 export GW_METRICS_PORT='${METRICS_PORT}'
@@ -285,6 +328,17 @@ cleanup() {
   if [ "$KEEP_WORK" = "1" ]; then
     log "KEEP_WORK=1 -> preserving work dir: $WORK_DIR"
   else
+    # Remote mode: remove the backend-side temp dir we created. Safety-guarded so
+    # only our unique prefix is ever removed (a stray var can't rm the wrong tree).
+    if [ "${REMOTE_MODE:-0}" = "1" ] && [ -n "${REMOTE_TMP_DIR:-}" ] \
+       && [ "${REMOTE_TMP_DIR#/tmp/sshgw-it-}" != "$REMOTE_TMP_DIR" ]; then
+      if ssh "${SSH_BACKEND_OPTS[@]}" "$BACKEND_LOGIN" "rm -rf '$REMOTE_TMP_DIR'" >"$WORK_DIR/remote_tmp.cleanup.log" 2>&1; then
+        log "removed remote tmp dir ${BACKEND_LOGIN}:${REMOTE_TMP_DIR}"
+      else
+        log_err "could not remove remote tmp dir ${BACKEND_LOGIN}:${REMOTE_TMP_DIR} (idempotent — safe to remove manually):"
+        tail_log "$WORK_DIR/remote_tmp.cleanup.log" 15
+      fi
+    fi
     rm -rf "$WORK_DIR"
   fi
 }
@@ -375,6 +429,7 @@ write_run_env
 # (`export IT_WORK_DIR` alone would export an unset name).
 export IT_WORK_DIR="$WORK_DIR"
 export IT_ASSET_DIR="$ASSET_DIR"
+export REMOTE_TMP_DIR="$REMOTE_TMP_DIR"
 export GW_ADDR GW_PORT GW_METRICS_PORT GW_PID GATEWAY_UP
 export SSHD_ADDR SSHD_PORT SSHD_UP CP_ADDR CP_PORT
 export USER_KEY="$ASSET_DIR/user_ed25519" PRINCIPAL DENIED_PRINCIPAL NOTFOUND_PRINCIPAL

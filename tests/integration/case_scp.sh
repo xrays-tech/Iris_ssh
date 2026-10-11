@@ -6,8 +6,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
 
+# remote_file lives on the BACKEND (placed via the gateway), so it uses
+# REMOTE_TMP_DIR; local_file/down_file are gateway-host-local (IT_WORK_DIR).
 local_file="$IT_WORK_DIR/scp_payload.local"
-remote_file="$IT_WORK_DIR/scp_payload.remote"
+remote_file="$REMOTE_TMP_DIR/scp_payload.remote"
 down_file="$IT_WORK_DIR/scp_payload.down"
 
 head -c 20000 /dev/urandom > "$local_file"
@@ -22,6 +24,7 @@ if cmp -s "$local_file" "$down_file"; then
 else
   fail "scp round-trip mismatch: local vs downloaded differ"
 fi
-# tidy the remote copy (also lives under IT_WORK_DIR so orchestrator cleans it).
+# tidy the remote copy (backend-side path under REMOTE_TMP_DIR; the orchestrator
+# also rm -rf's the whole REMOTE_TMP_DIR at cleanup).
 ssh "${SSH_OPTS[@]}" "$TARGET" "rm -f '$remote_file'" >/dev/null 2>&1 || true
 echo "OK: case_scp"

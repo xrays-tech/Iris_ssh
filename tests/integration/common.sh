@@ -3,7 +3,13 @@
 #
 # Relies on env exported by scripts/run_integration.sh:
 #   GW_ADDR GW_PORT USER_KEY PRINCIPAL DENIED_PRINCIPAL NOTFOUND_PRINCIPAL
-#   BACKEND_HOST BACKEND_PORT BACKEND_USER IT_WORK_DIR
+#   BACKEND_HOST BACKEND_PORT BACKEND_USER IT_WORK_DIR REMOTE_TMP_DIR
+#
+# Path semantics:
+#   IT_WORK_DIR    gateway-host-local scratch (downloads, logs, local files)
+#   REMOTE_TMP_DIR backend-side scratch (paths placed on the backend via the
+#                  gateway: local mode == IT_WORK_DIR; remote mode == a /tmp dir
+#                  created on the backend). Only difference matters in remote mode.
 #
 # Provides:
 #   SSH_OPTS[]  ssh option array (client -> gateway)
@@ -24,6 +30,7 @@ CASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${USER_KEY:?USER_KEY not set}"
 : "${PRINCIPAL:?PRINCIPAL not set}"
 : "${IT_WORK_DIR:?IT_WORK_DIR not set}"
+: "${REMOTE_TMP_DIR:?REMOTE_TMP_DIR not set (run via scripts/run_integration.sh)}"
 
 TARGET="${PRINCIPAL}@${GW_ADDR}"
 
