@@ -1,0 +1,27 @@
+[Unit]
+Description=SSH Gateway (russh dual-session relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/ssh-gw --config /etc/ssh-gw/gateway.toml
+# Optional: explicit runtime/user
+# User=sshgw
+RuntimeDirectory=ssh-gw
+Restart=on-failure
+RestartSec=2s
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/ssh-gw
+# Graceful shutdown: systemd SIGTERM -> gateway drains + DISCONNECT(11);
+# kept short so drain_wait + disconnect_flush have room before SIGKILL.
+TimeoutStopSec=70s
+KillSignal=SIGTERM
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target

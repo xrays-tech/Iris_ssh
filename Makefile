@@ -8,6 +8,7 @@
 #   make selftest       infra-only health check (backend sshd + control plane)
 #   make soak           A5 long-run stability soak (scripts/run_soak.sh; SOAK_DURATION)
 #   make ha-drain       B5 HA drain rollout rehearsal (scripts/ha_drain.sh)
+#   make bench          gateway-vs-direct performance benchmark (scripts/bench.sh; BENCH_FILE_MB/BENCH_ITERS)
 #   make all            lint + test + build + integration
 #
 # The integration suite is self-contained: a local sshd backend + a mock
@@ -18,7 +19,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := all
 
-.PHONY: help build lint test integration selftest soak ha-drain all
+.PHONY: help build lint test integration selftest soak ha-drain bench all
 
 help:
 	@grep -E '^#   make' $(MAKEFILE_LIST) | sed 's/^#   //'
@@ -46,3 +47,6 @@ soak:
 
 ha-drain:
 	scripts/ha_drain.sh
+
+bench:
+	BENCH_FILE_MB=$${BENCH_FILE_MB:-64} BENCH_ITERS=$${BENCH_ITERS:-5} scripts/bench.sh
