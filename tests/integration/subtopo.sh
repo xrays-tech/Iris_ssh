@@ -31,6 +31,32 @@ SUBTOP_FAIL_OPEN="${SUBTOP_FAIL_OPEN:-false}"
 SUBTOP_CACHE_TTL="${SUBTOP_CACHE_TTL:-30s}"
 SUBTOP_TTL_JITTER="${SUBTOP_TTL_JITTER:-3s}"
 SUBTOP_WINDOW="${SUBTOP_WINDOW:-1MB}"
+SUBTOP_KEEPALIVE_INTERVAL="${SUBTOP_KEEPALIVE_INTERVAL:-15s}"
+SUBTOP_KEEPALIVE_MAX_MISS="${SUBTOP_KEEPALIVE_MAX_MISS:-2}"
+# B4 jump / B3 sftp-intercept drivers (defaults keep every existing case unchanged).
+SUBTOP_JUMP_ENABLED="${SUBTOP_JUMP_ENABLED:-false}"
+SUBTOP_JUMP_TARGETS="${SUBTOP_JUMP_TARGETS:-}"          # space-separated host[:port]
+SUBTOP_JUMP_ALLOW_PRIVATE="${SUBTOP_JUMP_ALLOW_PRIVATE:-false}"
+SUBTOP_SFTP_ENABLED="${SUBTOP_SFTP_ENABLED:-false}"
+SUBTOP_SFTP_DENY="${SUBTOP_SFTP_DENY:-}"                # space-separated SFTP cmd names
+SUBTOP_SFTP_ALLOW_PREFIX="${SUBTOP_SFTP_ALLOW_PREFIX:-}"
+SUBTOP_SFTP_DENY_PREFIX="${SUBTOP_SFTP_DENY_PREFIX:-}"
+# B4: when true, the default resolve rule carries policy.tcp_forwarding=true and a
+# policy.tcp_forwarding_targets entry for the sub-topology backend, and that same
+# "127.0.0.1:$ST_SSHD_PORT" is auto-added to [jump] allowed_targets.
+SUBTOP_TCP_FORWARDING="${SUBTOP_TCP_FORWARDING:-false}"
+# Overridable host key (for rotation rehearsal); defaults to the shared asset key.
+SUBTOP_HOSTKEY="${SUBTOP_HOSTKEY:-$IT_ASSET_DIR/hostkey_ed25519}"
+
+# toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
+toml_arr() {
+  local out='[' first=1 v
+  for v in $1; do
+    if [ "$first" = 1 ]; then first=0; else out="$out, "; fi
+    out="$out\"$v\""
+  done
+  printf '%s]' "$out"
+}
 
 # Resolve the gateway binary the same way run_integration.sh does.
 SUBTOPO_CASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -56,14 +82,31 @@ subtopo_start() {
   if [ -n "${SUBTOP_RULES:-}" ]; then
     cp "$SUBTOP_RULES" "$SUBTOPO_DIR/rules.json"
   else
-    printf '{"resolve":{"%s":{"status":200,"target":{"host":"127.0.0.1","port":%s,"user":"%s"},"policy":{"ttl":60}}},"default":{"status":404}}\n' \
-      "$PRINCIPAL" "$ST_SSHD_PORT" "$BACKEND_USER" > "$SUBTOPO_DIR/rules.json"
+    local _pol_extra="" _bktgt="127.0.0.1:${ST_SSHD_PORT}"
+    if [ "$SUBTOP_TCP_FORWARDING" = "true" ]; then
+      _pol_extra=",\"tcp_forwarding\":true,\"tcp_forwarding_targets\":[\"127.0.0.1:${ST_SSHD_PORT}\"]"
+      case " $SUBTOP_JUMP_TARGETS " in *" $_bktgt "*) : ;; *) SUBTOP_JUMP_TARGETS="$SUBTOP_JUMP_TARGETS $_bktgt" ;; esac
+    fi
+    printf '{"resolve":{"%s":{"status":200,"target":{"host":"127.0.0.1","port":%s,"user":"%s"},"policy":{"ttl":60%s}}},"default":{"status":404}}\n' \
+      "$PRINCIPAL" "$ST_SSHD_PORT" "$BACKEND_USER" "$_pol_extra" > "$SUBTOPO_DIR/rules.json"
   fi
 
-  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n[pool]\nenabled=false\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
-    "$ST_GW_PORT" "$IT_ASSET_DIR/hostkey_ed25519" "$SUBTOP_WINDOW" \
-    "$IT_ASSET_DIR/backend_ed25519" "$ST_CP_PORT" "$SUBTOP_CACHE_TTL" \
-    "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
+  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
+    "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" \
+    "$IT_ASSET_DIR/backend_ed25519" "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
+    "$ST_CP_PORT" "$SUBTOP_CACHE_TTL"     "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
+
+  # B4 jump + B3 sftp-intercept sections (defaults are inert; older gateways that
+  # predate these fields simply ignore the unknown sections).
+  {
+    printf '[jump]\nenabled=%s\nallowed_targets=%s\nallow_private_networks=%s\n' \
+      "$SUBTOP_JUMP_ENABLED" "$(toml_arr "$SUBTOP_JUMP_TARGETS")" "$SUBTOP_JUMP_ALLOW_PRIVATE"
+    printf '[intercept.sftp]\nenabled=%s\ndeny_commands=%s\nallowed_path_prefixes=%s\ndenied_path_prefixes=%s\n' \
+      "$SUBTOP_SFTP_ENABLED" "$(toml_arr "$SUBTOP_SFTP_DENY")" \
+      "$(toml_arr "$SUBTOP_SFTP_ALLOW_PREFIX")" "$(toml_arr "$SUBTOP_SFTP_DENY_PREFIX")"
+    # [ca] required by the gateway validator; harmless non-empty trusted key.
+    printf '[ca]\ntrusted_ca_keys=["%s"]\n' "$IT_ASSET_DIR/user_ed25519.pub"
+  } >> "$SUBTOPO_DIR/gw.toml"
 
   /usr/sbin/sshd -t -f "$SUBTOPO_DIR/sshd.cfg" 2>>"$SUBTOPO_DIR/sshd.log" \
     || { tail_log "$SUBTOPO_DIR/sshd.log" 20; return 1; }

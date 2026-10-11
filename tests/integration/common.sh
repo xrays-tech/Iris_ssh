@@ -72,6 +72,12 @@ SCP_OPTS=(
 CASE_NAME="$(basename "${BASH_SOURCE[1]:-$0}" .sh 2>/dev/null || echo case)"
 pass() { printf '[%s] PASS: %s\n' "$CASE_NAME" "$*" >&2; }
 fail() { printf '[%s] FAIL: %s\n' "$CASE_NAME" "$*" >&2; exit 1; }
+# skip_case <reason> — capability-gated skip. Emits a machine-visible marker on
+# stdout and exits 0; the orchestrator counts these as SKIP (never as PASS), so a
+# skipped case is never mistaken for a green assertion. Use ONLY when a real
+# capability (real machine, a not-yet-landed src feature, a missing binary) is
+# absent — never to paper over a real failing assertion.
+skip_case() { printf 'SKIP_CASE: %s\n' "$*"; printf '[%s] SKIP: %s\n' "$CASE_NAME" "$*" >&2; exit 0; }
 
 # run_capture <cmd...> -> sets RUN_OUT (stdout+stderr merged) and RUN_RC.
 run_capture() {

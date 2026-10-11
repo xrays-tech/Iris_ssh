@@ -251,11 +251,9 @@ timeout = "2s"
 max_sessions = 10000
 max_sessions_per_ip = 20
 # src decouples auth_timeout (the auth-phase budget) from the russh rejection
-# delay, exposed via `auth_rejection_pad` (default 250ms): the initial `none`
-# probe waits min(auth_timeout, auth_rejection_pad) and ongoing rejections wait
-# the pad (src/server/mod.rs auth_rejection_timing). A 0s budget therefore keeps
-# the initial probe instant in tests with no effect on the suite (the lane's own
-# unit tests use "0s" too).
+# delay via auth_rejection_pad (default 250ms): the initial 'none' probe waits
+# min(auth_timeout, auth_rejection_pad), ongoing rejections wait the pad. A 0s
+# budget keeps the initial probe instant in tests (the lane's own tests use 0s).
 auth_timeout = "0s"
 
 [shutdown]
@@ -265,6 +263,12 @@ hard_deadline = "30s"
 
 [metrics]
 addr = "${GW_ADDR}:${METRICS_PORT}"
+
+# [ca] is required (validation rejects an empty CA section). These tests never
+# use cert auth, so we point trusted_ca_keys at a harmless valid pubkey to make
+# the CA section non-empty without enabling anything.
+[ca]
+trusted_ca_keys = ["${ASSET_DIR}/user_ed25519.pub"]
 EOF
 }
 
@@ -457,6 +461,13 @@ ALL_CASES=(
   case_rekey_midstream
   case_backend_lost
   case_control_plane_failopen
+  case_wire_ordering
+  case_client_matrix
+  case_jump
+  case_sftp_intercept
+  case_hostkey_rotation
+  case_halfopen_lost
+  case_netem_slow
   case_graceful_shutdown
 )
 
@@ -502,14 +513,15 @@ fi
 # ---------------------------------------------------------------------------
 # Infra selftest (runs whenever --selftest, and always as a prelude)
 # ---------------------------------------------------------------------------
-PASS_COUNT=0 FAIL_COUNT=0 BLOCKED_COUNT=0
+PASS_COUNT=0 FAIL_COUNT=0 BLOCKED_COUNT=0 SKIP_COUNT=0
 FAILED_NAMES=""
 
-bump() { # bump <PASS|FAIL|BLOCKED> <name>
+bump() { # bump <PASS|FAIL|BLOCKED|SKIP> <name>
   case "$1" in
     PASS)    PASS_COUNT=$((PASS_COUNT+1)); log "RESULT PASS    :: $2" ;;
     FAIL)    FAIL_COUNT=$((FAIL_COUNT+1)); FAILED_NAMES="$FAILED_NAMES $2"; log_err "RESULT FAIL    :: $2" ;;
     BLOCKED) BLOCKED_COUNT=$((BLOCKED_COUNT+1)); log "RESULT BLOCKED :: $2" ;;
+    SKIP)    SKIP_COUNT=$((SKIP_COUNT+1)); log "RESULT SKIP    :: $2 (capability-gated; not a pass)" ;;
   esac
 }
 
@@ -593,7 +605,10 @@ if [ "${#CASE_LIST[@]}" -gt 0 ]; then
     log "--- running case: $name ---"
     rc=0
     bash "$case_path" >"$outfile" 2>&1 || rc=$?
-    if [ "$rc" -eq 0 ]; then
+    if grep -q '^SKIP_CASE:' "$outfile"; then
+      # capability-gated skip (case printed the SKIP_CASE: marker) — not a pass.
+      bump SKIP "$name"
+    elif [ "$rc" -eq 0 ]; then
       bump PASS "$name"
     else
       bump FAIL "$name"
@@ -609,8 +624,11 @@ fi
 # ---------------------------------------------------------------------------
 log "================ run summary ================"
 log "work dir : $WORK_DIR"
-log "pass=$PASS_COUNT fail=$FAIL_COUNT blocked=$BLOCKED_COUNT"
+log "pass=$PASS_COUNT fail=$FAIL_COUNT blocked=$BLOCKED_COUNT skip=$SKIP_COUNT"
 [ -n "$FAILED_NAMES" ] && log "failed  :$FAILED_NAMES"
+if [ "$SKIP_COUNT" -gt 0 ]; then
+  log "NOTE: $SKIP_COUNT case(s) SKIPPED (capability-gated: real-machine / not-yet-landed feature)."
+fi
 if [ "$BLOCKED_COUNT" -gt 0 ]; then
   log "NOTE: $BLOCKED_COUNT case(s) BLOCKED — gateway unavailable (src/ lane pending)."
 fi

@@ -42,6 +42,19 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
+# do_POST builds the 200/4xx/5xx body from the matched rule VERBATIM (every
+# non-control key is passed through). So `policy` may carry any field the
+# gateway's Policy understands today (agent_forwarding, tcp_forwarding,
+# recording, ttl) AND forward-compatible fields the gateway will consume later
+# (e.g. policy.tcp_forward_targets for B4 jump target whitelisting,
+# policy.sftp_intercept for B3 command interception). Unknown fields are inert
+# until the gateway reads them, so rules stay backward-compatible. Example rule:
+#     "<principal>": {"status":200,
+#                     "target":{"host","port","user"},
+#                     "policy":{"ttl":60,"tcp_forwarding":true,
+#                               "tcp_forward_targets":["127.0.0.1:22223"],
+#                               "sftp_intercept":{"deny_ops":["remove"]}}}
+
 
 class State:
     def __init__(self, rules_path: str, access_log: str = "") -> None:
