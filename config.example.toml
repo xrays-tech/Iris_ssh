@@ -23,11 +23,21 @@ outbound_guard = true   # per-channel outbound Semaphore fuse (D5)
 env_allowlist = []      # empty = pass env through (M1); non-empty filters names
 
 # Gateway → backend authentication.
+# `backend_auth` selects the credential presented to the backend:
+#   "key"  (default) — the private key below, whose public key sits in the
+#           backend's authorized_keys. Nothing else is required.
+#   "cert" — a short-lived user certificate issued on the fly at dial time and
+#           accepted by the backend's `TrustedUserCAKeys`. Requires
+#           `[ca] signing_key`; the private key becomes optional (an ephemeral
+#           inner keypair is used when omitted) and is still honoured as a
+#           stable gateway identity when present. Per-resolve override:
+#           `policy.backend_auth` in the control-plane response.
 [backend]
 private_key = "/etc/ssh-gw/backend_root_ed25519"   # default key
 # credential_map maps a backend username to its key path (overrides private_key).
 credential_map = { root = "/etc/ssh-gw/backend_root_ed25519" }
 host_key_policy = "pinned"     # "pinned" (prod) | "accept-new" (onboarding)
+# backend_auth = "key"         # set to "cert" to dial with a CA-issued certificate
 
 # Opt-in connection pool (off by default: one backend connection per session).
 # The dial circuit breaker and per-connection channel cap are active regardless
@@ -90,13 +100,20 @@ addr = "127.0.0.1:9090"
 # Trusted CA **public** keys (authorized_keys format). One list serves both
 # user certificates (`auth_openssh_certificate`) and backend host certificates
 # (`@cert-authority`), because both anchor on the certificate's signing key.
-# Omit the whole section to disable certificate authentication.
+# Omit the whole section to disable certificate authentication entirely.
 # [ca]
 # trusted_ca_keys = ["/etc/ssh-gw/ca_user.pub", "/etc/ssh-gw/ca_host.pub"]
 # cert_lifetime = "300s"
-# Optional: enable short-lived user-certificate issuance (0600 CA private key).
-# Requires at least one trusted_ca_keys entry, otherwise it is refused.
-# signing_key = "/etc/ssh-gw/ca_user"
+# Optional: enable short-lived certificate issuance (0600 CA private key).
+# Required for `backend_auth = "cert"`, and what operator tooling uses to mint
+# user certificates. Requires at least one trusted_ca_keys entry.
+# signing_key = "/etc/ssh-gw/ca"
+#
+# With a trusted CA present, the backend leg advertises the certificate
+# algorithms that set can verify — so a backend that presents a `HostCertificate`
+# is negotiated and verified by a four-step chain (signing key in the CA set →
+# signature → validity window → principals include the host dialed). A host
+# certificate naming a different host is refused even when its CA is trusted.
 
 # --- M3: session recording (B2) ----------------------------------------------
 # One file per channel: `<session-id>-<channel>.srec` in a 0700 directory, each

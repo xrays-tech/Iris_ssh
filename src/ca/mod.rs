@@ -36,6 +36,11 @@ use crate::error::Result;
 pub struct CertificateAuthority {
     /// `SHA256:` fingerprints of trusted CA **signing** keys.
     trusted_ca: Vec<String>,
+    /// The trusted CA public keys themselves, retained so the gateway can report
+    /// which certificate *algorithms* it is able to verify. KEX needs that list:
+    /// a client leg that advertises no host-certificate algorithms will never be
+    /// offered one, however many CAs it trusts.
+    trusted_ca_keys: Vec<PublicKey>,
     /// The CA private key, when configured (verify-only otherwise).
     signing_key: Option<std::sync::Arc<PrivateKey>>,
     /// Default lifetime for issued certificates.
@@ -52,6 +57,7 @@ impl CertificateAuthority {
     /// issue, so certificate authentication is effectively disabled loudly.
     pub fn load(config: &crate::config::CaConfig) -> Result<Self> {
         let mut trusted_ca = Vec::with_capacity(config.trusted_ca_keys.len());
+        let mut trusted_ca_keys = Vec::with_capacity(config.trusted_ca_keys.len());
         for path in &config.trusted_ca_keys {
             // Trusted entries are CA **public** keys (authorized_keys format), so
             // they are loaded as such — 0600 is not required of a public key.
@@ -62,6 +68,7 @@ impl CertificateAuthority {
                 ))
             })?;
             trusted_ca.push(sha256_fingerprint(&key));
+            trusted_ca_keys.push(key);
         }
         let signing_key = match &config.signing_key {
             Some(path) => Some(std::sync::Arc::new(
@@ -71,6 +78,7 @@ impl CertificateAuthority {
         };
         Ok(CertificateAuthority {
             trusted_ca,
+            trusted_ca_keys,
             signing_key,
             cert_lifetime: config.cert_lifetime,
         })
@@ -89,6 +97,25 @@ impl CertificateAuthority {
     /// Whether this CA can issue certificates (a signing key is configured).
     pub fn can_issue(&self) -> bool {
         self.signing_key.is_some()
+    }
+
+    /// The key algorithms of the trusted CAs, de-duplicated — exactly the
+    /// certificate algorithms this gateway can verify.
+    ///
+    /// The backend leg advertises these during KEX (russh turns each into its
+    /// `…-cert-v01@openssh.com` name), so a backend that only offers certificate
+    /// types we cannot check is never negotiated. Advertising only what we can
+    /// verify is what keeps a *narrower* trust set from causing a confusing
+    /// "no matching host key type" failure.
+    pub fn trusted_cert_algorithms(&self) -> Vec<ssh_key::Algorithm> {
+        let mut algos: Vec<ssh_key::Algorithm> = Vec::new();
+        for key in &self.trusted_ca_keys {
+            let algo = key.algorithm().clone();
+            if !algos.contains(&algo) {
+                algos.push(algo);
+            }
+        }
+        algos
     }
 
     /// The configured certificate lifetime for issued certificates.
@@ -141,12 +168,55 @@ pub fn certificate_ca_fingerprint(cert: &russh::keys::Certificate) -> String {
     sha256_fingerprint(&PublicKey::from(cert.signature_key().clone()))
 }
 
-/// Issue a short-lived user certificate (the pure core of
+/// Issue a short-lived **user** certificate (the pure core of
 /// [`CertificateAuthority::issue_user_certificate`], split out so it can be
 /// exercised with a generated key and no config plumbing).
 pub fn issue_user_certificate_with(
     signing_key: &PrivateKey,
     subject_key: &PublicKey,
+    principals: &[String],
+    key_id: &str,
+    lifetime: Duration,
+) -> Result<russh::keys::Certificate> {
+    issue_certificate_with(
+        signing_key,
+        subject_key,
+        ssh_key::certificate::CertType::User,
+        principals,
+        key_id,
+        lifetime,
+    )
+}
+
+/// Issue a short-lived **host** certificate (M4-T1's counterpart on the backend
+/// side: a backend `sshd` presents this during KEX, and the gateway's
+/// `@cert-authority` chain verifies it).
+pub fn issue_host_certificate_with(
+    signing_key: &PrivateKey,
+    subject_key: &PublicKey,
+    principals: &[String],
+    key_id: &str,
+    lifetime: Duration,
+) -> Result<russh::keys::Certificate> {
+    issue_certificate_with(
+        signing_key,
+        subject_key,
+        ssh_key::certificate::CertType::Host,
+        principals,
+        key_id,
+        lifetime,
+    )
+}
+
+/// Issue a short-lived certificate of an explicit [`CertType`](ssh_key::certificate::CertType).
+///
+/// The type is part of the signed body, so a user certificate can never be
+/// replayed as a host certificate (or vice versa) — which is what the
+/// verification chain asserts on the accepting side.
+pub fn issue_certificate_with(
+    signing_key: &PrivateKey,
+    subject_key: &PublicKey,
+    cert_type: ssh_key::certificate::CertType,
     principals: &[String],
     key_id: &str,
     lifetime: Duration,
@@ -176,7 +246,7 @@ pub fn issue_user_certificate_with(
     )
     .map_err(|e| crate::error::Error::Invariant(format!("building certificate envelope: {e}")))?;
     builder
-        .cert_type(ssh_key::certificate::CertType::User)
+        .cert_type(cert_type)
         .map_err(|e| crate::error::Error::Invariant(format!("setting cert type: {e}")))?;
     builder
         .key_id(key_id)
@@ -194,12 +264,15 @@ pub fn issue_user_certificate_with(
     })
 }
 
-/// Outcome of validating a user certificate against a CA set at time `now`.
+/// Outcome of validating a certificate against a CA set at time `now`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertificateCheck {
     /// The certificate is well-formed, correctly CA-signed, within its validity
     /// window, and names the requested principal.
     Trusted,
+    /// The certificate is of the wrong type for the context it was presented in
+    /// (e.g. a user certificate offered where a host certificate is required).
+    WrongCertType { expected: &'static str },
     /// The issuing CA is not in the trusted set.
     UnknownCa,
     /// The certificate does not list `principal` in its valid principals.
@@ -210,18 +283,93 @@ pub enum CertificateCheck {
     BadSignature,
 }
 
-/// Pure validation of a user certificate against a trusted CA set at time `now`
-/// (seconds since the Unix epoch).
-///
-/// `is_valid_at` is the clock seam: production passes `SystemTime::now()`, tests
-/// pass an arbitrary instant, which is what makes expiry testable without
-/// sleeping (plan §6.4 — clock injection, no Mock).
+/// Pure validation of a **user** certificate (M3's entry point; delegates to
+/// [`validate_certificate_at`] with the user type required).
 pub fn validate_user_certificate_at(
     cert: &russh::keys::Certificate,
     ca_fingerprints: &[String],
     principal: &str,
     now_unix: u64,
 ) -> CertificateCheck {
+    validate_certificate_at(
+        CertContext::User,
+        cert,
+        ca_fingerprints,
+        principal,
+        now_unix,
+    )
+}
+
+/// Pure validation of a **host** certificate (M4-T1's `@cert-authority` chain).
+///
+/// Same chain as the user path, but the principal is the backend's host name and
+/// the certificate type must be a host certificate.
+pub fn validate_host_certificate_at(
+    cert: &russh::keys::Certificate,
+    ca_fingerprints: &[String],
+    host: &str,
+    now_unix: u64,
+) -> CertificateCheck {
+    validate_certificate_at(CertContext::Host, cert, ca_fingerprints, host, now_unix)
+}
+
+/// Which context a certificate is being presented in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertContext {
+    /// OpenSSH *user* authentication.
+    User,
+    /// KEX *host* authentication (`@cert-authority`).
+    Host,
+}
+
+impl CertContext {
+    fn expected_type(self) -> ssh_key::certificate::CertType {
+        match self {
+            CertContext::User => ssh_key::certificate::CertType::User,
+            CertContext::Host => ssh_key::certificate::CertType::Host,
+        }
+    }
+
+    /// Label used in the [`CertificateCheck::WrongCertType`] reason.
+    fn label(self) -> &'static str {
+        match self {
+            CertContext::User => "user",
+            CertContext::Host => "host",
+        }
+    }
+}
+
+/// Pure validation of a certificate against a trusted CA set at time `now`
+/// (seconds since the Unix epoch).
+///
+/// `now_unix` is the clock seam: production passes `SystemTime::now()`, tests pass
+/// an arbitrary instant, which is what makes expiry testable without sleeping
+/// (plan §6.4 — clock injection, no Mock).
+///
+/// The four-step chain (propose §3.3 / plan-m4 M4-T1):
+/// 1. the **signing** key is a trusted CA (fails fast, before any crypto);
+/// 2. the certificate's own signature verifies (catches a tampered body);
+/// 3. `valid_after < now < valid_before`;
+/// 4. the requested principal/host is one of the certificate's valid principals,
+///    compared case-insensitively after trimming (host names are not case
+///    significant, and a trailing dot or stray whitespace must not be the reason
+///    a legitimate certificate is refused).
+pub fn validate_certificate_at(
+    context: CertContext,
+    cert: &russh::keys::Certificate,
+    ca_fingerprints: &[String],
+    principal: &str,
+    now_unix: u64,
+) -> CertificateCheck {
+    // 0. The certificate must be of the right kind for where it appeared: a
+    //    user certificate must never satisfy the host-key check, or a holder of
+    //    an ordinary user cert could impersonate the backend during KEX.
+    if cert.cert_type() != context.expected_type() {
+        return CertificateCheck::WrongCertType {
+            expected: context.label(),
+        };
+    }
+
     // 1. Trust anchor: the *signing* key must be a trusted CA. Doing this before
     //    the signature check means an untrusted CA fails fast and we never waste
     //    crypto on it.
@@ -247,14 +395,31 @@ pub fn validate_user_certificate_at(
 
     // 4. The requested principal must be one of the certificate's valid
     //    principals, otherwise a certificate minted for `bob` could log in as
-    //    `alex_host1`.
-    if !cert.valid_principals().iter().any(|p| p == principal) {
+    //    `alex_host1` — or, on the host path, a certificate minted for one
+    //    backend could stand in for another.
+    if !principals_contain(cert.valid_principals(), principal) {
         return CertificateCheck::PrincipalMismatch {
             expected: principal.to_owned(),
         };
     }
 
     CertificateCheck::Trusted
+}
+
+/// Case-insensitive, whitespace-insensitive principal/host-name containment.
+///
+/// Host names are not case significant (RFC 4343) and both sides may carry a
+/// trailing root dot, so `DB.Example.COM.` must match `db.example.com`. Being
+/// lenient here cannot widen trust: the entry still has to name exactly this
+/// principal.
+fn principals_contain(principals: &[String], wanted: &str) -> bool {
+    let wanted = normalize_principal(wanted);
+    principals.iter().any(|p| normalize_principal(p) == wanted)
+}
+
+/// Lower-case and strip surrounding whitespace plus a trailing root dot.
+fn normalize_principal(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Current Unix time in seconds, or an error if the clock is behind the epoch.
@@ -405,10 +570,136 @@ mod tests {
     }
 
     #[test]
+    fn host_certificate_is_typed_as_host_and_verified_by_the_same_chain() {
+        let ca = ca_key();
+        let inner = subject_key();
+        let cert = issue_host_certificate_with(
+            &ca,
+            &inner,
+            &["db.example.com".to_owned()],
+            "backend-host",
+            Duration::from_secs(300),
+        )
+        .expect("issue a host cert");
+        assert_eq!(
+            cert.cert_type(),
+            ssh_key::certificate::CertType::Host,
+            "a host certificate must be typed Host, or the host-key check cannot tell it apart"
+        );
+        let trusted = [sha256_fingerprint(ca.public_key())];
+        assert_eq!(
+            validate_host_certificate_at(
+                &cert,
+                &trusted,
+                "db.example.com",
+                now_unix_secs().unwrap()
+            ),
+            CertificateCheck::Trusted
+        );
+    }
+
+    #[test]
+    fn user_and_host_certificates_are_not_interchangeable() {
+        // The type is inside the signed body, so a user certificate can never
+        // satisfy the host check (and vice versa) — even from the same CA with
+        // the same principals.
+        let ca = ca_key();
+        let inner = subject_key();
+        let principals = vec!["db.example.com".to_owned()];
+        let user =
+            issue_user_certificate_with(&ca, &inner, &principals, "u", Duration::from_secs(300))
+                .expect("user cert");
+        let host =
+            issue_host_certificate_with(&ca, &inner, &principals, "h", Duration::from_secs(300))
+                .expect("host cert");
+        let trusted = [sha256_fingerprint(ca.public_key())];
+        let now = now_unix_secs().unwrap();
+
+        assert_eq!(
+            validate_user_certificate_at(&user, &trusted, "db.example.com", now),
+            CertificateCheck::Trusted
+        );
+        assert_eq!(
+            validate_host_certificate_at(&host, &trusted, "db.example.com", now),
+            CertificateCheck::Trusted
+        );
+        assert_eq!(
+            validate_host_certificate_at(&user, &trusted, "db.example.com", now),
+            CertificateCheck::WrongCertType { expected: "host" },
+            "a user certificate must not pass the host check"
+        );
+        assert_eq!(
+            validate_user_certificate_at(&host, &trusted, "db.example.com", now),
+            CertificateCheck::WrongCertType { expected: "user" },
+            "a host certificate must not pass the user check"
+        );
+    }
+
+    #[test]
+    fn host_certificate_for_another_host_fails_the_chain() {
+        let ca = ca_key();
+        let inner = subject_key();
+        let cert = issue_host_certificate_with(
+            &ca,
+            &inner,
+            &["payroll.example.com".to_owned()],
+            "other",
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        let trusted = [sha256_fingerprint(ca.public_key())];
+        assert_eq!(
+            validate_host_certificate_at(
+                &cert,
+                &trusted,
+                "db.example.com",
+                now_unix_secs().unwrap()
+            ),
+            CertificateCheck::PrincipalMismatch {
+                expected: "db.example.com".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn host_name_principal_matching_normalises_case_and_root_dot() {
+        // `DB.Example.COM.` and `db.example.com` denote the same host, so both
+        // must validate. Being lenient cannot widen trust: the entry still has to
+        // name exactly this principal.
+        let ca = ca_key();
+        let inner = subject_key();
+        let cert = issue_host_certificate_with(
+            &ca,
+            &inner,
+            &["db.example.com".to_owned()],
+            "h",
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        let trusted = [sha256_fingerprint(ca.public_key())];
+        let now = now_unix_secs().unwrap();
+        for alias in ["db.example.com", "DB.EXAMPLE.COM", "db.example.com."] {
+            assert_eq!(
+                validate_host_certificate_at(&cert, &trusted, alias, now),
+                CertificateCheck::Trusted,
+                "{alias} must be accepted"
+            );
+        }
+        assert_eq!(
+            validate_host_certificate_at(&cert, &trusted, "evil-db.example.com", now),
+            CertificateCheck::PrincipalMismatch {
+                expected: "evil-db.example.com".to_owned()
+            },
+            "leniency must not turn into a suffix match"
+        );
+    }
+
+    #[test]
     fn issuing_without_a_signing_key_is_refused() {
         // A verify-only CA must not silently produce certificates.
         let ca = CertificateAuthority {
             trusted_ca: Vec::new(),
+            trusted_ca_keys: Vec::new(),
             signing_key: None,
             cert_lifetime: Duration::from_secs(60),
         };

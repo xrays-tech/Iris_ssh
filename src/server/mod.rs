@@ -436,20 +436,34 @@ impl GatewayContext {
             keys.push(key);
         }
 
+        // M4: the certificate authority gates backend host *certificates*
+        // (`@cert-authority`) and issues the short-lived user certificates used
+        // for cert-mode dialing, so it is loaded before the dialer.
+        let ca = Arc::new(crate::ca::CertificateAuthority::load(&config.ca)?);
         let credentials = Arc::new(CredentialStore::load(&config)?);
         // No pre-pinned fingerprints by default: `pinned` therefore rejects
         // until an operator pins the backend fingerprint (out-of-band), while
-        // `accept-new` learns it with a warning.
-        let verifier = Arc::new(HostKeyVerifier::new(
-            config.backend.host_key_policy,
-            Vec::new(),
-        ));
-        let dialer = Arc::new(BackendDialer::new(
-            &config,
-            Arc::clone(&credentials),
-            Arc::clone(&verifier),
-            metrics.clone(),
-        ));
+        // `accept-new` learns it with a warning. The CA set is layered on top so
+        // a host certificate is trusted by its signer instead of its inner key.
+        let verifier = Arc::new(if ca.trusted_ca_fingerprints().is_empty() {
+            HostKeyVerifier::new(config.backend.host_key_policy, Vec::new())
+        } else {
+            HostKeyVerifier::with_trusted_ca(
+                config.backend.host_key_policy,
+                Vec::new(),
+                ca.trusted_ca_fingerprints().to_vec(),
+            )
+        });
+        let dialer = Arc::new(
+            BackendDialer::new(
+                &config,
+                Arc::clone(&credentials),
+                verifier,
+                metrics.clone(),
+                Some(Arc::clone(&ca)),
+            )
+            .with_ca(ca),
+        );
 
         let resolver = Arc::new(Resolver::new(
             control_plane,

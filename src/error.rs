@@ -106,6 +106,10 @@ pub enum BackendError {
     #[error("backend dial circuit open for {target}: repeated recent failures")]
     CircuitOpen { target: String },
 
+    /// A short-lived backend certificate could not be issued (cert-mode dial).
+    #[error("could not issue a backend certificate for {user}: {reason}")]
+    IssueCert { user: String, reason: String },
+
     #[error("backend authentication as {user:?} failed")]
     Auth { user: String },
 

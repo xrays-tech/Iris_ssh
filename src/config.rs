@@ -78,6 +78,10 @@ pub struct BackendConfig {
     /// Maps a backend username to the key file the gateway authenticates with.
     pub credential_map: BTreeMap<String, PathBuf>,
     pub host_key_policy: HostKeyPolicy,
+    /// Which credential the gateway presents: a private key (the default, and the
+    /// only mode that works without a configured CA) or a short-lived user
+    /// certificate issued on the fly (propose §3.3, M4-T3).
+    pub backend_auth: crate::backend::BackendAuthMethod,
 }
 
 impl BackendConfig {
@@ -385,6 +389,13 @@ struct RawBackend {
     #[serde(default)]
     credential_map: BTreeMap<String, String>,
     host_key_policy: String,
+    /// `"key"` (default) or `"cert"`.
+    #[serde(default = "default_backend_auth")]
+    backend_auth: String,
+}
+
+fn default_backend_auth() -> String {
+    "key".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,10 +724,32 @@ impl GatewayConfig {
         };
 
         let host_key_policy = HostKeyPolicy::parse(raw.backend.host_key_policy.trim())?;
-        if raw.backend.private_key.is_none() && raw.backend.credential_map.is_empty() {
+        // Credential rules per selected backend auth mode (M4-T3):
+        // * `key`  — a private key is mandatory (the backend's authorized_keys
+        //   carries its public key), so the existing error stands.
+        // * `cert` — the inner key is optional: the backend trusts the issuing CA
+        //   (`TrustedUserCAKeys`), so the gateway may present an ephemeral
+        //   keypair. A configured key is still honoured as a stable identity.
+        let backend_auth = crate::backend::BackendAuthMethod::parse(
+            "backend.backend_auth",
+            &raw.backend.backend_auth,
+        )?;
+        let has_key_material =
+            raw.backend.private_key.is_some() || !raw.backend.credential_map.is_empty();
+        if matches!(backend_auth, crate::backend::BackendAuthMethod::Key) && !has_key_material {
             return Err(ConfigError::Invalid {
                 field: "backend".into(),
-                reason: "either private_key or credential_map must be provided".into(),
+                reason:
+                    "either private_key or credential_map must be provided (backend_auth = \"key\")"
+                        .into(),
+            });
+        }
+        if matches!(backend_auth, crate::backend::BackendAuthMethod::Cert)
+            && raw.ca.signing_key.is_none()
+        {
+            return Err(ConfigError::Invalid {
+                field: "backend.backend_auth".into(),
+                reason: "backend_auth = \"cert\" requires [ca] signing_key (the gateway must be able to issue)".into(),
             });
         }
         for (user, path) in &raw.backend.credential_map {
@@ -736,6 +769,7 @@ impl GatewayConfig {
                 .map(|(u, p)| (u, PathBuf::from(p)))
                 .collect(),
             host_key_policy,
+            backend_auth,
         };
 
         if raw.pool.channels_per_conn == 0 || raw.pool.channels_per_conn > 8 {
@@ -1007,6 +1041,110 @@ mod tests {
         assert_eq!(cfg.limits.auth_timeout, Duration::ZERO);
         assert_eq!(cfg.limits.auth_rejection_pad, Duration::from_millis(250));
         assert_eq!(cfg.limits.inactivity_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn backend_auth_defaults_to_key_which_changes_nothing() {
+        let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
+        assert_eq!(
+            cfg.backend.backend_auth,
+            crate::backend::BackendAuthMethod::Key,
+            "the default credential must be the existing private-key path"
+        );
+    }
+
+    #[test]
+    fn backend_auth_cert_requires_a_signing_key() {
+        // A gateway told to present certificates it cannot mint must refuse to
+        // boot: silently falling back to keys would look like a working cert
+        // deployment while authenticating with something else.
+        let bad = minimal_toml().replace(
+            "host_key_policy = \"pinned\"",
+            "host_key_policy = \"pinned\"\n            backend_auth = \"cert\"",
+        );
+        let err = GatewayConfig::parse(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("signing_key"),
+            "expected a signing_key requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn backend_auth_cert_allows_omitting_the_private_key() {
+        // With a CA able to issue, the backend trusts the CA rather than a
+        // specific gateway key, so an ephemeral inner keypair is acceptable.
+        let assets = std::env::temp_dir().join(format!(
+            "sshgw-cfg-ca-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&assets).unwrap();
+        let host = assets.join("host");
+        let ca_priv = assets.join("ca");
+        let ca_pub = assets.join("ca.pub");
+        {
+            for p in [&host, &ca_priv] {
+                let mut rng = rand::rng();
+                let body =
+                    russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
+                        .unwrap()
+                        .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                        .unwrap();
+                let f = std::fs::File::create(p).unwrap();
+                let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
+                std::fs::write(p, body).unwrap();
+            }
+        }
+        std::fs::write(
+            &ca_pub,
+            russh::keys::load_secret_key(&ca_priv, None)
+                .unwrap()
+                .public_key()
+                .to_openssh()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [ {{ path = "{}", state = "active" }} ]
+            [backend]
+            host_key_policy = "accept-new"
+            backend_auth = "cert"
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [ca]
+            trusted_ca_keys = ["{}"]
+            signing_key = "{}"
+        "#,
+            host.to_string_lossy(),
+            ca_pub.to_string_lossy(),
+            ca_priv.to_string_lossy(),
+        );
+        drop(std::fs::remove_dir_all(&assets));
+
+        let cfg = GatewayConfig::parse(&toml).expect("cert mode without a private key is valid");
+        assert_eq!(
+            cfg.backend.backend_auth,
+            crate::backend::BackendAuthMethod::Cert
+        );
+        assert!(cfg.backend.private_key.is_none());
+        assert!(cfg.backend.credential_map.is_empty());
+        assert_eq!(cfg.ca.trusted_ca_keys.len(), 1);
+        assert!(cfg.ca.signing_key.is_some());
+    }
+
+    #[test]
+    fn backend_auth_rejects_an_unknown_value() {
+        let bad = minimal_toml().replace(
+            "host_key_policy = \"pinned\"",
+            "host_key_policy = \"pinned\"\n            backend_auth = \"token\"",
+        );
+        let err = GatewayConfig::parse(&bad).unwrap_err();
+        assert!(err.to_string().contains("backend_auth"), "{err}");
     }
 
     #[test]

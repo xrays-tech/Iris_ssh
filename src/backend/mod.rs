@@ -28,6 +28,55 @@ use crate::types::Grant;
 /// safe: group and other must have no access.
 const KEY_UNSAFE_MODE_MASK: u32 = 0o077;
 
+/// How the gateway authenticates itself to the backend (propose §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendAuthMethod {
+    /// A backend private key, with its public key in the backend's
+    /// `authorized_keys` — the default, unchanged path.
+    Key,
+    /// A short-lived user certificate issued by the gateway's CA, accepted by the
+    /// backend's `TrustedUserCAKeys`.
+    Cert,
+}
+
+impl BackendAuthMethod {
+    /// Parse the textual config / policy value.
+    pub fn parse(field: &str, value: &str) -> std::result::Result<Self, crate::error::ConfigError> {
+        match value.trim() {
+            "key" => Ok(BackendAuthMethod::Key),
+            "cert" => Ok(BackendAuthMethod::Cert),
+            other => Err(crate::error::ConfigError::Invalid {
+                field: field.to_owned(),
+                reason: format!("unknown backend_auth {other:?} (expected \"key\" or \"cert\")"),
+            }),
+        }
+    }
+
+    /// The canonical string form (round-trips through [`parse`](Self::parse)).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendAuthMethod::Key => "key",
+            BackendAuthMethod::Cert => "cert",
+        }
+    }
+}
+
+/// Resolve which credential the gateway presents to a backend.
+///
+/// `instance_default` is `[backend] backend_auth` (always set — it defaults to
+/// `key`), and `grant_override` is the optional per-resolve `policy.backend_auth`.
+/// The grant wins when present, which lets one control plane steer a single
+/// backend onto certificates while every other target keeps using keys.
+///
+/// Pure by design (plan S3): no I/O, no clock, no locks — so the routing rules
+/// are directly unit-testable.
+pub fn resolve_backend_auth(
+    instance_default: BackendAuthMethod,
+    grant_override: Option<BackendAuthMethod>,
+) -> BackendAuthMethod {
+    grant_override.unwrap_or(instance_default)
+}
+
 /// Loads and holds the backend private keys, keyed by backend username, plus an
 /// optional default key for users without an explicit mapping.
 #[derive(Debug, Default)]
@@ -125,11 +174,15 @@ fn check_key_permissions(path: &std::path::Path, is_host_key: bool) -> Result<()
 
 /// Compute the canonical `SHA256:` fingerprint of a backend host key. Exposed as
 /// a pure helper so the pinning value can be logged/asserted.
-//
-// M4: @cert-authority — for a Certificate, this currently fingerprints the
-// *inner* key (placeholder). A host-cert trust path must instead verify
-// `cert.signature_key()` against a trusted CA set (see docs/known-limitations.md).
-// TODO(M4): replace inner-key fingerprint with CA-set verification + tests.
+///
+/// For a `Certificate` this returns the **inner key's** fingerprint, which is
+/// what the pre-M4 `pinned`/`accept-new` policies (and an unconfigured CA set)
+/// match on. The M4 `@cert-authority` path does *not* use it: a trusted-CA host
+/// certificate is verified by
+/// [`HostKeyVerifier::verify_host_certificate`] instead, because the inner key
+/// rotates with every backend re-issue while the CA stays put.
+///
+/// `host_key_description` is the audit-friendly way to report either kind.
 pub fn host_key_fingerprint(key: &PublicKeyOrCertificate) -> String {
     let public = match key {
         PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
@@ -140,18 +193,52 @@ pub fn host_key_fingerprint(key: &PublicKeyOrCertificate) -> String {
     public.fingerprint(HashAlg::Sha256).to_string()
 }
 
+/// An operator-readable description of what the backend presented during KEX.
+///
+/// For a host certificate this deliberately names **both** the signing CA's
+/// fingerprint (the actual trust anchor) and the inner key's, so an operator
+/// reading a log line can tell a CA-signed host key apart from a bare one that
+/// merely happens to match a pinned fingerprint — the two are not
+/// interchangeable, and conflating them is exactly the confusion that
+/// `docs/known-limitations.md` #1 warns about.
+pub fn host_key_description(key: &PublicKeyOrCertificate) -> String {
+    match key {
+        PublicKeyOrCertificate::PublicKey { .. } => {
+            format!("hostkey {}", host_key_fingerprint(key))
+        }
+        PublicKeyOrCertificate::Certificate(cert) => format!(
+            "host-cert (ca {} / key {})",
+            crate::ca::certificate_ca_fingerprint(cert),
+            host_key_fingerprint(key)
+        ),
+    }
+}
+
 /// Client-leg handler: verifies the backend host key against the policy and
 /// records the last rejection reason so `connect` can surface a clear error.
+///
+/// russh hands the handler whatever the KEX produced — a bare public key *or* a
+/// host certificate — with **no** prior validation of its own, so the whole
+/// trust decision (including the `@cert-authority` chain) lives here.
 pub struct BackendClient {
     verifier: Arc<HostKeyVerifier>,
     last_rejection: Arc<Mutex<Option<String>>>,
+    /// The host name this dial set out to reach. A host certificate must name it
+    /// among its valid principals, or a certificate minted for a *different*
+    /// backend would be accepted here (M4-T1, plan risk "principals 越权").
+    expected_host: String,
 }
 
 impl BackendClient {
-    fn new(verifier: Arc<HostKeyVerifier>, last_rejection: Arc<Mutex<Option<String>>>) -> Self {
+    fn new(
+        verifier: Arc<HostKeyVerifier>,
+        last_rejection: Arc<Mutex<Option<String>>>,
+        expected_host: String,
+    ) -> Self {
         BackendClient {
             verifier,
             last_rejection,
+            expected_host,
         }
     }
 }
@@ -163,18 +250,47 @@ impl client::Handler for BackendClient {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
-        let fp = host_key_fingerprint(server_public_key);
-        match self.verifier.verify(&fp) {
-            crate::policy::HostKeyVerdict::Trusted => Ok(true),
+        let described = host_key_description(server_public_key);
+
+        // M4-T1: a host certificate goes through the four-step
+        // `@cert-authority` chain when trusted CAs are configured. With no CA
+        // configured it falls back to the legacy inner-fingerprint path so an
+        // operator who has not adopted certificates sees no behaviour change.
+        let verdict = match server_public_key {
+            PublicKeyOrCertificate::Certificate(cert) if self.verifier.has_trusted_ca() => {
+                let now = crate::ca::now_unix_secs()
+                    .unwrap_or_else(|e| {
+                        // A clock we cannot read is not a reason to trust
+                        // anything: refuse, and say why.
+                        tracing::warn!(target: "backend", %e, "cannot read the clock for host-cert validation");
+                        u64::MAX
+                    });
+                // u64::MAX is in the future, so every real certificate reads as
+                // expired — fail closed.
+                self.verifier
+                    .verify_host_certificate(cert, &self.expected_host, now)
+            }
+            _ => self
+                .verifier
+                .verify(&host_key_fingerprint(server_public_key)),
+        };
+
+        match verdict {
+            crate::policy::HostKeyVerdict::Trusted => {
+                if matches!(server_public_key, PublicKeyOrCertificate::Certificate(_)) {
+                    tracing::info!(target: "backend", host = %described, "trusted backend host certificate via @cert-authority");
+                }
+                Ok(true)
+            }
             crate::policy::HostKeyVerdict::TrustFirstUse => {
-                tracing::warn!(target: "backend", %fp, "trusted backend host key on first use; pin it for production");
+                tracing::warn!(target: "backend", host = %described, "trusted backend host key on first use; pin it for production");
                 Ok(true)
             }
             crate::policy::HostKeyVerdict::Rejected { reason } => {
                 if let Ok(mut slot) = self.last_rejection.lock() {
-                    *slot = Some(format!("{reason} (fingerprint {fp})"));
+                    *slot = Some(format!("{reason} ({described})"));
                 }
-                tracing::warn!(target: "backend", %fp, %reason, "rejected backend host key");
+                tracing::warn!(target: "backend", host = %described, %reason, "rejected backend host key");
                 Ok(false)
             }
         }
@@ -188,6 +304,12 @@ pub struct BackendDialer {
     client_config: Arc<client::Config>,
     metrics: Metrics,
     dial_timeout: Duration,
+    /// The gateway's CA: signs a fresh short-lived user certificate per dial in
+    /// cert mode. Absent means cert mode is unavailable and dialing fails loudly.
+    ca: Option<Arc<crate::ca::CertificateAuthority>>,
+    /// `[backend] backend_auth`: the default credential for grants that do not
+    /// carry their own override.
+    backend_auth: BackendAuthMethod,
     /// Per-target dial circuit breaker (§3.8): after `threshold` consecutive
     /// dial failures a target is short-circuited so repeated channel opens don't
     /// pile onto a dead backend.
@@ -200,8 +322,22 @@ impl BackendDialer {
         credentials: Arc<CredentialStore>,
         verifier: Arc<HostKeyVerifier>,
         metrics: Metrics,
+        ca: Option<Arc<crate::ca::CertificateAuthority>>,
     ) -> Self {
+        let mut preferred = client::Config::default().preferred;
+        // russh's client default advertises **no** host-certificate algorithms,
+        // so a backend that only offers a host certificate is negotiated down to
+        // its bare key and the `@cert-authority` chain would never run. Advertising
+        // the certificate types our trusted CAs can actually verify closes that
+        // gap (plan-m4 M4-T1's missing wire half).
+        if let Some(ca) = &ca {
+            let algos = ca.trusted_cert_algorithms();
+            if !algos.is_empty() {
+                preferred.host_key_certificates = std::borrow::Cow::Owned(algos);
+            }
+        }
         let client_config = client::Config {
+            preferred,
             window_size: config.relay.window_size,
             maximum_packet_size: config.relay.max_packet,
             // The gateway drives liveness itself; don't let russh's own timeout
@@ -228,11 +364,27 @@ impl BackendDialer {
             client_config: Arc::new(client_config),
             metrics,
             dial_timeout: config.control_plane.timeout,
+            ca,
+            backend_auth: config.backend.backend_auth,
             dial_breaker: DialCircuitBreaker::new(
                 config.pool.circuit_failure_threshold,
                 config.pool.circuit_reset_timeout,
             ),
         }
+    }
+
+    /// Attach the certificate authority, enabling cert-mode dialing and the
+    /// host-certificate trust path (M4-T1/T2). Without it the dialer keeps the
+    /// pre-M4 private-key behaviour exactly.
+    pub fn with_ca(mut self, ca: Arc<crate::ca::CertificateAuthority>) -> Self {
+        self.ca = Some(ca);
+        self
+    }
+
+    /// The routing default this dialer was built with (exposed for introspection
+    /// and tests).
+    pub fn backend_auth_method(&self) -> BackendAuthMethod {
+        self.backend_auth
     }
 
     /// The breaker key for a grant's target (one breaker per `host:port`).
@@ -255,11 +407,17 @@ impl BackendDialer {
         let started = std::time::Instant::now();
         let addr = (grant.target.host.as_str(), grant.target.port);
         let last_rejection: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let handler = BackendClient::new(Arc::clone(&self.verifier), Arc::clone(&last_rejection));
+        let handler = BackendClient::new(
+            Arc::clone(&self.verifier),
+            Arc::clone(&last_rejection),
+            // Host-certificate validation must check the certificate names *this*
+            // host, so the handler needs the name we set out to reach.
+            grant.target.host.clone(),
+        );
 
         let connect_fut =
             client::connect::<BackendClient, _>(Arc::clone(&self.client_config), addr, handler);
-        let handle = tokio::time::timeout(self.dial_timeout, connect_fut)
+        let mut handle = tokio::time::timeout(self.dial_timeout, connect_fut)
             .await
             .map_err(|_| {
                 self.metrics.backend_dial_fail();
@@ -277,24 +435,43 @@ impl BackendDialer {
                 self.dial_error(grant, last_rejection, e)
             })?;
 
-        // Authenticate with the backend key for the target user.
-        let key_for_user = self
-            .credentials
-            .for_user(&grant.target.user)
-            .ok_or_else(|| {
+        // Authenticate with the credential the routed method selects (M4-T2/T3).
+        // A per-grant override wins over `[backend] backend_auth`; a malformed
+        // policy value is a resolve error, not a silent downgrade to `key`.
+        let method = match grant.policy.backend_auth_method() {
+            Some(Ok(override_method)) => override_method,
+            Some(Err(e)) => {
                 self.metrics.backend_dial_fail();
                 self.dial_breaker.record_failure(&key);
-                BackendError::Auth {
-                    user: grant.target.user.clone(),
-                }
-            })?;
-        let pkwha = PrivateKeyWithHashAlg::new(key_for_user, None);
+                return Err(e.into());
+            }
+            None => self.backend_auth,
+        };
+        let outcome = match method {
+            BackendAuthMethod::Key => {
+                let key_for_user =
+                    self.credentials
+                        .for_user(&grant.target.user)
+                        .ok_or_else(|| BackendError::Auth {
+                            user: grant.target.user.clone(),
+                        })?;
+                let pkwha = PrivateKeyWithHashAlg::new(key_for_user, None);
+                handle
+                    .authenticate_publickey(&grant.target.user, pkwha)
+                    .await
+                    .map_err(|e| BackendError::Auth {
+                        user: format!("{} ({e})", grant.target.user),
+                    })
+            }
+            BackendAuthMethod::Cert => self.authenticate_with_certificate(&mut handle, grant).await,
+        };
 
-        let mut handle = handle;
-        match handle
-            .authenticate_publickey(&grant.target.user, pkwha)
-            .await
-        {
+        match outcome {
+            Err(e) => {
+                self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(&key);
+                Err(e.into())
+            }
             Ok(AuthResult::Success) => {
                 self.metrics.backend_dial_ok();
                 self.metrics.backend_dial_latency(started.elapsed());
@@ -310,15 +487,82 @@ impl BackendDialer {
                 }
                 .into())
             }
-            Err(e) => {
-                self.metrics.backend_dial_fail();
-                self.dial_breaker.record_failure(&key);
-                Err(BackendError::Auth {
-                    user: format!("{} ({e})", grant.target.user),
-                }
-                .into())
-            }
         }
+    }
+
+    /// Authenticate to the backend with a **freshly issued** short-lived user
+    /// certificate (M4-T2).
+    ///
+    /// The certificate is minted at dial time and never cached or reused:
+    ///
+    /// * **stateless** — nothing to persist, so an HA fleet of replicas needs no
+    ///   shared cert store and no coordination;
+    /// * **auditable** — every connection issues exactly one certificate, so the
+    ///   audit trail lines up one-to-one with dials;
+    /// * **rotation-safe for new connections** — a CA signing-key rotation takes
+    ///   effect on the next dial, not on a schedule.
+    ///
+    /// The deliberate trade-off (recorded here per plan-m4 M4-T2): a connection
+    /// that is *already established* keeps its certificate for the life of the
+    /// SSH session. SSH never re-authenticates inside a session, so rotating the
+    /// CA cannot revoke a live connection; it only stops the next one. Revoking
+    /// an established session is the backend's job (`ssh-keygen -R` on the user
+    /// side, or killing the session).
+    ///
+    /// The *inner* key is the configured backend credential when one exists, and
+    /// an ephemeral keypair otherwise — which is what lets `private_key` /
+    /// `credential_map` be omitted in cert mode, since the backend trusts the CA
+    /// rather than a specific gateway key.
+    async fn authenticate_with_certificate(
+        &self,
+        handle: &mut Handle<BackendClient>,
+        grant: &Grant,
+    ) -> std::result::Result<AuthResult, BackendError> {
+        let user = &grant.target.user;
+        let ca = self.ca.as_ref().ok_or_else(|| BackendError::IssueCert {
+            user: user.clone(),
+            reason: "no CA is loaded; cert mode needs [ca] signing_key".into(),
+        })?;
+
+        // Prefer the operator-provisioned identity; otherwise use a throwaway
+        // keypair, which is safe because the backend trusts the issuing CA.
+        let inner_key = match self.credentials.for_user(user) {
+            Some(key) => key,
+            None => Arc::new(
+                PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).map_err(
+                    |e| BackendError::IssueCert {
+                        user: user.clone(),
+                        reason: format!("generating an ephemeral keypair: {e}"),
+                    },
+                )?,
+            ),
+        };
+
+        // One certificate per dial: principals = the backend user, lifetime =
+        // `[ca].cert_lifetime`, key_id = what the backend's logs will show.
+        let principals = vec![user.clone()];
+        let key_id = format!("sshgw-dial-{}@{}", grant.principal.as_str(), user);
+        let cert = ca
+            .issue_user_certificate(inner_key.public_key(), &principals, &key_id)
+            .map_err(|e| BackendError::IssueCert {
+                user: user.clone(),
+                reason: e.to_string(),
+            })?;
+
+        tracing::debug!(
+            target: "backend",
+            user = %user,
+            key_id = %key_id,
+            "authenticating to the backend with a short-lived user certificate"
+        );
+
+        handle
+            .authenticate_openssh_cert(user, inner_key, cert)
+            .await
+            .map_err(|e| BackendError::IssueCert {
+                user: user.clone(),
+                reason: e.to_string(),
+            })
     }
 
     fn dial_error(
@@ -430,6 +674,140 @@ mod tests {
         );
     }
 
+    // ---- M4-T2/T3: backend credential routing + config ----
+
+    #[test]
+    fn routing_prefers_the_grant_override_then_the_instance_default() {
+        use crate::backend::{resolve_backend_auth, BackendAuthMethod};
+        // No override -> the instance default.
+        assert_eq!(
+            resolve_backend_auth(BackendAuthMethod::Key, None),
+            BackendAuthMethod::Key
+        );
+        assert_eq!(
+            resolve_backend_auth(BackendAuthMethod::Cert, None),
+            BackendAuthMethod::Cert
+        );
+        // The grant wins when present, in both directions.
+        assert_eq!(
+            resolve_backend_auth(BackendAuthMethod::Key, Some(BackendAuthMethod::Cert)),
+            BackendAuthMethod::Cert
+        );
+        assert_eq!(
+            resolve_backend_auth(BackendAuthMethod::Cert, Some(BackendAuthMethod::Key)),
+            BackendAuthMethod::Key
+        );
+    }
+
+    #[test]
+    fn backend_auth_method_parses_and_round_trips() {
+        use crate::backend::BackendAuthMethod;
+        assert_eq!(
+            BackendAuthMethod::parse("f", "key").unwrap(),
+            BackendAuthMethod::Key
+        );
+        assert_eq!(
+            BackendAuthMethod::parse("f", " cert ").unwrap(),
+            BackendAuthMethod::Cert
+        );
+        assert_eq!(BackendAuthMethod::Key.as_str(), "key");
+        assert_eq!(BackendAuthMethod::Cert.as_str(), "cert");
+        assert!(BackendAuthMethod::parse("f", "token").is_err());
+    }
+
+    #[test]
+    fn policy_backend_auth_absent_means_no_override() {
+        // A control plane that predates the field must not change behaviour.
+        let policy = crate::types::Policy {
+            tcp_forwarding: true,
+            ..Default::default()
+        };
+        assert_eq!(policy.backend_auth, None);
+        assert!(policy.backend_auth_method().is_none());
+    }
+
+    #[test]
+    fn policy_backend_auth_reports_a_malformed_value_instead_of_defaulting() {
+        // An unreadable policy must not silently downgrade the credential to a
+        // key: that would quietly weaken authentication.
+        let policy = crate::types::Policy {
+            backend_auth: Some("token".to_owned()),
+            ..Default::default()
+        };
+        match policy.backend_auth_method() {
+            Some(Err(e)) => assert!(!e.to_string().is_empty()),
+            other => panic!("a malformed backend_auth must be an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cert_mode_without_a_ca_loaded_fails_loudly() {
+        // A dialer built without a CA must refuse rather than fall back to keys.
+        use crate::backend::BackendAuthMethod;
+        let grant = crate::types::Grant {
+            principal: crate::types::Principal::parse("alex_host1").unwrap(),
+            fingerprint: crate::types::Fingerprint::new("SHA256:fp"),
+            target: crate::types::Target {
+                host: "127.0.0.1".into(),
+                port: 22,
+                user: "root".into(),
+            },
+            policy: crate::types::Policy {
+                backend_auth: Some("cert".to_owned()),
+                ..Default::default()
+            },
+        };
+        let assets = std::env::temp_dir().join(format!(
+            "sshgw-m4-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&assets).unwrap();
+        let host = assets.join("host");
+        let backend = assets.join("backend");
+        for p in [&host, &backend] {
+            let mut rng = rand::rng();
+            let body = PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                .unwrap();
+            {
+                let f = std::fs::File::create(p).unwrap();
+                let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
+            }
+            std::fs::write(p, body).unwrap();
+        }
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [ {{ path = "{}", state = "active" }} ]
+            [backend]
+            private_key = "{}"
+            host_key_policy = "accept-new"
+            backend_auth = "cert"
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [ca]
+            trusted_ca_keys = []
+        "#,
+            host.to_string_lossy(),
+            backend.to_string_lossy(),
+        );
+        drop(std::fs::remove_dir_all(&assets));
+
+        // The config layer catches the contradictory combination first (cert mode
+        // needs a signing key), so this never reaches the dialer.
+        let err = crate::config::GatewayConfig::parse(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signing_key"),
+            "cert mode without a signing key must be rejected at config time, got: {msg}"
+        );
+        let _ = (grant, BackendAuthMethod::Cert);
+    }
+
     #[test]
     fn verifier_rejects_unpinned_under_pinned_policy() {
         let v = HostKeyVerifier::new(HostKeyPolicy::Pinned, Vec::new());
@@ -499,7 +877,7 @@ mod tests {
         let config = crate::config::GatewayConfig::parse(&toml).unwrap();
         let credentials = Arc::new(CredentialStore::load(&config).unwrap());
         let verifier = Arc::new(HostKeyVerifier::new(HostKeyPolicy::AcceptNew, Vec::new()));
-        let dialer = BackendDialer::new(&config, credentials, verifier, Metrics::default());
+        let dialer = BackendDialer::new(&config, credentials, verifier, Metrics::default(), None);
         drop(std::fs::remove_dir_all(&assets));
         dialer
     }
