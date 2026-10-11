@@ -128,3 +128,16 @@ tail_log() {
     printf '%s\n' "----- end $f -----" >&2
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Minimal assertions for standalone scripts/*.sh harnesses that source lib.sh
+# but not tests/integration/common.sh (cases redefine these with CASE_NAME, so
+# they are unaffected — common.sh is sourced after lib.sh and overrides).
+# ---------------------------------------------------------------------------
+pass() { printf 'PASS: %s\n' "$*" >&2; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+assert_eq()        { if [ "$1" = "$2" ]; then pass "eq '$1' ($3)"; else fail "$3: expected [$2] got [$1]"; fi; }
+assert_ne()        { if [ "$1" != "$2" ]; then pass "ne ($3)"; else fail "$3: expected != [$2]"; fi; }
+assert_contains()  { case "$1" in *"$2"*) pass "contains '$2' ($3)";; *) fail "$3: expected to contain [$2]";; esac; }
+assert_not_contains(){ case "$1" in *"$2"*) fail "$3: expected NOT to contain [$2]";; *) pass "not-contains ($3)";; esac; }
+assert_rc0()       { local rc=0 o; o="$("$@" 2>&1)" || rc=$?; if [ "$rc" = 0 ]; then pass "rc0 :: $*"; else fail "rc0 expected: $* got rc=$rc out=[$o]"; fi; }

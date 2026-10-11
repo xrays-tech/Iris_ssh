@@ -6,6 +6,8 @@
 #   make test           unit tests (cargo test)
 #   make integration    black-box integration suite (scripts/run_integration.sh)
 #   make selftest       infra-only health check (backend sshd + control plane)
+#   make soak           A5 long-run stability soak (scripts/run_soak.sh; SOAK_DURATION)
+#   make ha-drain       B5 HA drain rollout rehearsal (scripts/ha_drain.sh)
 #   make all            lint + test + build + integration
 #
 # The integration suite is self-contained: a local sshd backend + a mock
@@ -16,7 +18,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := all
 
-.PHONY: help build lint test integration selftest all
+.PHONY: help build lint test integration selftest soak ha-drain all
 
 help:
 	@grep -E '^#   make' $(MAKEFILE_LIST) | sed 's/^#   //'
@@ -38,3 +40,9 @@ integration:
 	scripts/run_integration.sh
 
 all: lint test build integration
+
+soak:
+	SOAK_DURATION=$${SOAK_DURATION:-60} scripts/run_soak.sh
+
+ha-drain:
+	scripts/ha_drain.sh
