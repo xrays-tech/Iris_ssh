@@ -314,6 +314,12 @@ pub struct BackendDialer {
     /// dial failures a target is short-circuited so repeated channel opens don't
     /// pile onto a dead backend.
     dial_breaker: DialCircuitBreaker,
+    /// Process-wide ephemeral identity reused for cert-dial when the operator did
+    /// not provision a per-user key (M4 P2-2). The *certificate* is still minted
+    /// fresh per dial — this only avoids `PrivateKey::random` on every connect;
+    /// the backend trusts the CA, not this throwaway identity key. The `Result`
+    /// outer layer preserves a collection error instead of panicking on first use.
+    ephemeral_identity: std::sync::OnceLock<std::result::Result<Arc<PrivateKey>, String>>,
 }
 
 impl BackendDialer {
@@ -370,6 +376,7 @@ impl BackendDialer {
                 config.pool.circuit_failure_threshold,
                 config.pool.circuit_reset_timeout,
             ),
+            ephemeral_identity: std::sync::OnceLock::new(),
         }
     }
 
@@ -524,18 +531,25 @@ impl BackendDialer {
             reason: "no CA is loaded; cert mode needs [ca] signing_key".into(),
         })?;
 
-        // Prefer the operator-provisioned identity; otherwise use a throwaway
-        // keypair, which is safe because the backend trusts the issuing CA.
+        // Prefer the operator-provisioned identity; otherwise reuse a single
+        // process-wide throwaway keypair (safe because the backend trusts the
+        // issuing CA, not this identity key — see M4 P2-2). The certificate is
+        // still minted fresh per dial below.
         let inner_key = match self.credentials.for_user(user) {
             Some(key) => key,
-            None => Arc::new(
-                PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).map_err(
-                    |e| BackendError::IssueCert {
+            None => match self.ephemeral_identity.get_or_init(|| {
+                PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                    .map(Arc::new)
+                    .map_err(|e| format!("generating an ephemeral identity key: {e}"))
+            }) {
+                Ok(key) => key.clone(),
+                Err(reason) => {
+                    return Err(BackendError::IssueCert {
                         user: user.clone(),
-                        reason: format!("generating an ephemeral keypair: {e}"),
-                    },
-                )?,
-            ),
+                        reason: reason.clone(),
+                    })
+                }
+            },
         };
 
         // One certificate per dial: principals = the backend user, lifetime =
@@ -933,5 +947,50 @@ mod tests {
             .build()
             .unwrap()
             .block_on(fut)
+    }
+
+    #[test]
+    fn ephemeral_identity_is_generated_once_and_reused_across_dials() {
+        // M4 P2-2: without an operator-provisioned key, cert mode reuses one
+        // process-wide throwaway identity key instead of PrivateKey::random per
+        // dial; the certificate is still minted fresh each time.
+        let dialer = dialer_with(1, Duration::from_secs(60));
+        let key1 = {
+            let slot = dialer
+                .ephemeral_identity
+                .get_or_init(|| {
+                    PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                        .map(Arc::new)
+                        .map_err(|e| e.to_string())
+                })
+                .clone()
+                .expect("ephemeral key generation must not fail");
+            key1_fingerprint(&slot)
+        };
+        let key2 = {
+            let slot = dialer
+                .ephemeral_identity
+                .get_or_init(|| {
+                    // A second init must not happen; if it did, the fingerprint
+                    // would differ and the assert below would fail.
+                    PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                        .map(Arc::new)
+                        .map_err(|e| e.to_string())
+                })
+                .clone()
+                .expect("ephemeral key generation must not fail");
+            key1_fingerprint(&slot)
+        };
+        assert_eq!(
+            key1, key2,
+            "ephemeral identity must be generated once and reused across dials"
+        );
+        assert!(!key1.is_empty());
+    }
+
+    fn key1_fingerprint(k: &Arc<PrivateKey>) -> String {
+        k.public_key()
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string()
     }
 }
