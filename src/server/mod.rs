@@ -654,14 +654,6 @@ pub struct GatewaySession {
     audited: bool,
 }
 
-/// Result of running an uplink buffer through the channel tap (B2/B3).
-enum UplinkOutcome {
-    /// Forward these bytes to the backend.
-    Forward(Vec<u8>),
-    /// Nothing should be forwarded (the tap refused everything).
-    Dropped,
-}
-
 impl GatewaySession {
     fn reject_all(&self) -> Auth {
         Auth::reject()
@@ -669,42 +661,29 @@ impl GatewaySession {
 
     /// Run an uplink buffer through the channel's tap (B2/B3).
     ///
-    /// Injected bytes (e.g. a synthesized SFTP failure response) are written
-    /// back to the client immediately so it sees the refusal, and only the
-    /// permitted remainder is forwarded.
-    fn apply_uplink_tap(&mut self, channel: ChannelId, data: &[u8]) -> UplinkOutcome {
+    /// Returns `None` when nothing is forwarded, otherwise the permitted bytes
+    /// together with any bytes that must be pushed back to the client on the
+    /// **channel data stream** — a synthesized SFTP failure has to travel the same
+    /// stream the client's request arrived on, or the client waits forever for a
+    /// reply that never comes.
+    fn apply_uplink_tap(&mut self, channel: ChannelId, data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         let Some(tap) = self.taps.get(&channel).cloned() else {
-            return UplinkOutcome::Forward(data.to_vec());
+            return Some((data.to_vec(), Vec::new()));
         };
         match tap.on_data(relay::Direction::Up, data) {
-            relay::DataVerdict::Pass => UplinkOutcome::Forward(data.to_vec()),
+            relay::DataVerdict::Pass => Some((data.to_vec(), Vec::new())),
             relay::DataVerdict::Rewrite {
                 forward,
                 inject,
                 denied,
             } => {
                 if let Some(reason) = denied {
-                    self.ctx.metrics.sftp_request_denied();
-                    tracing::info!(target: "relay", %channel, %reason, "uplink data withheld by tap");
+                    tracing::info!(target: "relay", %channel, %reason, "uplink request withheld by tap");
                 }
-                if !inject.is_empty() {
-                    // The client-facing session handle lives on the relay's
-                    // session; push the refusal back down the client channel.
-                    let entry = self.entry.clone();
-                    if let Some(entry) = entry {
-                        let cid = channel;
-                        tokio::spawn(async move {
-                            let _ = entry
-                                .handle
-                                .extended_data(cid, 1, Bytes::from(inject))
-                                .await;
-                        });
-                    }
-                }
-                if forward.is_empty() {
-                    UplinkOutcome::Dropped
+                if forward.is_empty() && inject.is_empty() {
+                    None
                 } else {
-                    UplinkOutcome::Forward(forward)
+                    Some((forward, inject))
                 }
             }
         }
@@ -1257,14 +1236,22 @@ impl server::Handler for GatewaySession {
             }
         }
 
-        // B2/B3: the channel tap may withhold or rewrite the payload. A rewrite
-        // is returned only when something was refused, so the untapped fast path
-        // still forwards the client's buffer without copying it.
-        let payload = match self.apply_uplink_tap(channel, data) {
-            UplinkOutcome::Forward(buf) => buf,
-            UplinkOutcome::Dropped => return Ok(()),
+        // B2/B3: the channel tap may withhold part of the payload and answer the
+        // client directly (e.g. a synthesized SFTP permission-denied status). The
+        // untapped fast path still forwards the client's buffer with no copy.
+        let Some((payload, inject)) = self.apply_uplink_tap(channel, data) else {
+            return Ok(());
         };
         let n = payload.len();
+        // The refusal answer goes on the same channel-data stream the request
+        // arrived on; writing it to stderr instead would strand the client.
+        if !inject.is_empty() {
+            // `Session::data` is synchronous (it enqueues onto the session's own
+            // send channel), unlike `Handle::data` used from detached tasks.
+            if let Err(e) = session.data(channel, Bytes::from(inject)) {
+                tracing::debug!(target: "relay", ?channel, ?e, "could not deliver tap response to client");
+            }
+        }
 
         // The relay is still present: the serial handler cannot have been
         // re-entered during our await, and nothing else removes relays.
@@ -1662,7 +1649,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!(
                 "sshgw-ctx-{}-{}.key",
                 std::process::id(),
-                digest.replace(':', "").replace('/', "")
+                digest.replace([':', '/'], "")
             ));
             {
                 let f = std::fs::File::create(&path).unwrap();
@@ -2717,17 +2704,20 @@ mod tests {
         out
     }
 
-    fn request(type_byte: u8, id: u32, path: &str) -> Vec<u8> {
+    /// Build a request frame using the SFTP command's **wire** type byte, so the
+    /// fixture cannot drift from the parser's table (the mistake that let
+    /// `deny_commands=["REMOVE"]` silently never match).
+    fn request(command: crate::sftp::SftpCommand, id: u32, path: &str) -> Vec<u8> {
         let mut body = id.to_be_bytes().to_vec();
         body.extend_from_slice(&(path.len() as u32).to_be_bytes());
         body.extend_from_slice(path.as_bytes());
-        frame(type_byte, &body)
+        frame(command.type_byte(), &body)
     }
 
     #[tokio::test]
     async fn sftp_inspector_passes_allowed_requests_without_copying() {
         let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
-        let ok = request(3, 1, "/data/ok.txt"); // OPEN
+        let ok = request(crate::sftp::SftpCommand::Open, 1, "/data/ok.txt");
         let verdict = inspector.on_data(relay::Direction::Up, &ok);
         assert_eq!(
             verdict,
@@ -2739,7 +2729,7 @@ mod tests {
     #[tokio::test]
     async fn sftp_inspector_denies_a_forbidden_command_and_synthesises_status() {
         let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
-        let rm = request(10, 42, "/data/x.txt"); // REMOVE
+        let rm = request(crate::sftp::SftpCommand::Remove, 42, "/data/x.txt");
         let verdict = inspector.on_data(relay::Direction::Up, &rm);
         let relay::DataVerdict::Rewrite {
             forward,
@@ -2769,14 +2759,14 @@ mod tests {
     #[tokio::test]
     async fn sftp_inspector_denies_paths_outside_the_allow_list() {
         let inspector = sftp_inspector(&[], &["/data/"], &[]);
-        let denied = request(3, 7, "/etc/shadow"); // OPEN /etc/shadow
+        let denied = request(crate::sftp::SftpCommand::Open, 7, "/etc/shadow");
         let verdict = inspector.on_data(relay::Direction::Up, &denied);
         assert!(
             matches!(verdict, relay::DataVerdict::Rewrite { .. }),
             "an out-of-scope path must be refused"
         );
 
-        let allowed = request(3, 8, "/data/ok.txt");
+        let allowed = request(crate::sftp::SftpCommand::Open, 8, "/data/ok.txt");
         assert_eq!(
             inspector.on_data(relay::Direction::Up, &allowed),
             relay::DataVerdict::Pass
@@ -2786,7 +2776,7 @@ mod tests {
     #[tokio::test]
     async fn sftp_inspector_never_inspects_downlink_data() {
         let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
-        let rm = request(10, 42, "/data/x.txt");
+        let rm = request(crate::sftp::SftpCommand::Remove, 42, "/data/x.txt");
         assert_eq!(
             inspector.on_data(relay::Direction::Down, &rm),
             relay::DataVerdict::Pass,
@@ -2798,8 +2788,8 @@ mod tests {
     async fn composite_tap_chains_inspector_before_recorder() {
         // The recorder must see only what the inspector allowed.
         let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
-        let rm = request(10, 1, "/data/x.txt");
-        let allowed = request(3, 2, "/data/ok.txt");
+        let rm = request(crate::sftp::SftpCommand::Remove, 1, "/data/x.txt");
+        let allowed = request(crate::sftp::SftpCommand::Open, 2, "/data/ok.txt");
         let combined: Vec<u8> = rm.iter().chain(allowed.iter()).copied().collect();
 
         // With the inspector first, the recorder sees just the allowed OPEN.

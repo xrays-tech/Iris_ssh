@@ -26,11 +26,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::relay::{ChannelCtx, ChannelTap, DataVerdict, Direction, SubsystemInterceptor, Verdict};
 
-/// A decoded SFTP request of interest.
+/// A decoded SFTP message of interest.
+///
+/// The numeric values are the **wire type bytes** from SFTP draft
+/// ietf-secsh-filexfer-02; they are not interchangeable — `SSH_FXP_REMOVE` (13)
+/// and `SSH_FXP_RMDIR` (15) look adjacent but mean very different things, and a
+/// mix-up silently disables a policy rule (that exact bug is why
+/// `tests::real_client_wire_bytes_decode` below asserts the golden frames
+/// captured from the OpenSSH `sftp` client).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SftpCommand {
-    /// `SSH_FXP_INIT` — protocol negotiation; carries no path.
+    /// `SSH_FXP_INIT` — version negotiation; carries no path.
     Init,
+    /// `SSH_FXP_VERSION` — the server's version reply.
+    Version,
     Open,
     Close,
     Read,
@@ -38,6 +47,8 @@ pub enum SftpCommand {
     Lstat,
     Fstat,
     SetStat,
+    /// `SSH_FXP_FSETSTAT` (10) — by handle, so it carries no path.
+    FSetStat,
     Remove,
     Rename,
     Mkdir,
@@ -46,6 +57,8 @@ pub enum SftpCommand {
     ReadDir,
     RealPath,
     Stat,
+    /// `SSH_FXP_EXTENDED` — a vendor extension request (e.g. `limits@openssh.com`).
+    Extended,
     /// A request this parser does not classify (forwarded as-is).
     Other(u8),
 }
@@ -55,6 +68,7 @@ impl SftpCommand {
     pub fn type_byte(self) -> u8 {
         match self {
             SftpCommand::Init => 1,
+            SftpCommand::Version => 2,
             SftpCommand::Open => 3,
             SftpCommand::Close => 4,
             SftpCommand::Read => 5,
@@ -62,14 +76,16 @@ impl SftpCommand {
             SftpCommand::Lstat => 7,
             SftpCommand::Fstat => 8,
             SftpCommand::SetStat => 9,
-            SftpCommand::Remove => 10,
-            SftpCommand::Rename => 11,
-            SftpCommand::Mkdir => 12,
-            SftpCommand::Rmdir => 13,
-            SftpCommand::OpenDir => 14,
-            SftpCommand::ReadDir => 15,
+            SftpCommand::FSetStat => 10,
+            SftpCommand::OpenDir => 11,
+            SftpCommand::ReadDir => 12,
+            SftpCommand::Remove => 13,
+            SftpCommand::Mkdir => 14,
+            SftpCommand::Rmdir => 15,
             SftpCommand::RealPath => 16,
             SftpCommand::Stat => 17,
+            SftpCommand::Rename => 18,
+            SftpCommand::Extended => 200,
             SftpCommand::Other(b) => b,
         }
     }
@@ -78,6 +94,7 @@ impl SftpCommand {
     pub fn name(self) -> String {
         match self {
             SftpCommand::Init => "INIT".to_owned(),
+            SftpCommand::Version => "VERSION".to_owned(),
             SftpCommand::Open => "OPEN".to_owned(),
             SftpCommand::Close => "CLOSE".to_owned(),
             SftpCommand::Read => "READ".to_owned(),
@@ -85,14 +102,16 @@ impl SftpCommand {
             SftpCommand::Lstat => "LSTAT".to_owned(),
             SftpCommand::Fstat => "FSTAT".to_owned(),
             SftpCommand::SetStat => "SETSTAT".to_owned(),
-            SftpCommand::Remove => "REMOVE".to_owned(),
-            SftpCommand::Rename => "RENAME".to_owned(),
-            SftpCommand::Mkdir => "MKDIR".to_owned(),
-            SftpCommand::Rmdir => "RMDIR".to_owned(),
+            SftpCommand::FSetStat => "FSETSTAT".to_owned(),
             SftpCommand::OpenDir => "OPENDIR".to_owned(),
             SftpCommand::ReadDir => "READDIR".to_owned(),
+            SftpCommand::Remove => "REMOVE".to_owned(),
+            SftpCommand::Mkdir => "MKDIR".to_owned(),
+            SftpCommand::Rmdir => "RMDIR".to_owned(),
             SftpCommand::RealPath => "REALPATH".to_owned(),
             SftpCommand::Stat => "STAT".to_owned(),
+            SftpCommand::Rename => "RENAME".to_owned(),
+            SftpCommand::Extended => "EXTENDED".to_owned(),
             SftpCommand::Other(b) => format!("OTHER({b})"),
         }
     }
@@ -112,6 +131,13 @@ impl SftpCommand {
                 | SftpCommand::RealPath
                 | SftpCommand::Stat
         )
+    }
+
+    /// Whether the message is the **server → client** version reply, which the
+    /// inspector must never treat as a request even if it appears in a buffer
+    /// handed to the uplink path.
+    pub fn is_version(self) -> bool {
+        matches!(self, SftpCommand::Version)
     }
 }
 
@@ -156,6 +182,7 @@ pub fn decode_request(frame: &[u8]) -> Option<SftpRequest> {
     let type_byte = *c.take(1)?.first()?;
     let command = match type_byte {
         1 => SftpCommand::Init,
+        2 => SftpCommand::Version,
         3 => SftpCommand::Open,
         4 => SftpCommand::Close,
         5 => SftpCommand::Read,
@@ -163,18 +190,21 @@ pub fn decode_request(frame: &[u8]) -> Option<SftpRequest> {
         7 => SftpCommand::Lstat,
         8 => SftpCommand::Fstat,
         9 => SftpCommand::SetStat,
-        10 => SftpCommand::Remove,
-        11 => SftpCommand::Rename,
-        12 => SftpCommand::Mkdir,
-        13 => SftpCommand::Rmdir,
-        14 => SftpCommand::OpenDir,
-        15 => SftpCommand::ReadDir,
+        10 => SftpCommand::FSetStat,
+        11 => SftpCommand::OpenDir,
+        12 => SftpCommand::ReadDir,
+        13 => SftpCommand::Remove,
+        14 => SftpCommand::Mkdir,
+        15 => SftpCommand::Rmdir,
         16 => SftpCommand::RealPath,
         17 => SftpCommand::Stat,
+        18 => SftpCommand::Rename,
+        200 => SftpCommand::Extended,
         other => SftpCommand::Other(other),
     };
 
-    // INIT has no request id; every other request starts with one.
+    // INIT is the only client message without a request id; everything else —
+    // including the server's VERSION reply — starts with one.
     if matches!(command, SftpCommand::Init) {
         return Some(SftpRequest {
             request_id: 0,
@@ -195,6 +225,7 @@ pub fn decode_request(frame: &[u8]) -> Option<SftpRequest> {
         | SftpCommand::OpenDir
         | SftpCommand::RealPath
         | SftpCommand::Stat => (Some(read_string(&mut c)?), None),
+        // RENAME carries (oldpath, newpath).
         SftpCommand::Rename => (Some(read_string(&mut c)?), Some(read_string(&mut c)?)),
         _ => (None, None),
     };
@@ -528,8 +559,12 @@ mod tests {
     use super::*;
 
     /// Build a framed SFTP request (length || type || body).
-    fn frame(type_byte: u8, body: &[u8]) -> Vec<u8> {
-        let mut inner = vec![type_byte];
+    ///
+    /// The type byte always comes from `SftpCommand::type_byte`, never a literal,
+    /// so a fixture can never disagree with the parser (a literal-only fixture is
+    /// what let the wrong REMOVE/RMDIR numbering pass unnoticed).
+    fn frame(command: SftpCommand, body: &[u8]) -> Vec<u8> {
+        let mut inner = vec![command.type_byte()];
         inner.extend_from_slice(body);
         let mut out = Vec::new();
         out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
@@ -549,9 +584,121 @@ mod tests {
         out
     }
 
+    /// Golden frames captured from the real OpenSSH `sftp` client on macOS while
+    /// running `rm <regular file>` through the gateway (RUST_LOG instrumentation).
+    ///
+    /// These bytes exist because the first implementation of this table numbered
+    /// `SSH_FXP_REMOVE` as 10 and `SSH_FXP_RMDIR` as 13 — self-consistent with
+    /// the unit fixtures, and therefore invisible to them, but wrong on the wire,
+    /// so a `deny_commands=["REMOVE"]` policy never matched the client's actual
+    /// delete request. Asserting the real capture pins the mapping.
+    /// Parse a space-separated hex string (line continuations allowed).
+    fn hex(spec: &str) -> Vec<u8> {
+        let cleaned: String = spec
+            .chars()
+            .filter(|c| !c.is_whitespace() || *c == ' ')
+            .collect();
+        cleaned
+            .split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).expect("valid hex byte"))
+            .collect()
+    }
+
+    #[test]
+    fn real_client_wire_bytes_decode() {
+        // SSH_FXP_INIT (version 3).
+        let init = hex("00 00 00 05 01 00 00 00 03");
+        assert_eq!(
+            decode_request(&init[4..]).expect("decode INIT").command,
+            SftpCommand::Init
+        );
+
+        // SSH_FXP_EXTENDED "limits@openssh.com" (type 200), id 1.
+        let ext = hex("00 00 00 1b c8 00 00 00 01 00 00 00 12 \
+             6c 69 6d 69 74 73 40 6f 70 65 6e 73 73 68 2e 63 6f 6d");
+        let decoded = decode_request(&ext[4..]).expect("decode EXTENDED");
+        assert_eq!(decoded.command, SftpCommand::Extended);
+        assert_eq!(decoded.request_id, 1);
+
+        // SSH_FXP_REALPATH"." (type 16), id 2.
+        let realpath = hex("00 00 00 0a 10 00 00 00 02 00 00 00 01 2e");
+        let decoded = decode_request(&realpath[4..]).expect("decode REALPATH");
+        assert_eq!(decoded.command, SftpCommand::RealPath);
+        assert_eq!(decoded.path.as_deref(), Some("."));
+
+        // SSH_FXP_LSTAT (type 7), id 3.
+        let lstat = hex("00 00 00 17 07 00 00 00 03 00 00 00 0e \
+             2f 74 6d 70 2f 61 62 63 64 65 66 67 68 69");
+        let decoded = decode_request(&lstat[4..]).expect("decode LSTAT");
+        assert_eq!(decoded.command, SftpCommand::Lstat);
+        assert_eq!(decoded.request_id, 3);
+
+        // THE delete: SSH_FXP_REMOVE (type **13**), id 4 — the byte the old table
+        // read as RMDIR. This is the assertion that would have caught the bug.
+        let remove = hex("00 00 00 17 0d 00 00 00 04 00 00 00 0e \
+             2f 74 6d 70 2f 61 62 63 64 65 66 67 68 69");
+        let decoded = decode_request(&remove[4..]).expect("decode REMOVE");
+        assert_eq!(
+            decoded.command,
+            SftpCommand::Remove,
+            "type byte 13 must decode as SSH_FXP_REMOVE, not RMDIR"
+        );
+        assert_eq!(decoded.command.type_byte(), 13);
+        assert_eq!(decoded.command.name(), "REMOVE");
+        assert_eq!(decoded.request_id, 4);
+        assert!(decoded.command.has_path(), "REMOVE is path-bearing");
+    }
+
+    #[test]
+    fn sftp_type_bytes_match_the_protocol_spec() {
+        // The full wire table, so an off-by-one anywhere else is caught too.
+        let expected: &[(SftpCommand, u8)] = &[
+            (SftpCommand::Init, 1),
+            (SftpCommand::Version, 2),
+            (SftpCommand::Open, 3),
+            (SftpCommand::Close, 4),
+            (SftpCommand::Read, 5),
+            (SftpCommand::Write, 6),
+            (SftpCommand::Lstat, 7),
+            (SftpCommand::Fstat, 8),
+            (SftpCommand::SetStat, 9),
+            (SftpCommand::FSetStat, 10),
+            (SftpCommand::OpenDir, 11),
+            (SftpCommand::ReadDir, 12),
+            (SftpCommand::Remove, 13),
+            (SftpCommand::Mkdir, 14),
+            (SftpCommand::Rmdir, 15),
+            (SftpCommand::RealPath, 16),
+            (SftpCommand::Stat, 17),
+            (SftpCommand::Rename, 18),
+            (SftpCommand::Extended, 200),
+        ];
+        for (command, byte) in expected {
+            assert_eq!(
+                command.type_byte(),
+                *byte,
+                "{} has the wrong wire byte",
+                command.name()
+            );
+            // And the decoder must round-trip the byte back to the same command.
+            let mut frame = vec![*byte, 0, 0, 0, 1]; // type + a plausible request id
+                                                     // Two empty string fields: enough for the path-bearing commands, and
+                                                     // harmlessly unread by the handle-based ones.
+            frame.extend_from_slice(&0u32.to_be_bytes());
+            frame.extend_from_slice(&0u32.to_be_bytes());
+            let decoded = decode_request(&frame).expect("decode round-trip");
+            assert_eq!(
+                decoded.command,
+                *command,
+                "byte {byte} must decode back to {}",
+                command.name()
+            );
+        }
+    }
+
     #[test]
     fn decodes_path_bearing_requests() {
-        let open = frame(3, &id_body(7, &ssh_string("/etc/passwd")));
+        let open = frame(SftpCommand::Open, &id_body(7, &ssh_string("/etc/passwd")));
         // Strip the length prefix, as the reassembler would.
         let body = &open[4..];
         let req = decode_request(body).expect("decode OPEN");
@@ -559,7 +706,7 @@ mod tests {
         assert_eq!(req.request_id, 7);
         assert_eq!(req.path.as_deref(), Some("/etc/passwd"));
 
-        let rm = frame(10, &id_body(8, &ssh_string("/tmp/x")));
+        let rm = frame(SftpCommand::Remove, &id_body(8, &ssh_string("/tmp/x")));
         let req = decode_request(&rm[4..]).expect("decode REMOVE");
         assert_eq!(req.command, SftpCommand::Remove);
         assert_eq!(req.path.as_deref(), Some("/tmp/x"));
@@ -570,7 +717,7 @@ mod tests {
         let mut body = 9u32.to_be_bytes().to_vec();
         body.extend_from_slice(&ssh_string("/a/old"));
         body.extend_from_slice(&ssh_string("/a/new"));
-        let f = frame(11, &body);
+        let f = frame(SftpCommand::Rename, &body);
         let req = decode_request(&f[4..]).expect("decode RENAME");
         assert_eq!(req.command, SftpCommand::Rename);
         assert_eq!(req.path.as_deref(), Some("/a/old"));
@@ -579,16 +726,21 @@ mod tests {
 
     #[test]
     fn decodes_init_and_unknown_types() {
-        let init = frame(1, &3u32.to_be_bytes());
+        let init = frame(SftpCommand::Init, &3u32.to_be_bytes());
         let req = decode_request(&init[4..]).expect("decode INIT");
         assert_eq!(req.command, SftpCommand::Init);
         assert_eq!(req.request_id, 0);
         assert!(!req.command.has_path());
 
-        let weird = frame(200, &[0, 0, 0, 1]);
+        // Type 77 is genuinely unassigned; 200 is now known (SSH_FXP_EXTENDED).
+        let weird = frame(SftpCommand::Other(77), &[0, 0, 0, 1]);
         let req = decode_request(&weird[4..]).expect("decode unknown");
-        assert_eq!(req.command, SftpCommand::Other(200));
-        assert_eq!(req.command.name(), "OTHER(200)");
+        assert_eq!(req.command, SftpCommand::Other(77));
+        assert_eq!(req.command.name(), "OTHER(77)");
+        // And type 200 must now decode as the extension request it really is.
+        let ext = frame(SftpCommand::Extended, &0u32.to_be_bytes());
+        let req = decode_request(&ext[4..]).expect("decode extended");
+        assert_eq!(req.command, SftpCommand::Extended);
     }
 
     #[test]
