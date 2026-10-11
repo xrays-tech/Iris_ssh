@@ -342,10 +342,31 @@ impl BackendDialer {
                 preferred.host_key_certificates = std::borrow::Cow::Owned(algos);
             }
         }
+        // Optional explicit cipher-order override from `[relay] ciphers` (A/B
+        // throughput comparisons; empty = russh default chacha20-first order).
+        if !config.relay.ciphers.is_empty() {
+            let mut ciphers = Vec::with_capacity(config.relay.ciphers.len());
+            for name in &config.relay.ciphers {
+                match russh::cipher::Name::try_from(name.as_str()) {
+                    Ok(cipher) => ciphers.push(cipher),
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "config",
+                            %name,
+                            "ignoring unknown cipher name in relay.ciphers"
+                        );
+                    }
+                }
+            }
+            if !ciphers.is_empty() {
+                preferred.cipher = std::borrow::Cow::Owned(ciphers);
+            }
+        }
         let client_config = client::Config {
             preferred,
             window_size: config.relay.window_size,
             maximum_packet_size: config.relay.max_packet,
+            nodelay: config.relay.nodelay,
             // The gateway drives liveness itself; don't let russh's own timeout
             // GC an otherwise healthy long-lived backend session.
             inactivity_timeout: None,

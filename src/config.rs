@@ -68,6 +68,16 @@ pub struct RelayConfig {
     /// If non-empty, `env` requests are forwarded only for names in this set.
     /// Empty means pass all `env` unchanged (M1 behaviour; propose.md §3.4).
     pub env_allowlist: Vec<String>,
+    /// Disable Nagle's algorithm (`TCP_NODELAY`) on both SSH legs. Defaults to
+    /// false (russh default; Nagle on). For throughput tests set true — a
+    /// dual-hop relay under full-duplex traffic is the classic case where
+    /// Nagle + delayed-ACK otherwise adds micro-stalls.
+    pub nodelay: bool,
+    /// Optional explicit symmetric-cipher preference order (names like
+    /// `"chacha20-poly1305"`, `"aes256-gcm"`, `"aes128-gcm"`) applied to both
+    /// legs. Empty = russh default order (chacha20 first). Used for A/B
+    /// throughput comparisons; see docs/perf-report.md.
+    pub ciphers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +390,10 @@ struct RawRelay {
     outbound_guard: Option<bool>,
     #[serde(default)]
     env_allowlist: Vec<String>,
+    #[serde(default)]
+    nodelay: Option<bool>,
+    #[serde(default)]
+    ciphers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -721,6 +735,8 @@ impl GatewayConfig {
             max_packet,
             outbound_guard: raw.relay.outbound_guard.unwrap_or(true),
             env_allowlist: raw.relay.env_allowlist,
+            nodelay: raw.relay.nodelay.unwrap_or(false),
+            ciphers: raw.relay.ciphers,
         };
 
         let host_key_policy = HostKeyPolicy::parse(raw.backend.host_key_policy.trim())?;

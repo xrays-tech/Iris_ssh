@@ -485,10 +485,33 @@ impl GatewayContext {
 
         let auth_timing =
             auth_rejection_timing(config.limits.auth_timeout, config.limits.auth_rejection_pad);
+        let mut server_pref = ServerConfig::default().preferred;
+        // Optional explicit cipher-order override from `[relay] ciphers` (A/B
+        // throughput comparisons; empty = russh default chacha20-first order).
+        if !config.relay.ciphers.is_empty() {
+            let mut ciphers = Vec::with_capacity(config.relay.ciphers.len());
+            for name in &config.relay.ciphers {
+                match russh::cipher::Name::try_from(name.as_str()) {
+                    Ok(cipher) => ciphers.push(cipher),
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "config",
+                            %name,
+                            "ignoring unknown cipher name in relay.ciphers"
+                        );
+                    }
+                }
+            }
+            if !ciphers.is_empty() {
+                server_pref.cipher = std::borrow::Cow::Owned(ciphers);
+            }
+        }
         let server_config = ServerConfig {
             keys,
             window_size: config.relay.window_size,
             maximum_packet_size: config.relay.max_packet,
+            nodelay: config.relay.nodelay,
+            preferred: server_pref,
             channel_buffer_size: 100,
             // Only public-key auth is offered; password/none are rejected by the
             // handler regardless.

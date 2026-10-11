@@ -21,6 +21,10 @@ window_size = "1MB"     # initial channel window, both legs (256KB..8MB)
 max_packet = "32KB"     # max single packet payload (≤65535)
 outbound_guard = true   # per-channel outbound Semaphore fuse (D5)
 env_allowlist = []      # empty = pass env through (M1); non-empty filters names
+# nodelay = true        # TCP_NODELAY on both SSH legs; default false (russh Nagle-on).
+#                       # For dual-hop throughput, try true (Nagle+delayed-ACK micro-stall relief).
+# ciphers = ["aes256-gcm", "chacha20-poly1305"]   # explicit symmetric cipher order on both legs;
+#                       # empty = russh default (chacha20 first). A/B throughput knob.
 
 # Gateway → backend authentication.
 # `backend_auth` selects the credential presented to the backend:

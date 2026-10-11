@@ -53,15 +53,25 @@ python3 "$PWD/scripts/mock_control_plane.py" --port "$CP" --rules "$WORK/rules.j
 sleep 1
 curl -sf "http://127.0.0.1:$CP/healthz" >/dev/null || { echo "mock CP failed" >&2; exit 2; }
 
+
+# A/B knobs: GW_NODELAY=true|false, GW_CIPHERS="aes256-gcm,aes128-gcm" (empty=none)
+GW_CIPHERS_LINE=""
+if [ -n "${GW_CIPHERS:-}" ]; then
+  GW_CIPHERS_LINE="ciphers = [\"$(echo "$GW_CIPHERS" | sed 's/,/","/g')\"]"
+fi
+export GW_CIPHERS_LINE
+
 cat > "$WORK/gw.toml" <<EOF
 [listen]
 addr = "127.0.0.1:$G"
 [host_keys]
 keys = [ { path = "$WORK/assets/hostkey_ed25519", state = "active" } ]
 [relay]
-window_size = "1MB"
-max_packet = "32KB"
-outbound_guard = true
+window_size = "${GW_WINDOW:-1MB}"
+max_packet = "${GW_MAXPACKET:-32KB}"
+outbound_guard = ${GW_GUARD:-true}
+nodelay = ${GW_NODELAY:-false}
+${GW_CIPHERS_LINE}
 [backend]
 private_key = "$WORK/assets/backend_ed25519"
 host_key_policy = "accept-new"
