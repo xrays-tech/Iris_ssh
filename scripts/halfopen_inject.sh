@@ -56,7 +56,7 @@ iptables -A "$CHAIN" -p tcp --dport "$DPORT" -j DROP
 # hook the chain into INPUT exactly once
 iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$CHAIN"
 # arm auto self-clear so the link recovers even if this mgmt session drops
-setsid bash -c "sleep $HOLD; iptables -D INPUT -j $CHAIN 2>/dev/null; iptables -F $CHAIN 2>/dev/null" </dev/null >/dev/null 2>&1 &
+setsid bash -c "sleep $HOLD; iptables -D INPUT -j $CHAIN 2>/dev/null; iptables -F $CHAIN 2>/dev/null; iptables -X $CHAIN 2>/dev/null" </dev/null >/dev/null 2>&1 &
 echo "INJECTED chain=$CHAIN dport=$DPORT hold=${HOLD}s"
 REMOTE
     ;;

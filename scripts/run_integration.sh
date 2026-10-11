@@ -239,6 +239,11 @@ host_key_policy = "accept-new"
 
 [pool]
 enabled = false
+# keepalive_interval/max_miss drive the backend-leg half-open detection (
+# ~interval*(max+1)). Honored here so A1 (case_halfopen_lost) can speed the
+# gateway's detection via HALFOPEN_KEEPALIVE_INTERVAL=5s; defaults 15s/2.
+keepalive_interval = "${HALFOPEN_KEEPALIVE_INTERVAL:-15s}"
+keepalive_max_miss = ${HALFOPEN_KEEPALIVE_MAX_MISS:-2}
 
 [control_plane]
 # The gateway POSTs this URL verbatim (no path is appended — src/resolve/mod.rs
@@ -434,7 +439,9 @@ write_run_env
 export IT_WORK_DIR="$WORK_DIR"
 export IT_ASSET_DIR="$ASSET_DIR"
 export REMOTE_TMP_DIR="$REMOTE_TMP_DIR"
-export GW_ADDR GW_PORT GW_METRICS_PORT GW_PID GATEWAY_UP
+# GW_METRICS_PORT is held as METRICS_PORT internally, so map it explicitly (a
+# bare `export GW_METRICS_PORT` would export an unset name -> unbound in cases).
+export GW_ADDR GW_PORT GW_METRICS_PORT="$METRICS_PORT" GW_PID GATEWAY_UP
 export SSHD_ADDR SSHD_PORT SSHD_UP CP_ADDR CP_PORT
 export USER_KEY="$ASSET_DIR/user_ed25519" PRINCIPAL DENIED_PRINCIPAL NOTFOUND_PRINCIPAL
 export BACKEND_HOST BACKEND_PORT BACKEND_USER

@@ -17,8 +17,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -n "${SSH_GW_BACKEND_TARGET:-}" ] || skip_case "netem needs a Linux test backend (SSH_GW_BACKEND_TARGET); local uses case_slow_link"
 [ -n "${SSH_GW_ASSET_DIR:-}" ]     || skip_case "netem needs SSH_GW_ASSET_DIR (backend key)"
 
-BK="${SSH_GW_BACKEND_TARGET}"; BK_REST="${BK#*@}"
+BK="${SSH_GW_BACKEND_TARGET}"
+BK_USER="${BK%@*}"; BK_REST="${BK#*@}"; BK_HOST="${BK_REST%:*}"
 BACKEND_PORT="${BK_REST##*:}"; case "$BK_REST" in *:*) : ;; *) BACKEND_PORT="22" ;; esac
+BK_LOGIN="${BK_USER}@${BK_HOST}"
 KEY="$SSH_GW_ASSET_DIR/backend_ed25519"
 NETEM="$HERE/../../scripts/netem_ctl.sh"
 RATE="${NETEM_RATE:-2mbit}"; DELAY="${NETEM_DELAY:-40ms}"; JITTER="${NETEM_JITTER:-10ms}"
@@ -26,15 +28,22 @@ HOLD="${NETEM_HOLD:-90}"
 N="${NETEM_BYTES:-3145728}"
 CEIL="${NETEM_MAX_RSS_KB:-153600}"
 
-BK_TARGET_SPEC="$SSH_GW_BACKEND_TARGET"
-remote_ssh() {
-  ssh -p "$BACKEND_PORT" -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o IdentitiesOnly=yes -o ConnectTimeout=15 -o LogLevel=ERROR "$SSH_GW_BACKEND_TARGET" "$1"
+RS_OUT=""; RS_RC=0
+remote_ssh() {  # -> RS_OUT / RS_RC (never swallows ssh errors)
+  RS_RC=0
+  RS_OUT="$(ssh -p "$BACKEND_PORT" -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o LogLevel=ERROR "$BK_LOGIN" "$1" 2>&1)" || RS_RC=$?
 }
 
-if ! remote_ssh 'command -v tc >/dev/null && echo yes' 2>/dev/null | grep -q yes; then
-  skip_case "backend has no tc/netem (not the Linux test machine)"
+# (1) reachability/auth failure is a real error -> FAIL (never swallowed).
+remote_ssh 'echo REACHED'
+if [ "$RS_RC" -ne 0 ]; then
+  printf '%s\n' "$RS_OUT" >&2
+  fail "cannot ssh backend ${BK_LOGIN}:${BACKEND_PORT} with $KEY (rc=$RS_RC) — is the host reachable and $KEY in its authorized_keys?"
 fi
+# (2) only a genuinely missing tc is a SKIP.
+remote_ssh 'command -v tc >/dev/null 2>&1 && echo HAVE_TC'
+printf '%s' "$RS_OUT" | grep -q HAVE_TC || skip_case "backend '${BK_LOGIN}' reachable but has no tc/netem (not the Linux test machine)"
 
 # Prepare the backend-side file (upload is not on the shaped egress path).
 rf="$REMOTE_TMP_DIR/netem_$RANDOM.bin"

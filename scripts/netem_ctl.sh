@@ -40,9 +40,13 @@ sshargs=(-p "$bport" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 
 case "$cmd" in
   apply)
-    ssh "${sshargs[@]}" "${host}@${bhost}" bash -s -- "$rate" "$delay" "$jitter" "$dev" "$hold" <<'REMOTE'
+    # ssh collapses empty positional args (an empty --dev shifts the rest), so we
+    # pass an explicit AUTO sentinel for "auto-detect" instead of "".
+    devarg="${dev:-AUTO}"
+    ssh "${sshargs[@]}" "${host}@${bhost}" bash -s -- "$rate" "$delay" "$jitter" "$devarg" "$hold" <<'REMOTE'
 set -e
 RATE="$1"; DELAY="$2"; JITTER="$3"; DEVFIX="$4"; HOLD="$5"
+[ "$DEVFIX" = "AUTO" ] && DEVFIX=""
 DEV="$DEVFIX"
 [ -n "$DEV" ] || DEV="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
 [ -n "$DEV" ] || { echo "cannot determine egress device (set --dev)"; exit 3; }
@@ -56,9 +60,10 @@ echo "NETEM_APPLIED dev=$DEV rate=$RATE delay=$DELAY $JITTER hold=${HOLD}s"
 REMOTE
     ;;
   clear)
-    ssh "${sshargs[@]}" "${host}@${bhost}" bash -s -- "$dev" <<'REMOTE'
+    ssh "${sshargs[@]}" "${host}@${bhost}" bash -s -- "${dev:-AUTO}" <<'REMOTE'
 set -e
 DEVFIX="$1"
+[ "$DEVFIX" = "AUTO" ] && DEVFIX=""
 DEV="$DEVFIX"
 [ -n "$DEV" ] || DEV="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
 [ -n "$DEV" ] || { echo "cannot determine egress device (set --dev)"; exit 3; }
