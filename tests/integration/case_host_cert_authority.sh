@@ -65,13 +65,15 @@ else
   fail "gateway could not connect to a host-cert backend (r=$r out=[$out])"
 fi
 
-# M4-1 rejection negatives: only when the gateway does CA-based verification.
+# M4-1 rejection negatives: the gateway performs CA-based verification (M4-T1
+# landed), so an untrusted-CA host cert MUST be refused — hard assertion, no
+# defer. This is a once-live regression guard: if someone later breaks the cert
+# branch or has_trusted_ca() wiring, this case FAILs loudly instead of silently
+# degrading to "pending".
 if gateway_rejects_untrusted; then
-  pass "gateway performs @cert-authority rejection (M4-1 live)"
+  pass "gateway performs @cert-authority rejection (untrusted CA refused)"
 else
-  log "M4-1 negatives pending src M4-T1: the gateway trusts the host cert by"
-  log "inner-key fingerprint, not signature_key vs trusted_ca_keys, so untrusted/"
-  log "expired/wrong-principal certs are not yet rejected. Recipe ready via"
-  log "cert_topo.sh; enable once host-key @cert-authority lands in src (M4-V)."
+  tail_log "$SUBTOPO_DIR/gw.log" 30; tail_log "$SUBTOPO_DIR/sshd.log" 20
+  fail "gateway TRUSTED an untrusted-CA host cert — @cert-authority chain not enforced"
 fi
 echo "OK: case_host_cert_authority"
