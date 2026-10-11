@@ -208,12 +208,12 @@ timeout = "2s"
 [limits]
 max_sessions = 10000
 max_sessions_per_ip = 20
-# src maps limits.auth_timeout -> russh ServerConfig::auth_rejection_time
-# (src/server/mod.rs), i.e. the brute-force delay before an auth FAILURE is sent.
-# russh also keys the initial `none`-probe delay to auth_rejection_time_initial,
-# which the gateway leaves None (-> falls back to auth_rejection_time). With the
-# 30s default every connect stalls ~30s before auth even begins, so tests pin 0s:
-# no brute-force damping, fast fail — the suite never needs it.
+# src decouples auth_timeout (the auth-phase budget) from the russh rejection
+# delay, exposed via `auth_rejection_pad` (default 250ms): the initial `none`
+# probe waits min(auth_timeout, auth_rejection_pad) and ongoing rejections wait
+# the pad (src/server/mod.rs auth_rejection_timing). A 0s budget therefore keeps
+# the initial probe instant in tests with no effect on the suite (the lane's own
+# unit tests use "0s" too).
 auth_timeout = "0s"
 
 [shutdown]
