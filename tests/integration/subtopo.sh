@@ -47,6 +47,23 @@ SUBTOP_SFTP_DENY_PREFIX="${SUBTOP_SFTP_DENY_PREFIX:-}"
 SUBTOP_TCP_FORWARDING="${SUBTOP_TCP_FORWARDING:-false}"
 # Overridable host key (for rotation rehearsal); defaults to the shared asset key.
 SUBTOP_HOSTKEY="${SUBTOP_HOSTKEY:-$IT_ASSET_DIR/hostkey_ed25519}"
+# M4 backend-cert topology knobs (all default off -> identical to prior behaviour).
+#   SUBTOP_SSHD_HOST_CERT  path to a host cert: backend sshd presents it (HostCertificate).
+#   SUBTOP_SSHD_USER_CA    path to a user CA .pub: backend sshd trusts it (TrustedUserCAKeys).
+#   SUBTOP_TRUSTED_CA_KEYS space-separated CA .pub: gateway [ca] trusted_ca_keys (host @cert-authority).
+#   SUBTOP_SIGNING_KEY     path to a CA .priv: gateway [ca] signing_key (M4-2 cert-dial).
+#   SUBTOP_BACKEND_AUTH    "cert" -> gateway [backend] backend_auth="cert" (omitted = key default).
+SUBTOP_SSHD_HOST_CERT="${SUBTOP_SSHD_HOST_CERT:-}"
+SUBTOP_SSHD_USER_CA="${SUBTOP_SSHD_USER_CA:-}"
+# Authorized-keys override (for cert-only backends where the gateway key must NOT
+# be accepted, so only trusted-CA cert auth works). Default = shared asset file.
+SUBTOP_SSHD_AUTHORIZED_KEYS="${SUBTOP_SSHD_AUTHORIZED_KEYS:-$IT_ASSET_DIR/authorized_keys}"
+# Backend host key override (needed when the cert must sit beside the key: sshd
+# requires <hostkey>-cert.pub). Default = shared asset key.
+SUBTOP_SSHD_HOSTKEY="${SUBTOP_SSHD_HOSTKEY:-$IT_ASSET_DIR/sshd_host_ed25519}"
+SUBTOP_TRUSTED_CA_KEYS="${SUBTOP_TRUSTED_CA_KEYS:-}"
+SUBTOP_SIGNING_KEY="${SUBTOP_SIGNING_KEY:-}"
+SUBTOP_BACKEND_AUTH="${SUBTOP_BACKEND_AUTH:-}"
 
 # toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
 toml_arr() {
@@ -76,8 +93,11 @@ subtopo_start() {
   ST_GW_PORT="$(alloc_port)";   ST_MET_PORT="$(alloc_port)"
 
   printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s\nStrictModes no\nUsePAM no\nMaxSessions 10\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
-    "$ST_SSHD_PORT" "$IT_ASSET_DIR/sshd_host_ed25519" "$IT_ASSET_DIR/authorized_keys" "$SUBTOPO_DIR" \
+    "$ST_SSHD_PORT" "$SUBTOP_SSHD_HOSTKEY" "$SUBTOP_SSHD_AUTHORIZED_KEYS" "$SUBTOPO_DIR" \
     > "$SUBTOPO_DIR/sshd.cfg"
+  # M4: backend presents a host certificate (M4-1) / trusts a user CA (M4-2).
+  [ -n "$SUBTOP_SSHD_HOST_CERT" ] && printf 'HostCertificate %s\n' "$SUBTOP_SSHD_HOST_CERT" >> "$SUBTOPO_DIR/sshd.cfg"
+  [ -n "$SUBTOP_SSHD_USER_CA" ]   && printf 'TrustedUserCAKeys %s\n' "$SUBTOP_SSHD_USER_CA"   >> "$SUBTOPO_DIR/sshd.cfg"
 
   if [ -n "${SUBTOP_RULES:-}" ]; then
     cp "$SUBTOP_RULES" "$SUBTOPO_DIR/rules.json"
@@ -91,9 +111,12 @@ subtopo_start() {
       "$PRINCIPAL" "$ST_SSHD_PORT" "$BACKEND_USER" "$_pol_extra" > "$SUBTOPO_DIR/rules.json"
   fi
 
-  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
+  local _ba=""
+  [ "$SUBTOP_BACKEND_AUTH" = "cert" ] && _ba='backend_auth="cert"
+'
+  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n%s[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
     "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" \
-    "$IT_ASSET_DIR/backend_ed25519" "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
+    "$IT_ASSET_DIR/backend_ed25519" "$_ba" "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
     "$ST_CP_PORT" "$SUBTOP_CACHE_TTL"     "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
 
   # B4 jump + B3 sftp-intercept sections (defaults are inert; older gateways that
@@ -104,8 +127,12 @@ subtopo_start() {
     printf '[intercept.sftp]\nenabled=%s\ndeny_commands=%s\nallowed_path_prefixes=%s\ndenied_path_prefixes=%s\n' \
       "$SUBTOP_SFTP_ENABLED" "$(toml_arr "$SUBTOP_SFTP_DENY")" \
       "$(toml_arr "$SUBTOP_SFTP_ALLOW_PREFIX")" "$(toml_arr "$SUBTOP_SFTP_DENY_PREFIX")"
-    # [ca] required by the gateway validator; harmless non-empty trusted key.
-    printf '[ca]\ntrusted_ca_keys=["%s"]\n' "$IT_ASSET_DIR/user_ed25519.pub"
+    # [ca] required by the gateway validator. M4-1: point trusted_ca_keys at the
+    # host CA (gateway @cert-authority trust). Default: harmless non-empty key.
+    local _ca_keys="${SUBTOP_TRUSTED_CA_KEYS:-$IT_ASSET_DIR/user_ed25519.pub}"
+    printf '[ca]\ntrusted_ca_keys=%s\n' "$(toml_arr "$_ca_keys")"
+    # M4-2: gateway issues the backend user cert from this signing key.
+    [ -n "$SUBTOP_SIGNING_KEY" ] && printf 'signing_key="%s"\n' "$SUBTOP_SIGNING_KEY"
   } >> "$SUBTOPO_DIR/gw.toml"
 
   /usr/sbin/sshd -t -f "$SUBTOPO_DIR/sshd.cfg" 2>>"$SUBTOPO_DIR/sshd.log" \

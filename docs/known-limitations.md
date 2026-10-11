@@ -2,20 +2,21 @@
 
 本文件记录 SSH 网关已知的限制与遗留项，供运维与后续批次参考。每项均含「触发条件」与「处置」。
 
-## 1. 后端 host key `@cert-authority`（CA 签发 host 证书）未接线
+## 1. 后端 host key `@cert-authority`（CA 签发 host 证书）——测试拓扑已就绪，E2E 拒绝链待 src M4-T1
 
-- **状态**：M3 交付时未实现（backend/mod.rs:128-135 的 `host_key_fingerprint` 对证书仍按「内层公钥」算指纹）。
-- **影响**：网关 client 腿的 `HostKeyVerifier` 只支持 `pinned`（固定内层指纹）与 `accept-new` 两种策略；后端 sshd 若签发 host 证书（`@cert-authority` 体系），网关无法按「证书签名键 ∈ 受信 CA」来信任，需改用感知已知的 host 证书内层指纹或降级为 accept-new。
-- **触发条件**：后端纳管规模化、需要 host key 证书化（CA 统一签发 host 证书）运维时。
-- **处置**：列为 M4（后端基础设施专项）①；M4 判定性 DoD：host cert 校验 `signature_key()` ∈ 受信 CA 集 + `check_server_key` 单测 + E2E。
-- **代码占位**：`src/backend/mod.rs:128-135` 处已标注 `// M4: @cert-authority — current inner-key fingerprint is a placeholder`。
+- **状态**：M4-I tests 已交付证书拓扑——`scripts/cert_topo.sh`（ssh-keygen 签发 host/user 证书 + CA）、`subtopo.sh` 的 `SUBTOP_SSHD_HOST_KEY/CERT` + `[ca] trusted_ca_keys`、`tests/integration/case_host_cert_authority`。**已验证**：后端出示 host 证书时网关 client 腿能消费证书并连通（`case_host_cert_authority` PASS，real E2E exec）。
+- **仍受限**：`@cert-authority` 四步校验链（`signature_key() ∈ 受信 CA` → 验签 → 有效期 → principals 含目标主机）尚未在 src `backend/mod.rs:129-135` 接线（仍按内层公钥指纹 accept-new/pin 信任）。故**非受信 CA / 过期 / principals 不含目标主机** 的 host 证书仍会被网关接受（负例用例已备好并在检测到链生效后启用）。
+- **影响**：后端 host 证书化/CA 统一签发的信任收敛暂不可用；当前以 accept-new 或感知内层指纹降级。
+- **触发条件**：后端纳管规模化、需要 host key 证书化（CA 统一签发）时。
+- **处置**：src M4-T1 落地 `HostKeyVerifier` 证书分支 + `host_key_policy=cert-authority` 后，`case_host_cert_authority` 的负例自动由「pending」翻转为真实断言，无需改测试。
 
-## 2. 后端 `TrustedUserCAKeys`（用户证书拨号）未实现
+## 2. 后端 `TrustedUserCAKeys`（用户证书拨号 / cert-dial）——拓扑已自证，网关拨号 E2E 待 src M4-T2
 
-- **状态**：M3 交付时网关→后端认证仍走私钥路径（backend/mod.rs:290 `authenticate_publickey`），无证书拨号代码/用例。
-- **影响**：后端若配置 `TrustedUserCAKeys` 期望用户证书认证，网关还不能直接以短期证书登录后端（当前用网关后端私钥 + 后端 `authorized_keys` 网关公钥方案，为 propose §3.3 的默认路径，功能不受损）。
-- **触发条件**：后端安全策略要求用户级 CA 统一签发（gateway 短期用户证书；后端 `TrustedUserCAKeys` 校验）。
-- **处置**：列为 M4（后端基础设施专项）②；M4 判定性 DoD：cert-dial E2E（网关用 CA 签发的动态证书认证后端，证书过期拒绝、CA 轮换无感）。
+- **状态**：M4-I tests 已交付拓扑与自证——`case_cert_dial` 起 cert-only 后端（`TrustedUserCAKeys` + 空 authorized_keys），**已验证**：由测试 CA（`userca`）签发、principals=后端用户的用户证书经 direct `-o CertificateFile` 登录后端成功（后端信任链 + 我方签发自证 PASS）。
+- **仍受限**：网关→后端的 cert-dial（`backend_auth=cert`，connect 时现签短期用户证书走 `authenticate_openssh_cert`）尚未在 src `backend/mod.rs`（现仅 `authenticate_publickey` key-dial，mod.rs:295）落地。故 `[backend] backend_auth="cert"` 被当前网关忽略；cert-only 后端下网关拨号被拒，`case_cert_dial` 网关部分 SKIP（capability-gated，非假 PASS）。
+- **影响**：后端若配置 `TrustedUserCAKeys` 要求用户证书认证，网关暂不能以短期证书登录（当前仍走网关后端私钥 + 后端 authorized_keys 默认路径，功能不受损）。
+- **触发条件**：后端安全策略要求用户级 CA 统一签发（网关短期用户证书；后端 `TrustedUserCAKeys` 校验）时。
+- **处置**：src M4-T2 落地 backend 证书认证 + `backend_auth` 后，`case_cert_dial` 由 SKIP 翻转为 PASS；真机 `root@47.109.73.53` 可选加跑（改其后端 sshd_config）。
 
 ## 3. 半开假死（iptables DROP）与 netem 真机演练未在本机实跑
 

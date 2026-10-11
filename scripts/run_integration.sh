@@ -473,6 +473,8 @@ ALL_CASES=(
   case_jump
   case_sftp_intercept
   case_hostkey_rotation
+  case_host_cert_authority
+  case_cert_dial
   case_halfopen_lost
   case_netem_slow
   case_graceful_shutdown
