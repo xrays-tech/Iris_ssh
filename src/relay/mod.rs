@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{oneshot, Semaphore};
 
 use russh::client::Msg as ClientMsg;
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
@@ -339,33 +339,24 @@ pub struct ChannelRelay {
     /// Client-side channel id (the map key).
     pub client_id: ChannelId,
     /// Writable half of the backend channel (client → backend).
-    /// Wrapped in Arc<Mutex> to allow shared access between:
-    /// - uplink sender task (data_bytes for bulk data)
-    /// - relay (exec, pty, shell, etc. request-path calls)
-    pub backend: std::sync::Arc<tokio::sync::Mutex<BackendWriter>>,
+    pub backend: BackendWriter,
     /// FIFO router for want_reply replies (I2).
     pub router: ReplyRouter,
     /// Uplink window fuse (§3.6).
     pub window: std::sync::Arc<OutboundWindow>,
     /// Shared up/down byte counters (fed to the audit record).
     pub bytes: std::sync::Arc<ByteCounters>,
-    /// Sender for the uplink data queue. The data callback enqueues here
-    /// instead of awaiting data_bytes directly, allowing the server event
-    /// loop to process the next packet while the sender task handles
-    /// encryption and socket writes asynchronously.
-    pub uplink_tx: mpsc::Sender<Bytes>,
     metrics: Metrics,
 }
 
 impl ChannelRelay {
     pub fn new(
         client_id: ChannelId,
-        backend: std::sync::Arc<tokio::sync::Mutex<BackendWriter>>,
+        backend: BackendWriter,
         router: ReplyRouter,
         window: std::sync::Arc<OutboundWindow>,
         bytes: std::sync::Arc<ByteCounters>,
         metrics: Metrics,
-        uplink_tx: mpsc::Sender<Bytes>,
     ) -> Self {
         ChannelRelay {
             client_id,
@@ -373,15 +364,8 @@ impl ChannelRelay {
             router,
             window,
             bytes,
-            uplink_tx,
             metrics,
         }
-    }
-
-    /// Send data on the uplink, queuing it for the sender task.
-    /// Returns an error if the channel is closed (backend gone).
-    pub async fn send_uplink(&self, data: Bytes) -> Result<(), WindowClosed> {
-        self.uplink_tx.send(data).await.map_err(|_| WindowClosed)
     }
 
     /// Whether the fuse is currently exhausted for `n` bytes (records the
@@ -391,28 +375,6 @@ impl ChannelRelay {
             self.metrics.window_exhausted();
         }
     }
-}
-
-/// Spawn the uplink sender task for a channel.
-///
-/// This task drains the mpsc queue and calls `data_bytes` on the backend
-/// writer (locked via Mutex). It runs until the queue is closed (sender
-/// dropped) or the backend connection is lost.
-pub async fn run_uplink_sender(
-    backend: std::sync::Arc<tokio::sync::Mutex<BackendWriter>>,
-    mut rx: mpsc::Receiver<Bytes>,
-    window: std::sync::Arc<OutboundWindow>,
-) {
-    while let Some(data) = rx.recv().await {
-        let backend_locked = backend.lock().await;
-        if let Err(e) = backend_locked.data_bytes(data).await {
-            tracing::debug!(target: "relay", error = %e, "uplink sender task: data_bytes failed");
-            break;
-        }
-    }
-    // Queue drained or sender closed: close the window to unblock any
-    // waiters in the data callback (P0-2).
-    window.close();
 }
 
 /// Why the down-pump stopped relaying a channel.
@@ -497,76 +459,40 @@ pub async fn pump_backend_to_client(
             ChannelMsg::Data { data } => {
                 // B2/B3: a downlink tap may withhold or rewrite the payload
                 // (e.g. an SFTP denial response injected back to the client).
-                let tap_result = apply_tap_down(tap.as_ref(), &data, client_id);
-                match tap_result {
-                    DownTapResult::Pass => {
-                        if !data.is_empty()
-                            && up
-                                .data(client_id, Bytes::copy_from_slice(&data))
-                                .await
-                                .is_err()
-                        {
-                            stop_reason = StopReason::ClientWriteFailed;
-                            break;
-                        }
-                        bytes.add_down(data.len());
-                    }
-                    DownTapResult::Rewrite { forward, inject } => {
-                        let n = forward.len();
-                        if !inject.is_empty()
-                            && up.data(client_id, Bytes::from(inject)).await.is_err()
-                        {
-                            stop_reason = StopReason::ClientWriteFailed;
-                            break;
-                        }
-                        if !forward.is_empty()
-                            && up.data(client_id, Bytes::from(forward)).await.is_err()
-                        {
-                            stop_reason = StopReason::ClientWriteFailed;
-                            break;
-                        }
-                        bytes.add_down(n);
-                    }
+                let (payload, inject) = apply_tap_down(tap.as_ref(), &data, client_id);
+                let n = payload.len();
+                if !inject.is_empty() && up.data(client_id, Bytes::from(inject)).await.is_err() {
+                    stop_reason = StopReason::ClientWriteFailed;
+                    break;
                 }
+                if !payload.is_empty() && up.data(client_id, Bytes::from(payload)).await.is_err() {
+                    stop_reason = StopReason::ClientWriteFailed;
+                    break;
+                }
+                bytes.add_down(n);
             }
             ChannelMsg::ExtendedData { data, ext } => {
-                let tap_result = apply_tap_down(tap.as_ref(), &data, client_id);
-                match tap_result {
-                    DownTapResult::Pass => {
-                        if !data.is_empty()
-                            && up
-                                .extended_data(client_id, ext, Bytes::copy_from_slice(&data))
-                                .await
-                                .is_err()
-                        {
-                            stop_reason = StopReason::ClientWriteFailed;
-                            break;
-                        }
-                        bytes.add_down(data.len());
-                    }
-                    DownTapResult::Rewrite { forward, inject } => {
-                        let n = forward.len();
-                        if !inject.is_empty()
-                            && up
-                                .extended_data(client_id, ext, Bytes::from(inject))
-                                .await
-                                .is_err()
-                        {
-                            stop_reason = StopReason::ClientWriteFailed;
-                            break;
-                        }
-                        if !forward.is_empty()
-                            && up
-                                .extended_data(client_id, ext, Bytes::from(forward))
-                                .await
-                                .is_err()
-                        {
-                            stop_reason = StopReason::ClientWriteFailed;
-                            break;
-                        }
-                        bytes.add_down(n);
-                    }
+                let (payload, inject) = apply_tap_down(tap.as_ref(), &data, client_id);
+                let n = payload.len();
+                if !inject.is_empty()
+                    && up
+                        .extended_data(client_id, ext, Bytes::from(inject))
+                        .await
+                        .is_err()
+                {
+                    stop_reason = StopReason::ClientWriteFailed;
+                    break;
                 }
+                if !payload.is_empty()
+                    && up
+                        .extended_data(client_id, ext, Bytes::from(payload))
+                        .await
+                        .is_err()
+                {
+                    stop_reason = StopReason::ClientWriteFailed;
+                    break;
+                }
+                bytes.add_down(n);
             }
             ChannelMsg::Success => router.settle(true),
             ChannelMsg::Failure => router.settle(false),
@@ -641,27 +567,19 @@ pub async fn pump_backend_to_client(
     window.close();
 }
 
-/// Result of running a buffer through the downlink tap.
-enum DownTapResult {
-    /// Forward the original buffer unchanged (zero-copy).
-    Pass,
-    /// Forward modified data, optionally injecting a response.
-    Rewrite { forward: Vec<u8>, inject: Vec<u8> },
-}
-
-/// Run a downlink buffer through the channel tap, returning the result.
+/// Run a downlink buffer through the channel tap, returning `(forward, inject)`.
 ///
-/// `None` tap (the default) returns `Pass` with no allocation.
+/// `None` tap (the default) returns the payload untouched with no allocation.
 fn apply_tap_down(
     tap: Option<&Arc<dyn ChannelTap>>,
     data: &[u8],
     client_id: ChannelId,
-) -> DownTapResult {
+) -> (Vec<u8>, Vec<u8>) {
     let Some(tap) = tap else {
-        return DownTapResult::Pass;
+        return (data.to_vec(), Vec::new());
     };
     match tap.on_data(Direction::Down, data) {
-        DataVerdict::Pass => DownTapResult::Pass,
+        DataVerdict::Pass => (data.to_vec(), Vec::new()),
         DataVerdict::Rewrite {
             forward,
             inject,
@@ -670,7 +588,7 @@ fn apply_tap_down(
             if let Some(reason) = denied {
                 tracing::info!(target: "relay", ?client_id, %reason, "downlink data withheld by tap");
             }
-            DownTapResult::Rewrite { forward, inject }
+            (forward, inject)
         }
     }
 }
@@ -683,8 +601,8 @@ pub async fn forward_exec(
     command: &[u8],
 ) -> Result<Option<oneshot::Receiver<bool>>, String> {
     let rx = relay.router.push(want_reply);
-    let backend = relay.backend.lock().await;
-    backend
+    relay
+        .backend
         .exec(want_reply, command.to_vec())
         .await
         .map_err(|e| e.to_string())?;
