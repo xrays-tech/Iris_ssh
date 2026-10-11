@@ -17,13 +17,26 @@
 #   run_integration.sh <case> [<case>]  # bootstrap env then run only those cases
 #   run_integration.sh --selftest       # infra health only (no gateway needed)
 #
+# Flags:
+#   --skip-backpressure   skip case_backpressure even in local mode.
+#
 # Env knobs:
 #   SSH_GW_BIN            path to gateway binary (default target/debug/ssh-gw)
 #   SSH_GW_BACKEND_TARGET "user@host:port" -> switch to a REMOTE backend for
 #                         manual real-machine validation. When unset, a local
-#                         sshd is started (the default, CI path).
+#                         sshd is started (the default, CI path). In remote mode
+#                         case_backpressure is skipped by default (see below).
+#   SSH_GW_ASSET_DIR      reuse a FIXED key/asset dir instead of a fresh
+#                         per-run $WORK_DIR/assets. Required for REMOTE mode:
+#                         pre-install its backend_ed25519.pub in the remote
+#                         authorized_keys, or the gateway can't authenticate.
+#   SSHGW_SKIP_BACKPRESSURE  non-empty => always skip case_backpressure
 #   KEEP_WORK=1           preserve the temp work dir for post-mortem
 #   BP_BYTES / BP_MAX_RSS_KB   backpressure case overrides (see that case)
+#
+# Note: case_graceful_shutdown signals the LOCAL gateway process ($GW_PID) in all
+#       modes — the graceful-drain behaviour under test is the gateway's, not the
+#       backend's, so remote mode is unaffected.
 #
 # Exit code: 1 if any case FAILs; 0 otherwise (BLOCKED cases do not fail, so the
 # gate stays green while the src/ lane is still landing).
@@ -43,11 +56,13 @@ CASES_DIR="$REPO_ROOT/tests/integration"
 # ---------------------------------------------------------------------------
 SELFTEST=0
 KEEP_WORK="${KEEP_WORK:-0}"
+SKIP_BP_FLAG=0
 REQUESTED_CASES=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --selftest) SELFTEST=1 ;;
     --keep)     KEEP_WORK=1 ;;
+    --skip-backpressure) SKIP_BP_FLAG=1 ;;
     -h|--help)
       awk 'NR==1{next} /^#/{sub(/^#[ ]?/,""); print; next} {exit}' "$0" >&2
       exit 0 ;;
@@ -66,9 +81,17 @@ CURRENT_USER="$(id -un)"
 # ---------------------------------------------------------------------------
 STAMP="$(date +%Y%m%d-%H%M%S)"
 WORK_DIR="${TMPDIR:-/tmp}/sshgw-it.${STAMP}.$$"
-ASSET_DIR="$WORK_DIR/assets"
+mkdir -p "$WORK_DIR"
+
+# Asset dir: per-run under $WORK_DIR by default. Set SSH_GW_ASSET_DIR to reuse a
+# fixed dir — required for remote-backend validation, where the gateway's backend
+# pubkey must be pre-installed once in the remote authorized_keys (a fresh key
+# each run would never match). gen_assets is idempotent, so an existing dir is
+# reused as-is (all downstream references use $ASSET_DIR).
+ASSET_DIR="${SSH_GW_ASSET_DIR:-$WORK_DIR/assets}"
 mkdir -p "$ASSET_DIR"
 log "work dir: $WORK_DIR"
+log "asset dir: $ASSET_DIR"
 
 gen_assets "$ASSET_DIR"
 
@@ -384,6 +407,18 @@ resolve_case_path() {
   return 1
 }
 
+# case_backpressure pushes 200MB: fine locally, wasteful/slow over the public
+# internet. Local mode runs it by default; REMOTE mode skips it by default.
+# Forces: --skip-backpressure / SSHGW_SKIP_BACKPRESSURE skip it (any mode);
+# an explicit BP_BYTES opts back in. This filter only drops it from the *default*
+# all-cases list — naming `case_backpressure` explicitly always runs it.
+SKIP_BACKPRESSURE=0
+if [ "$SKIP_BP_FLAG" = "1" ] || [ -n "${SSHGW_SKIP_BACKPRESSURE:-}" ]; then
+  SKIP_BACKPRESSURE=1
+elif [ "$REMOTE_MODE" = "1" ] && [ -z "${BP_BYTES:-}" ]; then
+  SKIP_BACKPRESSURE=1
+fi
+
 if [ "$SELFTEST" = "1" ]; then
   CASE_LIST=()
 else
@@ -393,7 +428,13 @@ else
       if p="$(resolve_case_path "$c")"; then CASE_LIST+=("$p"); else die "unknown case: $c"; fi
     done
   else
-    for name in "${ALL_CASES[@]}"; do CASE_LIST+=("$CASES_DIR/$name.sh"); done
+    for name in "${ALL_CASES[@]}"; do
+      if [ "$name" = "case_backpressure" ] && [ "$SKIP_BACKPRESSURE" = "1" ]; then
+        log "skipping case_backpressure (remote/no-bandwidth mode; set BP_BYTES or --skip-backpressure controls)"
+        continue
+      fi
+      CASE_LIST+=("$CASES_DIR/$name.sh")
+    done
   fi
 fi
 
