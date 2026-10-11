@@ -42,6 +42,15 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Key material for tests only (server/client host + credential keys).
 rand = { version = "0.10", features = ["thread_rng"] }
 
+# Certificate parsing/signing for the CA path (B1); same version russh already
+# pulls in (`russh::keys` re-exports it, but the builder API is used directly).
+ssh-key = { version = "0.7.0-rc.11", features = ["ed25519", "rsa", "std"] }
+
+[dev-dependencies]
+# `ChannelId`'s constructor is private to russh (deliberately), so tests build one
+# by decoding it — the same path the library itself uses.
+ssh-encoding = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = true

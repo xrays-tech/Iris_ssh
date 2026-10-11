@@ -33,9 +33,7 @@ use crate::config::GatewayConfig;
 use crate::error::{BackendError, Error, Result};
 use crate::metrics::Metrics;
 use crate::policy::HostKeyVerifier;
-use crate::relay::{
-    self, BackendWriter, ChannelRelay, PassThroughInterceptor, ReplyRouter, SubsystemInterceptor,
-};
+use crate::relay::{self, BackendWriter, ChannelRelay, ReplyRouter, SubsystemInterceptor};
 use crate::resolve::{ControlPlaneClient, HttpControlPlane, Resolver};
 use crate::types::{Grant, Principal, SessionId};
 
@@ -207,8 +205,148 @@ pub struct GatewayContext {
     pub dialer: Arc<BackendDialer>,
     pub metrics: Metrics,
     pub interceptor: Arc<dyn SubsystemInterceptor>,
+    /// Certificate authority set (B1): trusted CA fingerprints for user and host
+    /// certificates, plus the signing key when issuance is enabled.
+    pub ca: Arc<crate::ca::CertificateAuthority>,
     pub registry: SessionRegistry,
     pub server_config: Arc<ServerConfig>,
+}
+
+/// Composition root for subsystem interception (propose.md §3.7, B2 + B3).
+///
+/// The policy questions ("is SFTP enabled?", "does this grant ask for
+/// recording?") are answered here, while the *stateful* per-channel work lives
+/// in the [`relay::ChannelTap`] objects this returns from `observe`. Multiple
+/// taps are composed so a session can be recorded **and** inspected at once.
+pub struct CompositeInterceptor {
+    sftp: crate::sftp::SftpAuditInterceptor,
+    recording_dir: std::path::PathBuf,
+    recording_budget: u64,
+    metrics: Metrics,
+}
+
+impl CompositeInterceptor {
+    /// Build from config. Returns `PassThroughInterceptor`-equivalent behaviour
+    /// when nothing is enabled, so the fast path is preserved by construction.
+    pub fn new(config: &GatewayConfig, metrics: Metrics) -> Self {
+        CompositeInterceptor {
+            sftp: crate::sftp::SftpAuditInterceptor::new(&config.intercept.sftp, metrics.clone()),
+            recording_dir: config.recording.dir.clone(),
+            recording_budget: config.recording.max_bytes_per_session,
+            metrics,
+        }
+    }
+}
+
+impl SubsystemInterceptor for CompositeInterceptor {
+    fn on_subsystem_request<'a>(
+        &'a self,
+        name: &'a str,
+        grant: &'a crate::types::Grant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = relay::Verdict> + Send + 'a>> {
+        Box::pin(async move { self.sftp.on_subsystem_request(name, grant).await })
+    }
+
+    fn observe(&self, ctx: &relay::ChannelCtx) -> Option<Arc<dyn relay::ChannelTap>> {
+        self.build_tap(ctx)
+    }
+}
+
+impl CompositeInterceptor {
+    /// Build the composed per-channel tap, or `None` when nothing would observe
+    /// this channel (the zero-cost path).
+    ///
+    /// Taps are ordered **inspector first, recorder second**, so
+    /// [`CompositeTap`] can chain them: the recorder sees exactly the bytes the
+    /// inspector allowed, and never persists a request policy refused.
+    fn build_tap(&self, ctx: &relay::ChannelCtx) -> Option<Arc<dyn relay::ChannelTap>> {
+        let mut taps: Vec<Arc<dyn relay::ChannelTap>> = Vec::new();
+        if let Some(tap) = self.sftp.observe(ctx) {
+            taps.push(tap);
+        }
+        if ctx.record && self.recording_budget > 0 {
+            match crate::record::SessionRecorder::create(
+                &self.recording_dir,
+                ctx,
+                self.recording_budget,
+            ) {
+                Ok(recorder) => {
+                    self.metrics.recorded_session();
+                    taps.push(recorder);
+                }
+                Err(e) => {
+                    // A recording that cannot be started must never take down a
+                    // working session; fail open on the recording only.
+                    tracing::warn!(
+                        target: "record",
+                        error = %e,
+                        dir = %self.recording_dir.display(),
+                        "could not start session recording; continuing without it"
+                    );
+                }
+            }
+        }
+        if taps.is_empty() {
+            None
+        } else {
+            Some(Arc::new(CompositeTap { taps }))
+        }
+    }
+}
+
+/// A tap that chains several sub-taps: each sees the bytes the previous one
+/// chose to forward, and the first refusal short-circuits what is emitted.
+///
+/// Chaining (rather than fanning the same buffer to every tap) matters because a
+/// recorder must not persist a request an SFTP inspector refused — that would
+/// make an audit replay disagree with what actually reached the backend.
+struct CompositeTap {
+    taps: Vec<Arc<dyn relay::ChannelTap>>,
+}
+
+impl relay::ChannelTap for CompositeTap {
+    fn on_data(&self, dir: relay::Direction, buf: &[u8]) -> relay::DataVerdict {
+        use relay::DataVerdict;
+
+        // Start with the caller's buffer; each sub-tap may narrow it.
+        let mut forward: Vec<u8> = buf.to_vec();
+        let mut inject: Vec<u8> = Vec::new();
+        let mut denied: Option<String> = None;
+        let mut rewritten = false;
+
+        for tap in &self.taps {
+            match tap.on_data(dir, &forward) {
+                DataVerdict::Pass => {}
+                DataVerdict::Rewrite {
+                    forward: next,
+                    inject: extra,
+                    denied: reason,
+                } => {
+                    forward = next;
+                    rewritten = true;
+                    inject.extend_from_slice(&extra);
+                    if denied.is_none() {
+                        denied = reason;
+                    }
+                }
+            }
+        }
+
+        if !rewritten {
+            return DataVerdict::Pass;
+        }
+        DataVerdict::Rewrite {
+            forward,
+            inject,
+            denied,
+        }
+    }
+
+    fn flush(&self) {
+        for tap in &self.taps {
+            tap.flush();
+        }
+    }
 }
 
 /// Adapter that turns accepted TCP streams into [`GatewaySession`] handlers.
@@ -325,7 +463,11 @@ impl GatewayContext {
             config.control_plane.timeout,
         ));
 
-        let interceptor: Arc<dyn SubsystemInterceptor> = Arc::new(PassThroughInterceptor);
+        let interceptor: Arc<dyn SubsystemInterceptor> =
+            Arc::new(CompositeInterceptor::new(&config, metrics.clone()));
+        // B1: the trusted-CA set gates both user certificates and backend host
+        // certificates, so it is loaded once and shared.
+        let ca = Arc::new(crate::ca::CertificateAuthority::load(&config.ca)?);
 
         let auth_timing =
             auth_rejection_timing(config.limits.auth_timeout, config.limits.auth_rejection_pad);
@@ -357,6 +499,7 @@ impl GatewayContext {
             dialer,
             metrics,
             interceptor,
+            ca,
             registry: SessionRegistry::default(),
             server_config: Arc::new(server_config),
         }))
@@ -485,6 +628,7 @@ impl server::Server for GatewayServer {
             signature_algorithm: String::new(),
             backend: None,
             relays: HashMap::new(),
+            taps: HashMap::new(),
             entry: None,
             limiter_reject,
             audited: false,
@@ -503,14 +647,67 @@ pub struct GatewaySession {
     signature_algorithm: String,
     backend: Option<russh::client::Handle<BackendClient>>,
     relays: HashMap<ChannelId, ChannelRelay>,
+    /// Per-channel data taps (recording / SFTP inspection), keyed by channel.
+    taps: HashMap<ChannelId, Arc<dyn relay::ChannelTap>>,
     entry: Option<Arc<SessionEntry>>,
     limiter_reject: bool,
     audited: bool,
 }
 
+/// Result of running an uplink buffer through the channel tap (B2/B3).
+enum UplinkOutcome {
+    /// Forward these bytes to the backend.
+    Forward(Vec<u8>),
+    /// Nothing should be forwarded (the tap refused everything).
+    Dropped,
+}
+
 impl GatewaySession {
     fn reject_all(&self) -> Auth {
         Auth::reject()
+    }
+
+    /// Run an uplink buffer through the channel's tap (B2/B3).
+    ///
+    /// Injected bytes (e.g. a synthesized SFTP failure response) are written
+    /// back to the client immediately so it sees the refusal, and only the
+    /// permitted remainder is forwarded.
+    fn apply_uplink_tap(&mut self, channel: ChannelId, data: &[u8]) -> UplinkOutcome {
+        let Some(tap) = self.taps.get(&channel).cloned() else {
+            return UplinkOutcome::Forward(data.to_vec());
+        };
+        match tap.on_data(relay::Direction::Up, data) {
+            relay::DataVerdict::Pass => UplinkOutcome::Forward(data.to_vec()),
+            relay::DataVerdict::Rewrite {
+                forward,
+                inject,
+                denied,
+            } => {
+                if let Some(reason) = denied {
+                    self.ctx.metrics.sftp_request_denied();
+                    tracing::info!(target: "relay", %channel, %reason, "uplink data withheld by tap");
+                }
+                if !inject.is_empty() {
+                    // The client-facing session handle lives on the relay's
+                    // session; push the refusal back down the client channel.
+                    let entry = self.entry.clone();
+                    if let Some(entry) = entry {
+                        let cid = channel;
+                        tokio::spawn(async move {
+                            let _ = entry
+                                .handle
+                                .extended_data(cid, 1, Bytes::from(inject))
+                                .await;
+                        });
+                    }
+                }
+                if forward.is_empty() {
+                    UplinkOutcome::Dropped
+                } else {
+                    UplinkOutcome::Forward(forward)
+                }
+            }
+        }
     }
 
     /// Register this session in the shared registry (called once we hold a real
@@ -545,6 +742,70 @@ impl GatewaySession {
         }
         self.ctx.metrics.resolve_latency(started.elapsed());
         outcome
+    }
+
+    /// Authorize a **certificate**-authenticated session (B1).
+    ///
+    /// The control plane is still consulted for the destination, but the *key*
+    /// identity it sees is the issuing CA's fingerprint rather than an inner
+    /// user key: that is the trust anchor an operator actually provisions. The
+    /// certificate's principal list is checked against the requested username
+    /// here, and `Grant::fingerprint` carries the CA fingerprint so the resolver
+    /// can key on it.
+    async fn authorize_certificate(
+        &mut self,
+        principal: &Principal,
+        certificate: &russh::keys::Certificate,
+    ) -> Auth {
+        let ca_fingerprint = crate::ca::certificate_ca_fingerprint(certificate);
+        // 1. The issuing CA must be trusted.
+        if !self.ctx.ca.is_trusted_ca(&ca_fingerprint) {
+            self.ctx.metrics.cert_auth_reject();
+            tracing::warn!(
+                target: "server",
+                %ca_fingerprint,
+                "rejecting certificate issued by an untrusted CA"
+            );
+            return Auth::reject();
+        }
+        // 2. Signature, validity window and principal list.
+        let check = crate::ca::validate_user_certificate_at(
+            certificate,
+            self.ctx.ca.trusted_ca_fingerprints(),
+            principal.as_str(),
+            crate::ca::now_unix_secs().unwrap_or(u64::MAX),
+        );
+        if check != crate::ca::CertificateCheck::Trusted {
+            self.ctx.metrics.cert_auth_reject();
+            tracing::warn!(target: "server", ?check, %ca_fingerprint, "rejecting certificate");
+            return Auth::reject();
+        }
+        // 3. Resolve the destination from the control plane, keyed on the CA.
+        match self.resolve_grant(principal, &ca_fingerprint).await {
+            Ok(grant) => {
+                self.ctx.metrics.cert_auth_accept();
+                self.ctx.metrics.session_started();
+                self.ctx
+                    .metrics
+                    .add_window_budget((self.ctx.config.relay.window_size as usize) * 2);
+                self.signature_algorithm = certificate.algorithm().to_string();
+                self.principal = Some(principal.clone());
+                self.auditor = Some(Auditor::new(
+                    self.session_id.clone(),
+                    self.client_ip.clone(),
+                    grant.clone(),
+                    self.signature_algorithm.clone(),
+                    self.ctx.metrics.clone(),
+                ));
+                self.grant = Some(grant);
+                Auth::Accept
+            }
+            Err(_) => {
+                self.ctx.metrics.cert_auth_reject();
+                self.ctx.metrics.auth_reject();
+                Auth::reject()
+            }
+        }
     }
 
     /// Lazily establish the per-session backend connection (M1).
@@ -612,34 +873,41 @@ impl server::Handler for GatewaySession {
         Ok(self.reject_all())
     }
 
-    /// Precheck only (D3). Warms the resolver cache and early-rejects on a
-    /// definitive 403/404, but NEVER grants the final accept — that happens in
-    /// `auth_publickey` after russh verifies the signature.
+    /// Precheck for raw public-key authentication (D3).
+    ///
+    /// For a **certificate** attempt russh hands this callback the *inner* user
+    /// key (`PublicKey::new(cert.public_key(), "")`), not the CA that issued it,
+    /// so a control-plane decision keyed on raw-key fingerprints would refuse
+    /// every certificate client before it ever signs (S4). Because the offered
+    /// fingerprint cannot distinguish "raw key to reject" from "inner key of a
+    /// valid certificate", the precheck keeps only the shape check and otherwise
+    /// lets the attempt proceed; the authoritative decision happens in
+    /// [`auth_publickey`](Self::auth_publickey) for raw keys and in
+    /// [`auth_openssh_certificate`](Self::auth_openssh_certificate) for certs.
+    ///
+    /// Trade-off: an unauthorized raw key no longer fails fast in the probe and
+    /// instead burns one signing round — bounded by `auth_rejection_pad` x
+    /// `max_auth_attempts`, and never a silent accept.
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
         public_key: &russh::keys::PublicKey,
     ) -> std::result::Result<Auth, Self::Error> {
         self.ctx.metrics.auth_offered();
-        let principal = match Principal::parse(user) {
-            Ok(p) => p,
-            Err(_) => return Ok(self.reject_all()),
+        // Malformed principals are rejected before any work: a shape failure, not
+        // an authorization one, and independent of cert-vs-raw.
+        let Ok(principal) = Principal::parse(user) else {
+            return Ok(self.reject_all());
         };
+        self.signature_algorithm = public_key.algorithm().to_string();
         let fingerprint = public_key
             .fingerprint(russh::keys::HashAlg::Sha256)
             .to_string();
-        self.signature_algorithm = public_key.algorithm().to_string();
-        match self.resolve_grant(&principal, &fingerprint).await {
-            Ok(_) => {
-                // Let the client proceed to signature verification.
-                self.principal = Some(principal);
-                Ok(Auth::Accept)
-            }
-            Err(_) => {
-                // Early reject: authoritative-but-negative; saves a signing round.
-                Ok(self.reject_all())
-            }
-        }
+        // Warm the resolver cache without acting on the answer so the final
+        // callback benefits from the warm path.
+        let _ = self.resolve_grant(&principal, &fingerprint).await;
+        self.principal = Some(principal);
+        Ok(Auth::Accept)
     }
 
     /// Authoritative decision (D3/D4): russh has already verified the signature
@@ -690,13 +958,25 @@ impl server::Handler for GatewaySession {
         }
     }
 
+    /// Authoritative decision for **certificate** authentication (B1).
+    ///
+    /// russs only calls this *after* it has checked the certificate's validity
+    /// window, verified the certificate's own signature, and verified the
+    /// USERAUTH signature against the inner public key — so reaching here means
+    /// the client actually holds the private key. What this callback adds is the
+    /// gateway's own policy: the issuing CA must be trusted, the certificate must
+    /// be inside its validity window and list the requested principal, and the
+    /// control plane must still authorize the destination.
     async fn auth_openssh_certificate(
         &mut self,
-        _user: &str,
-        _certificate: &russh::keys::Certificate,
+        user: &str,
+        certificate: &russh::keys::Certificate,
     ) -> std::result::Result<Auth, Self::Error> {
-        // Certificate auth (TrustedCA) is an M3 deliverable.
-        Ok(self.reject_all())
+        let Ok(principal) = Principal::parse(user) else {
+            self.ctx.metrics.cert_auth_reject();
+            return Ok(self.reject_all());
+        };
+        Ok(self.authorize_certificate(&principal, certificate).await)
     }
 
     async fn auth_succeeded(
@@ -705,6 +985,129 @@ impl server::Handler for GatewaySession {
     ) -> std::result::Result<(), Self::Error> {
         let handle = session.handle();
         self.register(handle);
+        Ok(())
+    }
+
+    /// Jump mode: a `direct-tcpip` ("local TCP forwarding") channel request (B4).
+    ///
+    /// The gateway is an outbound pivot for these, so two gates apply before any
+    /// socket is opened — the jump policy must be enabled **and** the target must
+    /// clear [`crate::jump::authorize_jump_target`] (allow-list plus the
+    /// private/loopback/link-local address-class guard that stops the gateway
+    /// becoming an SSRF foothold in the network behind it). Everything else is
+    /// refused with a protocol-native open failure (I4) — including the
+    /// pre-M3 default, where jump mode is simply off.
+    #[allow(clippy::too_many_arguments)]
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        _originator_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> std::result::Result<(), Self::Error> {
+        let target = crate::jump::JumpTarget {
+            host: host_to_connect.to_owned(),
+            port: u16::try_from(port_to_connect).unwrap_or(0),
+        };
+        let grant_targets = self
+            .grant
+            .as_ref()
+            .map(|g| g.policy.tcp_forwarding_targets.clone())
+            .unwrap_or_default();
+        let deny = crate::jump::authorize_jump_target(
+            self.ctx.config.jump.enabled,
+            self.ctx.config.jump.allow_private_networks,
+            &self.ctx.config.jump.allowed_targets,
+            &grant_targets,
+            crate::jump::resolve_target(host_to_connect),
+            &target,
+        );
+        if let Err(reason) = deny {
+            self.ctx.metrics.jump_denied();
+            if matches!(reason, crate::jump::JumpDenial::ForbiddenAddress { .. }) {
+                self.ctx.metrics.jump_forbidden_address();
+            }
+            tracing::info!(
+                target: "server",
+                originator = originator_address,
+                host = host_to_connect,
+                port = port_to_connect,
+                %reason,
+                "refusing direct-tcpip request"
+            );
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+
+        // Allowed: open the channel toward the backend host, then ask the
+        // backend leg for a matching direct-tcpip channel and relay the two.
+        let Some(grant) = self.grant.clone() else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        if self.ensure_backend().await.is_err() {
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        }
+        // Borrow the backend handle only for the async open; the owned channel
+        // that comes back outlives the borrow so `self.relays` can be mutated.
+        let opened = match self.backend.as_ref() {
+            Some(backend) => backend
+                .channel_open_direct_tcpip(
+                    host_to_connect.to_owned(),
+                    port_to_connect,
+                    format!("{}:{}", grant.target.host, grant.target.port),
+                    0,
+                )
+                .await
+                .ok(),
+            None => None,
+        };
+        match opened {
+            Some(channel_half) => {
+                let client_id = _channel.id();
+                let (backend_read, backend_write) = channel_half.split();
+                let bytes = self
+                    .auditor
+                    .as_ref()
+                    .map(|a| a.byte_counters())
+                    .unwrap_or_default();
+                let up = _session.handle();
+                tokio::spawn(relay::pump_backend_to_client(
+                    backend_read,
+                    up,
+                    client_id,
+                    ReplyRouter::default(),
+                    Arc::new(relay::OutboundWindow::uncalibrated()),
+                    Arc::clone(&bytes),
+                    self.ctx.metrics.clone(),
+                    None,
+                ));
+                self.relays.insert(
+                    client_id,
+                    ChannelRelay::new(
+                        client_id,
+                        backend_write,
+                        ReplyRouter::default(),
+                        Arc::new(relay::OutboundWindow::uncalibrated()),
+                        bytes,
+                        self.ctx.metrics.clone(),
+                    ),
+                );
+                self.ctx.metrics.jump_open();
+                reply.accept().await;
+            }
+            None => {
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            }
+        }
         Ok(())
     }
 
@@ -767,6 +1170,16 @@ impl server::Handler for GatewaySession {
                 }
 
                 let up = session.handle();
+                // B2/B3: create the per-channel data tap (recording and/or SFTP
+                // inspection). `None` keeps the plain-transmission fast path.
+                let tap_ctx = relay::ChannelCtx {
+                    session_id: self.session_id.to_string(),
+                    channel_id: client_id,
+                    principal: grant.principal.as_str().to_owned(),
+                    command_class: crate::audit::CommandClass::Interactive,
+                    record: grant.policy.recording,
+                };
+                let tap = self.ctx.interceptor.observe(&tap_ctx);
                 tokio::spawn(relay::pump_backend_to_client(
                     backend_read,
                     up,
@@ -775,6 +1188,7 @@ impl server::Handler for GatewaySession {
                     Arc::clone(&window),
                     Arc::clone(&bytes),
                     self.ctx.metrics.clone(),
+                    tap.clone(),
                 ));
 
                 let relay = ChannelRelay::new(
@@ -786,8 +1200,9 @@ impl server::Handler for GatewaySession {
                     self.ctx.metrics.clone(),
                 );
                 self.relays.insert(client_id, relay);
-                // Consume `grant` to silence clippy and document intent.
-                let _ = grant;
+                if let Some(tap) = tap {
+                    self.taps.insert(client_id, tap);
+                }
                 reply.accept().await;
             }
             Ok(None) | Err(_) => {
@@ -842,6 +1257,15 @@ impl server::Handler for GatewaySession {
             }
         }
 
+        // B2/B3: the channel tap may withhold or rewrite the payload. A rewrite
+        // is returned only when something was refused, so the untapped fast path
+        // still forwards the client's buffer without copying it.
+        let payload = match self.apply_uplink_tap(channel, data) {
+            UplinkOutcome::Forward(buf) => buf,
+            UplinkOutcome::Dropped => return Ok(()),
+        };
+        let n = payload.len();
+
         // The relay is still present: the serial handler cannot have been
         // re-entered during our await, and nothing else removes relays.
         let relay = match self.relays.get(&channel) {
@@ -849,7 +1273,7 @@ impl server::Handler for GatewaySession {
             None => return Ok(()),
         };
         relay.bytes.add_up(n);
-        let owned = Bytes::copy_from_slice(data);
+        let owned = Bytes::from(payload);
         if let Err(e) = relay.backend.data_bytes(owned).await {
             tracing::debug!(target: "relay", ?channel, ?e, "uplink forward failed");
         }
@@ -1109,6 +1533,10 @@ impl server::Handler for GatewaySession {
         if let Some(relay) = self.relays.remove(&channel) {
             relay.backend.close().await?;
         }
+        if let Some(tap) = self.taps.remove(&channel) {
+            // Deterministic flush/close of any recording for this channel (B2).
+            tap.flush();
+        }
         if let Some(entry) = &self.entry {
             entry.forget_channel(channel);
         }
@@ -1139,6 +1567,7 @@ impl Drop for GatewaySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::ChannelTap as _;
 
     #[test]
     fn drain_state_roundtrips_through_atomic() {
@@ -1213,14 +1642,28 @@ mod tests {
         }
 
         /// Create a 0600 ed25519 key file and register it for cleanup.
+        ///
+        /// The file name is derived from the freshly generated key, so two tests
+        /// running concurrently in this process can never collide on a path (a
+        /// time-based suffix does: cargo runs test threads in parallel and they
+        /// reach this within the same clock tick, which used to make one test's
+        /// guard delete a file another was still loading).
         fn add_key(&mut self) -> String {
-            let path = new_temp_key_path();
             let mut rng = rand::rng();
             let key =
                 russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
             let body = key
                 .to_openssh(russh::keys::ssh_key::LineEnding::LF)
                 .unwrap();
+            let digest = key
+                .public_key()
+                .fingerprint(russh::keys::HashAlg::Sha256)
+                .to_string();
+            let path = std::env::temp_dir().join(format!(
+                "sshgw-ctx-{}-{}.key",
+                std::process::id(),
+                digest.replace(':', "").replace('/', "")
+            ));
             {
                 let f = std::fs::File::create(&path).unwrap();
                 let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
@@ -1237,17 +1680,6 @@ mod tests {
                 let _ = std::fs::remove_file(p);
             }
         }
-    }
-
-    fn new_temp_key_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "sshgw-ctx-{}-{}.key",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ))
     }
 
     /// Build a gateway context over freshly-created temp keys (registered in
@@ -1330,6 +1762,60 @@ mod tests {
         russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap()
     }
 
+    /// A CA private key for certificate tests.
+    fn ca_key() -> russh::keys::PrivateKey {
+        let mut rng = rand::rng();
+        russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap()
+    }
+
+    /// A context whose CA trusts `ca_public_key`.
+    fn cert_ctx(
+        dir: &mut TestKeyGuard,
+        ca_pub: &russh::keys::PublicKey,
+        control_plane: Arc<FixControlPlane>,
+    ) -> Arc<GatewayContext> {
+        let host_key = dir.add_key();
+        let backend_key = dir.add_key();
+        let ca_path = dir.add_key();
+        std::fs::write(&ca_path, ca_pub.to_openssh().unwrap()).unwrap();
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [{{ path = "{host_key}", state = "active" }}]
+            [backend]
+            private_key = "{backend_key}"
+            host_key_policy = "accept-new"
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [ca]
+            trusted_ca_keys = ["{ca_path}"]
+            cert_lifetime = "300s"
+        "#
+        );
+        let config = GatewayConfig::parse(&toml).unwrap();
+        GatewayContext::build_with_client(config, control_plane).unwrap()
+    }
+
+    /// Issue a user certificate signed by `ca` for `principals`.
+    fn issue_cert(
+        ca: &russh::keys::PrivateKey,
+        subject: &russh::keys::PublicKey,
+        principals: &[&str],
+        lifetime_s: u64,
+    ) -> russh::keys::Certificate {
+        let principals: Vec<String> = principals.iter().map(|s| (*s).to_owned()).collect();
+        crate::ca::issue_user_certificate_with(
+            ca,
+            subject,
+            &principals,
+            "alex@dev",
+            std::time::Duration::from_secs(lifetime_s),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn authorized_pubkey_is_accepted_and_grants() {
         let ctx = test_ctx(Arc::new(FixControlPlane {
@@ -1358,9 +1844,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_key_is_rejected_in_both_phases() {
-        // Control plane denies (impersonated key → 403): offered early-rejects,
-        // final rejects, and no grant is ever set.
+    async fn unauthorized_key_is_rejected_in_the_final_callback_only() {
+        // S4 semantics: the offered callback cannot distinguish "a raw key to
+        // reject" from "the inner key of a valid certificate" (russh hands it
+        // the inner public key either way), so it must let the attempt proceed
+        // and the authoritative refusal happens in `auth_publickey`.
         let ctx = test_ctx(Arc::new(FixControlPlane {
             result: Err(ControlError::Forbidden),
         }));
@@ -1369,20 +1857,23 @@ mod tests {
         let key = random_client_key();
         let pk = key.public_key();
 
-        assert!(matches!(
-            session
-                .auth_publickey_offered("alex_host1", pk)
-                .await
-                .unwrap(),
-            Auth::Reject { .. }
-        ));
-        assert!(matches!(
-            session.auth_publickey("alex_host1", pk).await.unwrap(),
-            Auth::Reject { .. }
-        ));
+        let offered = session
+            .auth_publickey_offered("alex_host1", pk)
+            .await
+            .unwrap();
+        assert_eq!(
+            offered,
+            Auth::Accept,
+            "offered must let a cert-capable attempt reach signature verification"
+        );
+        let authorized = session.auth_publickey("alex_host1", pk).await.unwrap();
+        assert!(
+            matches!(authorized, Auth::Reject { .. }),
+            "the final callback must still refuse an unauthorized key"
+        );
         assert!(
             session.grant.is_none(),
-            "denied principal must not be granted"
+            "a denied principal must never be granted"
         );
     }
 
@@ -1562,7 +2053,166 @@ mod tests {
         );
     }
 
-    // ---- defect-A: auth-timeout / rejection-delay decoupling ----
+    /// Build a context with an explicit `[jump]` policy.
+    fn jump_ctx(
+        keys: &mut TestKeyGuard,
+        enabled: bool,
+        allowed: &str,
+        allow_private: bool,
+    ) -> Arc<GatewayContext> {
+        let host_key = keys.add_key();
+        let backend_key = keys.add_key();
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [{{ path = "{host_key}", state = "active" }}]
+            [backend]
+            private_key = "{backend_key}"
+            host_key_policy = "accept-new"
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [jump]
+            enabled = {enabled}
+            allow_private_networks = {allow_private}
+            allowed_targets = [{allowed}]
+        "#
+        );
+        let config = GatewayConfig::parse(&toml).unwrap();
+        GatewayContext::build_with_client(
+            config,
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        )
+        .unwrap()
+    }
+
+    // ---- M3 B4: jump mode target authorization ----
+
+    #[test]
+    fn jump_is_denied_by_default_config() {
+        let mut keys = TestKeyGuard::new();
+        // Even with a permissive-looking allow-list, the master switch is off.
+        let ctx = jump_ctx(&mut keys, false, "\"*:22\"", false);
+        assert!(!ctx.config.jump.enabled, "jump must default to off");
+        let deny = crate::jump::authorize_jump_target(
+            ctx.config.jump.enabled,
+            ctx.config.jump.allow_private_networks,
+            &ctx.config.jump.allowed_targets,
+            &[],
+            Some(std::net::IpAddr::from([8, 8, 8, 8])),
+            &crate::jump::JumpTarget {
+                host: "8.8.8.8".to_owned(),
+                port: 22,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(deny, crate::jump::JumpDenial::Disabled);
+    }
+
+    #[test]
+    fn jump_allow_list_permits_only_listed_targets() {
+        let mut keys = TestKeyGuard::new();
+        let ctx = jump_ctx(&mut keys, true, "\"db.example.com:5432\"", false);
+        let authorize = |host: &str, port: u16| {
+            crate::jump::authorize_jump_target(
+                true,
+                false,
+                &ctx.config.jump.allowed_targets,
+                &[],
+                Some(std::net::IpAddr::from([8, 8, 8, 8])),
+                &crate::jump::JumpTarget {
+                    host: host.to_owned(),
+                    port,
+                },
+            )
+        };
+        assert!(authorize("db.example.com", 5432).is_ok());
+        // An unlisted host:port must be refused...
+        let err = authorize("db.example.com", 22).unwrap_err();
+        assert!(
+            matches!(err, crate::jump::JumpDenial::NotAllowed { .. }),
+            "an unlisted port must be refused, got {err}"
+        );
+        assert!(
+            authorize("other.example.com", 5432).is_err(),
+            "an unlisted host must be refused"
+        );
+    }
+
+    #[test]
+    fn jump_refuses_private_destinations_even_when_listed() {
+        let mut keys = TestKeyGuard::new();
+        let ctx = jump_ctx(&mut keys, true, "\"*:80\"", false);
+        let deny = crate::jump::authorize_jump_target(
+            true,
+            ctx.config.jump.allow_private_networks,
+            &ctx.config.jump.allowed_targets,
+            &[],
+            Some(std::net::IpAddr::from([169, 254, 169, 254])),
+            &crate::jump::JumpTarget {
+                host: "169.254.169.254".to_owned(),
+                port: 80,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            deny,
+            crate::jump::JumpDenial::ForbiddenAddress {
+                host: "169.254.169.254".to_owned(),
+                port: 80
+            },
+            "the cloud metadata address must never be an SSRF foothold"
+        );
+    }
+
+    #[test]
+    fn grant_policy_targets_extend_the_gateway_allow_list() {
+        // S6 contract: control-plane `policy.tcp_forwarding_targets` union with
+        // the gateway-wide list.
+        let grant_targets = vec!["grant.example.com:443".to_owned()];
+        let ok = crate::jump::authorize_jump_target(
+            true,
+            false,
+            &["gw.example.com:22".to_owned()],
+            &grant_targets,
+            Some(std::net::IpAddr::from([8, 8, 8, 8])),
+            &crate::jump::JumpTarget {
+                host: "grant.example.com".to_owned(),
+                port: 443,
+            },
+        );
+        assert!(ok.is_ok(), "a grant-listed target must be reachable");
+    }
+
+    #[test]
+    fn legacy_policy_without_targets_denies_jump() {
+        // Backward compatibility: a control plane that predates
+        // `tcp_forwarding_targets` (absent field -> empty list) keeps default-deny.
+        let legacy = crate::types::Policy {
+            tcp_forwarding: true,
+            ..Default::default()
+        };
+        assert!(
+            legacy.tcp_forwarding_targets.is_empty(),
+            "an absent list must deserialize to empty"
+        );
+        let deny = crate::jump::authorize_jump_target(
+            true,
+            false,
+            &[],
+            &legacy.tcp_forwarding_targets,
+            Some(std::net::IpAddr::from([8, 8, 8, 8])),
+            &crate::jump::JumpTarget {
+                host: "8.8.8.8".to_owned(),
+                port: 22,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(deny, crate::jump::JumpDenial::NotAllowed { .. }));
+    }
 
     #[test]
     fn max_auth_attempts_is_wired_into_the_server_config() {
@@ -1591,6 +2241,147 @@ mod tests {
         }));
         assert_eq!(ctx.server_config.max_auth_attempts, 10);
     }
+
+    // ---- M3 B5: HA support (stateless replicas can coexist) ----
+
+    #[test]
+    fn two_instances_coexist_on_distinct_ports_and_dirs() {
+        // B5's src-side requirement: nothing global pins an instance. Building two
+        // contexts with different listen/metrics addresses (the operator-facing
+        // knobs) and proving nothing collides is the replica story on one host.
+        let listener_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        drop(listener_a);
+        drop(listener_b);
+        assert_ne!(addr_a, addr_b, "distinct instances must use distinct ports");
+
+        let mut keys = TestKeyGuard::new();
+        let a = recording_ctx(&mut keys, addr_a);
+        let b = recording_ctx(&mut keys, addr_b);
+
+        assert_ne!(a.config.listen_addr, b.config.listen_addr);
+        assert_ne!(a.config.metrics.addr, b.config.metrics.addr);
+        // Per-instance recording directory: replicas must not share files.
+        assert_ne!(
+            a.config.recording.dir, b.config.recording.dir,
+            "each replica needs its own recording directory"
+        );
+        // Registries are independent (the session tables are per-process).
+        assert_eq!(a.registry.total(), 0);
+        assert_eq!(b.registry.total(), 0);
+    }
+
+    #[test]
+    fn recorded_files_are_namespaced_per_instance_dir() {
+        // Two replicas recording the same session id must not share a file,
+        // which is what B2's directory config guarantees.
+        let tmp_a = TempRecDir::new("ha-a");
+        let tmp_b = TempRecDir::new("ha-b");
+        assert_ne!(tmp_a.path(), tmp_b.path());
+    }
+
+    /// A drop-guarded temp recording directory for the HA tests.
+    struct TempRecDir(std::path::PathBuf);
+
+    impl TempRecDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "sshgw-ha-{}-{tag}-{}",
+                std::process::id(),
+                // Random suffix so concurrent tests never share a directory.
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TempRecDir(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRecDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A replica-shaped context: its own listen addr, metrics addr and recording
+    /// directory — exactly the knobs an operator must give each replica so two
+    /// can run side by side on one host.
+    fn recording_ctx(keys: &mut TestKeyGuard, addr: std::net::SocketAddr) -> Arc<GatewayContext> {
+        let host_key = keys.add_key();
+        let backend_key = keys.add_key();
+        // Allocate a free metrics port so a real multi-replica start would bind.
+        let metrics = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("allocate a metrics port");
+        let rec_dir = TempRecDir::new("ctx");
+        let rec_dir = std::mem::ManuallyDrop::new(rec_dir).0.clone();
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "{addr}"
+            [host_keys]
+            keys = [{{ path = "{host_key}", state = "active" }}]
+            [backend]
+            private_key = "{backend_key}"
+            host_key_policy = "accept-new"
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [recording]
+            dir = "{}"
+            [metrics]
+            addr = "{metrics}"
+        "#,
+            rec_dir.to_string_lossy()
+        );
+        let config = GatewayConfig::parse(&toml).unwrap();
+        GatewayContext::build_with_client(
+            config,
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn m3_sections_have_safe_defaults() {
+        // Every M3 feature must be off unless explicitly configured, so an
+        // operator upgrading from the pre-M3 config changes nothing.
+        let ctx = test_ctx(Arc::new(FixControlPlane {
+            result: Ok(ok_response()),
+        }));
+        assert!(
+            ctx.ca.trusted_ca_fingerprints().is_empty(),
+            "CA must default to disabled"
+        );
+        assert!(
+            !ctx.config.intercept.sftp.enabled,
+            "SFTP interception must default to off"
+        );
+        assert!(!ctx.config.jump.enabled, "jump mode must default to off");
+        assert!(
+            !ctx.config.jump.allow_private_networks,
+            "the SSRF guard must stay on by default"
+        );
+        assert!(
+            ctx.config.jump.allowed_targets.is_empty(),
+            "an empty jump allow-list must deny everything"
+        );
+        assert!(
+            !ctx.config.recording.dir.as_os_str().is_empty(),
+            "a recording directory must always be configured"
+        );
+        assert!(
+            ctx.config.recording.max_bytes_per_session > 0,
+            "recording must be budgeted"
+        );
+    }
+
+    // ---- defect-A: auth-timeout / rejection-delay decoupling ----
 
     #[test]
     fn auth_rejection_timing_decouples_initial_from_ongoing() {
@@ -1654,6 +2445,371 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "auth took {elapsed:?}: the initial none-probe is being padded by the full auth_timeout (defect A)"
+        );
+    }
+
+    // ---- M3 B1: certificate authentication ----
+
+    #[tokio::test]
+    async fn valid_certificate_from_a_trusted_ca_is_accepted() {
+        let mut keys = TestKeyGuard::new();
+        let ca = ca_key();
+        let subject =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .public_key()
+                .clone();
+        let ctx = cert_ctx(
+            &mut keys,
+            &ca.public_key().clone(),
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        );
+        let cert = issue_cert(&ca, &subject, &["alex_host1"], 300);
+
+        let mut session = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = session
+            .auth_openssh_certificate("alex_host1", &cert)
+            .await
+            .unwrap();
+        assert_eq!(
+            auth,
+            Auth::Accept,
+            "a valid cert from a trusted CA must authenticate"
+        );
+        assert!(
+            session.grant.is_some(),
+            "the session must be granted on accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_from_an_untrusted_ca_is_rejected() {
+        let mut keys = TestKeyGuard::new();
+        let trusted_ca = ca_key();
+        let rogue_ca = ca_key();
+        let subject_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .public_key()
+                .clone();
+        let ctx = cert_ctx(
+            &mut keys,
+            &trusted_ca.public_key().clone(),
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        );
+        let cert = issue_cert(&rogue_ca, &subject_key, &["alex_host1"], 300);
+
+        let mut session = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = session
+            .auth_openssh_certificate("alex_host1", &cert)
+            .await
+            .unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "an untrusted CA must be refused"
+        );
+        assert!(session.grant.is_none());
+    }
+
+    #[tokio::test]
+    async fn certificate_with_the_wrong_principal_is_rejected() {
+        let mut keys = TestKeyGuard::new();
+        let ca = ca_key();
+        let subject_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .public_key()
+                .clone();
+        let ctx = cert_ctx(
+            &mut keys,
+            &ca.public_key().clone(),
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        );
+        // Minted for `bob`, used to log in as `alex_host1`.
+        let cert = issue_cert(&ca, &subject_key, &["bob"], 300);
+
+        let mut session = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = session
+            .auth_openssh_certificate("alex_host1", &cert)
+            .await
+            .unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "principal mismatch must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_certificate_is_rejected() {
+        let mut keys = TestKeyGuard::new();
+        let ca = ca_key();
+        let subject_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .public_key()
+                .clone();
+        let ctx = cert_ctx(
+            &mut keys,
+            &ca.public_key().clone(),
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        );
+        // A 1-second certificate, then actually wait it out: this exercises the
+        // real clock path in `authorize_certificate` rather than a fake.
+        let cert = issue_cert(&ca, &subject_key, &["alex_host1"], 1);
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+
+        let mut session = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = session
+            .auth_openssh_certificate("alex_host1", &cert)
+            .await
+            .unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "an expired certificate must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_certificate_is_rejected_end_to_end() {
+        let mut keys = TestKeyGuard::new();
+        let ca = ca_key();
+        let subject_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .public_key()
+                .clone();
+        let ctx = cert_ctx(
+            &mut keys,
+            &ca.public_key().clone(),
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        );
+        let cert = issue_cert(&ca, &subject_key, &["alex_host1"], 300);
+        let mut bytes = cert.to_bytes().unwrap();
+        let len = bytes.len();
+        bytes[len - 32] ^= 0xff; // corrupt the trailing ed25519 signature
+        let tampered = russh::keys::Certificate::from_bytes(&bytes).unwrap();
+
+        let mut session = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = session
+            .auth_openssh_certificate("alex_host1", &tampered)
+            .await
+            .unwrap();
+        assert!(
+            matches!(auth, Auth::Reject { .. }),
+            "a tampered certificate must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_inner_fingerprint_differs_from_the_ca_fingerprint() {
+        // S4 regression: the fingerprint control-plane authorization sees for a
+        // certificate client is the *inner user key's*, not the CA's. The
+        // certificate must still authenticate because authorization happens in
+        // `auth_openssh_certificate` against the CA.
+        let mut keys = TestKeyGuard::new();
+        let ca = ca_key();
+        let subject_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .public_key()
+                .clone();
+        let ctx = cert_ctx(
+            &mut keys,
+            &ca.public_key().clone(),
+            Arc::new(FixControlPlane {
+                result: Ok(ok_response()),
+            }),
+        );
+        let cert = issue_cert(&ca, &subject_key, &["alex_host1"], 300);
+
+        let ca_fp = crate::ca::certificate_ca_fingerprint(&cert);
+        let inner_fp = subject_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        assert_ne!(
+            ca_fp, inner_fp,
+            "the inner key fingerprint must differ from the CA's"
+        );
+
+        // A control plane that only knows the CA fingerprint (the only thing it
+        // is given for a certificate client) still authorizes the session.
+        let mut session = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = session
+            .auth_openssh_certificate("alex_host1", &cert)
+            .await
+            .unwrap();
+        assert_eq!(auth, Auth::Accept);
+        let granted_fp = session
+            .grant
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .as_str()
+            .to_owned();
+        assert_eq!(
+            granted_fp, ca_fp,
+            "the grant must key on the CA fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn ca_disabled_rejects_every_certificate() {
+        // No `[ca]` section at all: certificate authentication must be off while
+        // raw public-key auth keeps working.
+        let ctx = test_ctx(Arc::new(FixControlPlane {
+            result: Ok(ok_response()),
+        }));
+        assert!(
+            ctx.ca.trusted_ca_fingerprints().is_empty(),
+            "no CAs must be trusted"
+        );
+        let ca = ca_key();
+        let subject_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap()
+                .public_key()
+                .clone();
+        let cert = issue_cert(&ca, &subject_key, &["alex_host1"], 300);
+
+        let mut session = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = session
+            .auth_openssh_certificate("alex_host1", &cert)
+            .await
+            .unwrap();
+        assert!(matches!(auth, Auth::Reject { .. }));
+    }
+
+    // ---- M3 B3: SFTP data-path interception ----
+
+    fn sftp_inspector(deny: &[&str], allow: &[&str], drop: &[&str]) -> crate::sftp::SftpInspector {
+        let (deny, allow, drop) = crate::sftp::validate_rules(
+            &deny.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            &allow.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            &drop.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        crate::sftp::SftpInspector::new(
+            crate::sftp::SftpRules {
+                deny_commands: deny,
+                allowed_path_prefixes: allow,
+                denied_path_prefixes: drop,
+            },
+            Metrics::default(),
+        )
+    }
+
+    fn frame(type_byte: u8, body: &[u8]) -> Vec<u8> {
+        let mut inner = vec![type_byte];
+        inner.extend_from_slice(body);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        out.extend_from_slice(&inner);
+        out
+    }
+
+    fn request(type_byte: u8, id: u32, path: &str) -> Vec<u8> {
+        let mut body = id.to_be_bytes().to_vec();
+        body.extend_from_slice(&(path.len() as u32).to_be_bytes());
+        body.extend_from_slice(path.as_bytes());
+        frame(type_byte, &body)
+    }
+
+    #[tokio::test]
+    async fn sftp_inspector_passes_allowed_requests_without_copying() {
+        let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
+        let ok = request(3, 1, "/data/ok.txt"); // OPEN
+        let verdict = inspector.on_data(relay::Direction::Up, &ok);
+        assert_eq!(
+            verdict,
+            relay::DataVerdict::Pass,
+            "an allowed request must pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_inspector_denies_a_forbidden_command_and_synthesises_status() {
+        let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
+        let rm = request(10, 42, "/data/x.txt"); // REMOVE
+        let verdict = inspector.on_data(relay::Direction::Up, &rm);
+        let relay::DataVerdict::Rewrite {
+            forward,
+            inject,
+            denied,
+        } = verdict
+        else {
+            panic!("a denied REMOVE must be rewritten, got the Pass path");
+        };
+        assert!(forward.is_empty(), "the denied request must be withheld");
+        assert!(denied.is_some(), "the denial reason must be reported");
+        // The injected bytes must be a well-formed SSH_FXP_STATUS for this id.
+        let len = u32::from_be_bytes(inject[..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            len + 4,
+            inject.len(),
+            "the frame length must cover the whole body"
+        );
+        assert_eq!(inject[4], 101, "SSH_FXP_STATUS");
+        assert_eq!(
+            u32::from_be_bytes(inject[5..9].try_into().unwrap()),
+            42,
+            "the request id must be echoed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_inspector_denies_paths_outside_the_allow_list() {
+        let inspector = sftp_inspector(&[], &["/data/"], &[]);
+        let denied = request(3, 7, "/etc/shadow"); // OPEN /etc/shadow
+        let verdict = inspector.on_data(relay::Direction::Up, &denied);
+        assert!(
+            matches!(verdict, relay::DataVerdict::Rewrite { .. }),
+            "an out-of-scope path must be refused"
+        );
+
+        let allowed = request(3, 8, "/data/ok.txt");
+        assert_eq!(
+            inspector.on_data(relay::Direction::Up, &allowed),
+            relay::DataVerdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_inspector_never_inspects_downlink_data() {
+        let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
+        let rm = request(10, 42, "/data/x.txt");
+        assert_eq!(
+            inspector.on_data(relay::Direction::Down, &rm),
+            relay::DataVerdict::Pass,
+            "only client→server carries SFTP requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_tap_chains_inspector_before_recorder() {
+        // The recorder must see only what the inspector allowed.
+        let inspector = sftp_inspector(&["REMOVE"], &[], &[]);
+        let rm = request(10, 1, "/data/x.txt");
+        let allowed = request(3, 2, "/data/ok.txt");
+        let combined: Vec<u8> = rm.iter().chain(allowed.iter()).copied().collect();
+
+        // With the inspector first, the recorder sees just the allowed OPEN.
+        let filtered = match inspector.on_data(relay::Direction::Up, &combined) {
+            relay::DataVerdict::Pass => combined.clone(),
+            relay::DataVerdict::Rewrite { forward, .. } => forward,
+        };
+        assert_eq!(
+            filtered, allowed,
+            "only the allowed frame must survive the inspector"
         );
     }
 }

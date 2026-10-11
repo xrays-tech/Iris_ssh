@@ -2207,6 +2207,8 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
+ "ssh-encoding",
+ "ssh-key",
  "thiserror",
  "tokio",
  "toml",

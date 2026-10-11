@@ -125,6 +125,13 @@ pub struct Policy {
     pub agent_forwarding: bool,
     #[serde(default)]
     pub tcp_forwarding: bool,
+    /// Jump-mode target allow-list: `host`, `host:port`, or `*:port` entries.
+    ///
+    /// Compatible with the older boolean `tcp_forwarding` field: an absent list
+    /// deserializes to empty, and an empty list means "no targets allowed", so a
+    /// control plane that predates this field keeps the default-deny behaviour.
+    #[serde(default)]
+    pub tcp_forwarding_targets: Vec<String>,
     #[serde(default)]
     pub recording: bool,
     #[serde(default)]

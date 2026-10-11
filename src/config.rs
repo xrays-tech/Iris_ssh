@@ -28,6 +28,14 @@ pub struct GatewayConfig {
     pub pool: PoolConfig,
     pub control_plane: ControlPlaneConfig,
     pub limits: LimitsConfig,
+    /// Certificate authority (B1: host/user CA).
+    pub ca: CaConfig,
+    /// SFTP command-level interception (B3).
+    pub intercept: InterceptConfig,
+    /// Jump mode / direct-tcpip policy (B4).
+    pub jump: JumpConfig,
+    /// Session recording (B2).
+    pub recording: RecordingConfig,
     pub shutdown: ShutdownConfig,
     pub metrics: MetricsConfig,
 }
@@ -143,6 +151,67 @@ pub struct MetricsConfig {
     pub addr: std::net::SocketAddr,
 }
 
+/// Certificate-authority configuration (propose.md §八 / B1).
+///
+/// Both the user-certificate path (`auth_openssh_certificate`) and the backend
+/// host-certificate path (`@cert-authority`) trust CAs by the fingerprint of
+/// their **signing** key, so one list serves both.
+#[derive(Debug, Clone, Default)]
+pub struct CaConfig {
+    /// Paths to trusted CA public keys (OpenSSH format). Empty disables
+    /// certificate authentication entirely.
+    pub trusted_ca_keys: Vec<std::path::PathBuf>,
+    /// Optional CA private key. When present the gateway can *issue* short-lived
+    /// user certificates; absent means verify-only.
+    pub signing_key: Option<std::path::PathBuf>,
+    /// Lifetime of issued certificates (seconds).
+    pub cert_lifetime: Duration,
+}
+
+/// Session recording configuration (B2).
+#[derive(Debug, Clone)]
+pub struct RecordingConfig {
+    /// Directory for recording files. Must be per-instance private (0600 dir,
+    /// 0600 files) so multiple gateway replicas can coexist without collisions.
+    pub dir: std::path::PathBuf,
+    /// Hard cap on recorded bytes per channel; recording stops (and the session
+    /// is audited as truncated) once reached, bounding disk use.
+    pub max_bytes_per_session: u64,
+}
+
+/// SFTP interception configuration (B3).
+#[derive(Debug, Clone)]
+pub struct InterceptConfig {
+    pub sftp: SftpInterceptConfig,
+}
+
+/// SFTP command-level interception policy.
+#[derive(Debug, Clone, Default)]
+pub struct SftpInterceptConfig {
+    pub enabled: bool,
+    /// SFTP command names to refuse outright (e.g. `["REMOVE", "RENAME"]`).
+    pub deny_commands: Vec<String>,
+    /// Path prefixes that may be reached; empty means "allow all" (only
+    /// `deny_commands` applies).
+    pub allowed_path_prefixes: Vec<String>,
+    /// Path prefixes that are always refused, evaluated after the allow-list.
+    pub denied_path_prefixes: Vec<String>,
+}
+
+/// Jump-mode (direct-tcpip) configuration (B4).
+#[derive(Debug, Clone)]
+pub struct JumpConfig {
+    /// Master switch. Off = every direct-tcpip request is rejected locally,
+    /// which is the pre-M3 baseline.
+    pub enabled: bool,
+    /// Additional gateway-wide target allow-list (`host`, `host:port`,
+    /// `*:port`). Merged with the per-grant `policy.tcp_forwarding_targets`.
+    pub allowed_targets: Vec<String>,
+    /// Whether loopback/private/link-local destinations may be reached. Off by
+    /// default: the gateway must not become an SSRF pivot into the private net.
+    pub allow_private_networks: bool,
+}
+
 // --------------------------------------------------------------------------
 // Raw TOML structures (fields still strings, validated afterwards).
 // --------------------------------------------------------------------------
@@ -163,6 +232,110 @@ struct RawConfig {
     shutdown: RawShutdown,
     #[serde(default)]
     metrics: RawMetrics,
+    #[serde(default)]
+    ca: RawCa,
+    #[serde(default)]
+    intercept: RawIntercept,
+    #[serde(default)]
+    jump: RawJump,
+    #[serde(default)]
+    recording: RawRecording,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCa {
+    #[serde(default)]
+    trusted_ca_keys: Vec<String>,
+    #[serde(default)]
+    signing_key: Option<String>,
+    #[serde(default = "default_cert_lifetime")]
+    cert_lifetime: String,
+}
+
+impl Default for RawCa {
+    fn default() -> Self {
+        RawCa {
+            trusted_ca_keys: Vec::new(),
+            signing_key: None,
+            // Must match `default_cert_lifetime`: a derived `Default` would give
+            // an empty string and then fail duration parsing for an absent
+            // `[ca]` section.
+            cert_lifetime: default_cert_lifetime(),
+        }
+    }
+}
+
+fn default_cert_lifetime() -> String {
+    "300s".to_owned()
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawIntercept {
+    #[serde(default)]
+    sftp: RawSftpIntercept,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawSftpIntercept {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    deny_commands: Vec<String>,
+    #[serde(default)]
+    allowed_path_prefixes: Vec<String>,
+    #[serde(default)]
+    denied_path_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawJump {
+    #[serde(default = "default_jump_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    allowed_targets: Vec<String>,
+    #[serde(default = "default_allow_private_networks")]
+    allow_private_networks: bool,
+}
+
+impl Default for RawJump {
+    fn default() -> Self {
+        RawJump {
+            enabled: default_jump_enabled(),
+            allowed_targets: Vec::new(),
+            allow_private_networks: default_allow_private_networks(),
+        }
+    }
+}
+
+fn default_jump_enabled() -> bool {
+    false
+}
+fn default_allow_private_networks() -> bool {
+    false
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRecording {
+    #[serde(default = "default_recording_dir")]
+    dir: String,
+    #[serde(default = "default_max_bytes_per_session")]
+    max_bytes_per_session: u64,
+}
+
+impl Default for RawRecording {
+    fn default() -> Self {
+        RawRecording {
+            dir: default_recording_dir(),
+            max_bytes_per_session: default_max_bytes_per_session(),
+        }
+    }
+}
+
+fn default_recording_dir() -> String {
+    "/var/lib/ssh-gateway/recordings".to_owned()
+}
+fn default_max_bytes_per_session() -> u64 {
+    64 * 1024 * 1024
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,6 +823,64 @@ impl GatewayConfig {
                 reason: format!("not a valid socket address: {:?}", raw.metrics.addr),
             })?;
 
+        // --- M3: certificate authority (B1) ---------------------------------
+        // An absent `[ca]` section (hence no CAs and no signing key) is a valid,
+        // fully-opt-in "CA disabled" configuration: nothing must require it.
+        // A signing key alone, however, would mint certificates the gateway
+        // trusts for nobody, so refuse that half-configured state.
+        if raw.ca.signing_key.is_some() && raw.ca.trusted_ca_keys.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "ca".into(),
+                reason: "a signing_key requires at least one trusted_ca_keys entry".into(),
+            });
+        }
+        let ca = CaConfig {
+            trusted_ca_keys: raw
+                .ca
+                .trusted_ca_keys
+                .iter()
+                .map(|p| PathBuf::from(p.trim()))
+                .collect(),
+            signing_key: raw.ca.signing_key.as_ref().map(|p| PathBuf::from(p.trim())),
+            cert_lifetime: parse_duration("ca.cert_lifetime", &raw.ca.cert_lifetime)?,
+        };
+
+        // --- M3: SFTP interception (B3) -------------------------------------
+        let sftp_rules = crate::sftp::validate_rules(
+            &raw.intercept.sftp.deny_commands,
+            &raw.intercept.sftp.allowed_path_prefixes,
+            &raw.intercept.sftp.denied_path_prefixes,
+        )?;
+        let intercept = InterceptConfig {
+            sftp: SftpInterceptConfig {
+                enabled: raw.intercept.sftp.enabled,
+                deny_commands: sftp_rules.0,
+                allowed_path_prefixes: sftp_rules.1,
+                denied_path_prefixes: sftp_rules.2,
+            },
+        };
+
+        // --- M3: jump mode (B4) ---------------------------------------------
+        let jump = JumpConfig {
+            enabled: raw.jump.enabled,
+            allowed_targets: raw.jump.allowed_targets.clone(),
+            allow_private_networks: raw.jump.allow_private_networks,
+        };
+
+        // --- M3: session recording (B2 / B5) --------------------------------
+        let recording_dir = PathBuf::from(raw.recording.dir.trim());
+        if recording_dir.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "recording.dir".into(),
+                reason: "must not be empty".into(),
+            });
+        }
+        let recording = RecordingConfig {
+            dir: recording_dir,
+            // 0 means "unbounded"; anything else must be a positive budget.
+            max_bytes_per_session: raw.recording.max_bytes_per_session,
+        };
+
         Ok(GatewayConfig {
             listen_addr,
             host_keys,
@@ -658,6 +889,10 @@ impl GatewayConfig {
             pool,
             control_plane,
             limits,
+            ca,
+            intercept,
+            jump,
+            recording,
             shutdown,
             metrics: MetricsConfig { addr: metrics_addr },
         })

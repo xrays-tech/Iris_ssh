@@ -13,14 +13,18 @@
 
 pub mod audit;
 pub mod backend;
+pub mod ca;
 pub mod config;
 pub mod error;
+pub mod jump;
 pub mod metrics;
 pub mod policy;
 pub mod pool;
+pub mod record;
 pub mod relay;
 pub mod resolve;
 pub mod server;
+pub mod sftp;
 pub mod types;
 
 pub use error::{Error, Result};

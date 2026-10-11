@@ -41,12 +41,17 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
 
 use tokio::sync::{oneshot, Semaphore};
 
 use russh::client::Msg as ClientMsg;
-use russh::{ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+
+/// Re-exported so callers can name the type without depending on `russh`'s path.
+pub use russh::ChannelId;
 
 use crate::audit::ByteCounters;
 use crate::metrics::Metrics;
@@ -240,13 +245,62 @@ pub enum Verdict {
     Pass,
     /// Deny the request locally with this user-facing reason.
     Deny(String),
-    /// Forward and additionally tap the data stream (M3 recording/audit).
+    /// Forward and additionally observe the channel's data (M3 recording/audit).
     Tap,
+}
+
+/// Which way a captured buffer is travelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Client → backend.
+    Up,
+    /// Backend → client.
+    Down,
+}
+
+/// What a [`ChannelTap`] decided to do with a captured buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataVerdict {
+    /// Forward the buffer unchanged — the zero-cost fast path.
+    Pass,
+    /// Withhold or rewrite the buffer, optionally injecting bytes back to the
+    /// *client* (e.g. a synthesized `SSH_FXP_STATUS` failure).
+    Rewrite {
+        /// Bytes to forward; may be empty when the whole buffer is withheld.
+        forward: Vec<u8>,
+        /// Bytes to send back the other way (never part of `forward`).
+        inject: Vec<u8>,
+        /// Why something was withheld, for logging/metrics.
+        denied: Option<String>,
+    },
+}
+
+/// Per-channel identity handed to tap implementations, so a recorder or
+/// inspector can name and label its output without borrowing the session.
+#[derive(Debug, Clone)]
+pub struct ChannelCtx {
+    pub session_id: String,
+    pub channel_id: ChannelId,
+    pub principal: String,
+    pub command_class: crate::audit::CommandClass,
+    /// Whether the grant asked for this session to be recorded.
+    pub record: bool,
+}
+
+/// A per-channel data observer created by a [`SubsystemInterceptor`].
+///
+/// `on_data` is only ever called on a channel whose verdict was
+/// [`Verdict::Tap`], so the pass-through path pays nothing. `flush` runs once when
+/// the channel ends so a recorder can close its file deterministically rather
+/// than relying on `Drop` ordering inside a spawned task.
+pub trait ChannelTap: Send + Sync {
+    fn on_data(&self, dir: Direction, buf: &[u8]) -> DataVerdict;
+    fn flush(&self) {}
 }
 
 /// Relay-layer hook for SFTP/subsystem inspection. The default implementation,
 /// [`PassThroughInterceptor`], takes the zero-cost `Pass` fast path (no lock, no
-/// allocation); the richer `Tap` implementation is an M3 deliverable.
+/// allocation).
 ///
 /// The method returns a boxed future so the trait is object-safe and can be
 /// stored as `Arc<dyn SubsystemInterceptor>`.
@@ -256,6 +310,13 @@ pub trait SubsystemInterceptor: Send + Sync {
         name: &'a str,
         grant: &'a Grant,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Verdict> + Send + 'a>>;
+
+    /// Create the per-channel data observer for a channel the interceptor wants
+    /// to watch. The default returns `None` (no tap), which is what keeps the
+    /// plain-transmission path free of both allocation and locking.
+    fn observe(&self, _ctx: &ChannelCtx) -> Option<Arc<dyn ChannelTap>> {
+        None
+    }
 }
 
 /// The M1 interceptor: pass everything through with no overhead.
@@ -376,6 +437,7 @@ impl std::fmt::Display for StopReason {
 /// the command finishing — it additionally tells the whole client leg goodbye
 /// with `SSH_MSG_DISCONNECT[BY_APPLICATION]` (§3.8 destroy semantics) and logs
 /// the reason at ERROR, instead of leaving the client staring at a silent close.
+#[allow(clippy::too_many_arguments)]
 pub async fn pump_backend_to_client(
     mut backend: BackendReader,
     up: russh::server::Handle,
@@ -384,6 +446,7 @@ pub async fn pump_backend_to_client(
     window: std::sync::Arc<OutboundWindow>,
     bytes: std::sync::Arc<ByteCounters>,
     metrics: Metrics,
+    tap: Option<Arc<dyn ChannelTap>>,
 ) {
     // Why we are stopping. Starts as `BackendLost`, which is exactly the case of
     // reaching the end of the loop with `wait()` having returned `None` and no
@@ -394,16 +457,38 @@ pub async fn pump_backend_to_client(
     while let Some(msg) = backend.wait().await {
         match msg {
             ChannelMsg::Data { data } => {
-                let n = data.len();
-                if up.data(client_id, data).await.is_err() {
+                // B2/B3: a downlink tap may withhold or rewrite the payload
+                // (e.g. an SFTP denial response injected back to the client).
+                let (payload, inject) = apply_tap_down(tap.as_ref(), &data, client_id);
+                let n = payload.len();
+                if !inject.is_empty() && up.data(client_id, Bytes::from(inject)).await.is_err() {
+                    stop_reason = StopReason::ClientWriteFailed;
+                    break;
+                }
+                if !payload.is_empty() && up.data(client_id, Bytes::from(payload)).await.is_err() {
                     stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
                 bytes.add_down(n);
             }
             ChannelMsg::ExtendedData { data, ext } => {
-                let n = data.len();
-                if up.extended_data(client_id, ext, data).await.is_err() {
+                let (payload, inject) = apply_tap_down(tap.as_ref(), &data, client_id);
+                let n = payload.len();
+                if !inject.is_empty()
+                    && up
+                        .extended_data(client_id, ext, Bytes::from(inject))
+                        .await
+                        .is_err()
+                {
+                    stop_reason = StopReason::ClientWriteFailed;
+                    break;
+                }
+                if !payload.is_empty()
+                    && up
+                        .extended_data(client_id, ext, Bytes::from(payload))
+                        .await
+                        .is_err()
+                {
                     stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
@@ -474,7 +559,38 @@ pub async fn pump_backend_to_client(
     // close, a backend that died mid-send would wedge the server's serial event
     // loop until the (configurable) inactivity timeout fires.
     let _ = up.close(client_id).await;
+    if let Some(tap) = &tap {
+        // B2: flush/close the recording deterministically at channel end rather
+        // than relying on Drop ordering inside this task.
+        tap.flush();
+    }
     window.close();
+}
+
+/// Run a downlink buffer through the channel tap, returning `(forward, inject)`.
+///
+/// `None` tap (the default) returns the payload untouched with no allocation.
+fn apply_tap_down(
+    tap: Option<&Arc<dyn ChannelTap>>,
+    data: &[u8],
+    client_id: ChannelId,
+) -> (Vec<u8>, Vec<u8>) {
+    let Some(tap) = tap else {
+        return (data.to_vec(), Vec::new());
+    };
+    match tap.on_data(Direction::Down, data) {
+        DataVerdict::Pass => (data.to_vec(), Vec::new()),
+        DataVerdict::Rewrite {
+            forward,
+            inject,
+            denied,
+        } => {
+            if let Some(reason) = denied {
+                tracing::info!(target: "relay", ?client_id, %reason, "downlink data withheld by tap");
+            }
+            (forward, inject)
+        }
+    }
 }
 
 /// Forward an `exec` request (raw command bytes), enqueuing the reply slot

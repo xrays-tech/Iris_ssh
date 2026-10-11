@@ -85,3 +85,44 @@ hard_deadline = "30s"
 # existing dashboard or alert.
 [metrics]
 addr = "127.0.0.1:9090"
+
+# --- M3: certificate authority (propose §八 / host+user CA) -------------------
+# Trusted CA **public** keys (authorized_keys format). One list serves both
+# user certificates (`auth_openssh_certificate`) and backend host certificates
+# (`@cert-authority`), because both anchor on the certificate's signing key.
+# Omit the whole section to disable certificate authentication.
+# [ca]
+# trusted_ca_keys = ["/etc/ssh-gw/ca_user.pub", "/etc/ssh-gw/ca_host.pub"]
+# cert_lifetime = "300s"
+# Optional: enable short-lived user-certificate issuance (0600 CA private key).
+# Requires at least one trusted_ca_keys entry, otherwise it is refused.
+# signing_key = "/etc/ssh-gw/ca_user"
+
+# --- M3: session recording (B2) ----------------------------------------------
+# One file per channel: `<session-id>-<channel>.srec` in a 0700 directory, each
+# file 0600. A recording is a packet capture of the session, so treat it as
+# sensitive: keep the directory on private storage and out of shared paths, and
+# give every replica its own so multiple instances can run side by side (B5).
+[recording]
+dir = "/var/lib/ssh-gateway/recordings"
+max_bytes_per_session = 67108864   # 64 MiB; 0 disables recording entirely
+
+# --- M3: SFTP command-level interception (B3) --------------------------------
+# M1 pass-through by default. When enabled, the listed commands are refused and
+# the client receives a protocol-native SFTP permission-denied status; path rules
+# are applied to OPEN/REMOVE/RENAME/MKDIR/RMDIR/OPENDIR/REALPATH/LSTAT/STAT.
+[intercept.sftp]
+enabled = false
+deny_commands = ["REMOVE", "RENAME"]
+# allowed_path_prefixes = ["/data/"]      # empty = all paths allowed
+# denied_path_prefixes = ["/data/secret"]
+
+# --- M3: jump mode / direct-tcpip (B4) ---------------------------------------
+# Default off: every direct-tcpip request is refused locally, exactly as before
+# M3. With it on, a target must appear in an allow-list AND pass the address-class
+# guard (loopback/private/link-local/CGNAT + the cloud metadata address are
+# refused unless `allow_private_networks` is set).
+[jump]
+enabled = false
+allow_private_networks = false
+# allowed_targets = ["db.example.com:5432", "*:22"]

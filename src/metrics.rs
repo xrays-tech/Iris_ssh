@@ -57,6 +57,24 @@ struct MetricsInner {
     pool_dead_detected_total: AtomicU64,
     pool_tracked_conns: AtomicUsize,
 
+    // M3: certificate auth (B1)
+    cert_auth_accept_total: AtomicU64,
+    cert_auth_reject_total: AtomicU64,
+
+    // M3: SFTP interception (B3)
+    sftp_requests_seen_total: AtomicU64,
+    sftp_requests_denied_total: AtomicU64,
+
+    // M3: jump mode (B4)
+    jump_open_total: AtomicU64,
+    jump_denied_total: AtomicU64,
+    /// jump targets refused because of their address class (SSRF guard).
+    jump_forbidden_address_total: AtomicU64,
+
+    // M3: session recording (B2)
+    recorded_bytes_total: AtomicU64,
+    recorded_sessions_total: AtomicU64,
+
     // disconnect reason histogram, indexed by SSH reason code (0..=15).
     disconnect_reason: [AtomicU64; 16],
 
@@ -265,6 +283,65 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A certificate-authenticated session was accepted (B1).
+    pub fn cert_auth_accept(&self) {
+        self.inner
+            .cert_auth_accept_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A certificate authentication attempt was refused (B1).
+    pub fn cert_auth_reject(&self) {
+        self.inner
+            .cert_auth_reject_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An SFTP request was decoded and inspected (B3).
+    pub fn sftp_request_seen(&self) {
+        self.inner
+            .sftp_requests_seen_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An SFTP request was refused by policy (B3).
+    pub fn sftp_request_denied(&self) {
+        self.inner
+            .sftp_requests_denied_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `direct-tcpip` channel was opened for the client (B4).
+    pub fn jump_open(&self) {
+        self.inner.jump_open_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `direct-tcpip` request was refused (B4).
+    pub fn jump_denied(&self) {
+        self.inner.jump_denied_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `direct-tcpip` target was refused for its address class (B4 SSRF guard).
+    pub fn jump_forbidden_address(&self) {
+        self.inner
+            .jump_forbidden_address_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bytes written to the session recording (B2).
+    pub fn recorded_bytes(&self, bytes: usize) {
+        self.inner
+            .recorded_bytes_total
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// A session recording was started (B2).
+    pub fn recorded_session(&self) {
+        self.inner
+            .recorded_sessions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn pool_conn_tracked(&self) {
         self.inner
             .pool_tracked_conns
@@ -374,6 +451,51 @@ impl Metrics {
             &mut out,
             "sshgw_pool_tracked_conns",
             self.inner.pool_tracked_conns.load(Ordering::Relaxed),
+        );
+        push_counter(
+            &mut out,
+            "sshgw_cert_auth_accept_total",
+            &self.inner.cert_auth_accept_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_cert_auth_reject_total",
+            &self.inner.cert_auth_reject_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_sftp_requests_seen_total",
+            &self.inner.sftp_requests_seen_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_sftp_requests_denied_total",
+            &self.inner.sftp_requests_denied_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_jump_open_total",
+            &self.inner.jump_open_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_jump_denied_total",
+            &self.inner.jump_denied_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_jump_forbidden_address_total",
+            &self.inner.jump_forbidden_address_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_recorded_bytes_total",
+            &self.inner.recorded_bytes_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_recorded_sessions_total",
+            &self.inner.recorded_sessions_total,
         );
 
         for (code, counter) in self.inner.disconnect_reason.iter().enumerate().skip(1) {
