@@ -20,7 +20,19 @@ pub struct Metrics {
 struct MetricsInner {
     // gauges
     active_sessions: AtomicUsize,
-    relay_inflight_bytes: AtomicUsize,
+    /// Total relay *window budget* currently reserved by live sessions
+    /// (`config.relay.window_size * 2` per session: one send window for each
+    /// leg). This is a **quota reservation**, not live in-flight bytes — it is a
+    /// capacity-planning gauge (a derived ceiling of
+    /// `active_sessions * window_size * 2`), so a threshold on it means "the
+    /// gateway is about to run out of window budget", never "this many bytes are
+    /// buffered right now".
+    ///
+    /// Renamed from `relay_inflight_bytes` (exposed as
+    /// `sshgw_relay_window_budget_bytes`) because the old name suggested live
+    /// byte accounting and invited mis-set alerts. Old-name mapping for existing
+    /// dashboards/alerts: `sshgw_relay_inflight_bytes` -> `sshgw_relay_window_budget_bytes`.
+    relay_window_budget_bytes: AtomicUsize,
 
     // auth counters (two-phase, propose.md §3.2)
     auth_offered_total: AtomicU64,
@@ -154,16 +166,16 @@ impl Metrics {
                 });
     }
 
-    /// Bytes currently resident in the gateway's relays (best-effort gauge).
-    pub fn add_inflight(&self, bytes: usize) {
+    /// Reserve `bytes` of relay window budget for a newly-active session.
+    pub fn add_window_budget(&self, bytes: usize) {
         self.inner
-            .relay_inflight_bytes
+            .relay_window_budget_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Release a previously accounted inflight allocation.
-    pub fn sub_inflight(&self, bytes: usize) {
-        let _ = self.inner.relay_inflight_bytes.fetch_update(
+    /// Release a previously reserved relay window allocation.
+    pub fn sub_window_budget(&self, bytes: usize) {
+        let _ = self.inner.relay_window_budget_bytes.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |v| Some(v.saturating_sub(bytes)),
@@ -290,8 +302,8 @@ impl Metrics {
         );
         push_gauge(
             &mut out,
-            "sshgw_relay_inflight_bytes",
-            self.inner.relay_inflight_bytes.load(Ordering::Relaxed),
+            "sshgw_relay_window_budget_bytes",
+            self.inner.relay_window_budget_bytes.load(Ordering::Relaxed),
         );
         push_counter(
             &mut out,
@@ -413,15 +425,21 @@ mod tests {
     }
 
     #[test]
-    fn inflight_gauge_never_underflows() {
+    fn window_budget_gauge_never_underflows() {
         let m = Metrics::default();
-        m.add_inflight(100);
-        m.add_inflight(50);
-        assert_eq!(m.inner.relay_inflight_bytes.load(Ordering::Relaxed), 150);
-        m.sub_inflight(120);
-        assert_eq!(m.inner.relay_inflight_bytes.load(Ordering::Relaxed), 30);
-        m.sub_inflight(999); // oversubscribe
-        assert_eq!(m.inner.relay_inflight_bytes.load(Ordering::Relaxed), 0);
+        m.add_window_budget(100);
+        m.add_window_budget(50);
+        assert_eq!(
+            m.inner.relay_window_budget_bytes.load(Ordering::Relaxed),
+            150
+        );
+        m.sub_window_budget(120);
+        assert_eq!(
+            m.inner.relay_window_budget_bytes.load(Ordering::Relaxed),
+            30
+        );
+        m.sub_window_budget(999); // oversubscribe
+        assert_eq!(m.inner.relay_window_budget_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -455,10 +473,15 @@ mod tests {
     #[test]
     fn prometheus_render_is_valid_text_exposition() {
         let m = Metrics::default();
+        // The renamed gauge must be exposed under its new name, and the old name
+        // must not linger (stale series mislead dashboards).
+        m.add_window_budget(7);
         m.auth_offered();
         m.auth_accept();
         m.resolve_ok();
         let text = m.render_prometheus();
+        assert!(text.contains("sshgw_relay_window_budget_bytes 7"));
+        assert!(!text.contains("sshgw_relay_inflight_bytes"));
         assert!(text.contains("sshgw_active_sessions 0"));
         assert!(text.contains("sshgw_auth_offered_total 1"));
         assert!(text.contains("sshgw_auth_accept_total 1"));

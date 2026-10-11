@@ -316,6 +316,51 @@ impl ChannelRelay {
     }
 }
 
+/// Why the down-pump stopped relaying a channel.
+///
+/// The only distinction that drives behaviour is *backend lost vs. not*, but it
+/// is expressed as an enum rather than by comparing sentinel strings. A previous
+/// revision keyed the abnormal-exit decision off the fact that two near-identical
+/// strings (`"backend channel closed"` and `"backend closed channel"`) did **not**
+/// compare equal — a fragile coupling where any rewording silently flips a
+/// normal close into (or out of) the backend-loss path. Here the normal teardown
+/// case is a distinct variant, so that class of bug cannot compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The backend closed this channel normally (the command finished / the
+    /// backend ended its side). Quiet: no fabricated reason, no session disconnect.
+    BackendChannelClosed,
+    /// The client leg broke (the `up.data(...)` write failed) — the *client*
+    /// went away, so a session-wide DISCONNECT would be pointless.
+    ClientWriteFailed,
+    /// The backend channel stream ended without a `Close` message: the backend
+    /// connection died rather than the command finishing (§3.8 loss).
+    BackendLost,
+}
+
+impl StopReason {
+    /// Whether this stop means the backend connection was lost — the only case
+    /// that warrants the ERROR log, the reason metric and a DISCONNECT(11).
+    pub fn is_backend_lost(self) -> bool {
+        matches!(self, StopReason::BackendLost)
+    }
+
+    /// Stable label for logs and the audit trail.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopReason::BackendChannelClosed => "backend closed channel",
+            StopReason::ClientWriteFailed => "client leg write failed",
+            StopReason::BackendLost => "backend connection lost",
+        }
+    }
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The down-pump: backend → client. Runs as a detached task and is the only
 /// place backend-originated messages are turned into client-originated ones.
 ///
@@ -340,16 +385,18 @@ pub async fn pump_backend_to_client(
     bytes: std::sync::Arc<ByteCounters>,
     metrics: Metrics,
 ) {
-    // Distinguishes "backend closed this channel normally" from "the backend
-    // connection went away" (P1-3: reason + DISCONNECT[11]).
-    let mut stop_reason: &'static str = "backend channel closed";
+    // Why we are stopping. Starts as `BackendLost`, which is exactly the case of
+    // reaching the end of the loop with `wait()` having returned `None` and no
+    // `Close` message having arrived: the backend *connection* died rather than
+    // the command finishing. Every exit path overwrites it with the true cause.
+    let mut stop_reason = StopReason::BackendLost;
 
     while let Some(msg) = backend.wait().await {
         match msg {
             ChannelMsg::Data { data } => {
                 let n = data.len();
                 if up.data(client_id, data).await.is_err() {
-                    stop_reason = "client leg write failed";
+                    stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
                 bytes.add_down(n);
@@ -357,7 +404,7 @@ pub async fn pump_backend_to_client(
             ChannelMsg::ExtendedData { data, ext } => {
                 let n = data.len();
                 if up.extended_data(client_id, ext, data).await.is_err() {
-                    stop_reason = "client leg write failed";
+                    stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
                 bytes.add_down(n);
@@ -391,7 +438,7 @@ pub async fn pump_backend_to_client(
                 // Normal channel teardown (the command finished / the backend
                 // closed its side): no fabricated reason, no session-wide
                 // disconnect (I4).
-                stop_reason = "backend closed channel";
+                stop_reason = StopReason::BackendChannelClosed;
                 let _ = up.close(client_id).await;
                 break;
             }
@@ -400,22 +447,15 @@ pub async fn pump_backend_to_client(
             }
         }
     }
-    // `wait()` returning `None` without a preceding `Close` message: the backend
-    // channel stream ended because the *connection* died, not because the
-    // command finished. That is the abnormal case (P1-3).
-    let backend_died = !matches!(
-        stop_reason,
-        "backend closed channel" | "client leg write failed"
-    );
 
-    if backend_died {
+    if stop_reason.is_backend_lost() {
         // Audit trail + metric for the disconnect-reason histogram (§3.8).
         metrics.backend_lost();
         metrics.disconnect_reason(11); // SSH_DISCONNECT_BY_APPLICATION
         tracing::error!(
             target: "relay",
             ?client_id,
-            reason = stop_reason,
+            reason = %stop_reason,
             "backend connection lost; disconnecting client leg"
         );
         // §3.8 destroy semantics: tell the client *why*, with a protocol-level
@@ -457,6 +497,49 @@ pub async fn forward_exec(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn stop_reason_classifies_backend_loss_explicitly() {
+        // The pump's abnormal-vs-normal decision must come from the variant, not
+        // from how two similar strings happen to compare.
+        assert!(
+            !StopReason::BackendChannelClosed.is_backend_lost(),
+            "a normal backend Close must never be treated as backend loss"
+        );
+        assert!(
+            !StopReason::ClientWriteFailed.is_backend_lost(),
+            "the client going away is not a backend loss"
+        );
+        assert!(
+            StopReason::BackendLost.is_backend_lost(),
+            "the backend connection dying must be classified as a loss"
+        );
+    }
+
+    #[test]
+    fn stop_reason_labels_are_all_distinct() {
+        // Guards against the failure mode this enum replaced: near-identical
+        // sentinel strings whose equality (or inequality) carried meaning.
+        use std::collections::HashSet;
+        let all = [
+            StopReason::BackendChannelClosed,
+            StopReason::ClientWriteFailed,
+            StopReason::BackendLost,
+        ];
+        let labels: HashSet<&str> = all.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels.len(),
+            all.len(),
+            "stop reasons must have distinct labels"
+        );
+        for reason in all {
+            assert_eq!(
+                reason.to_string(),
+                reason.as_str(),
+                "Display must match as_str"
+            );
+        }
+    }
 
     #[test]
     fn reply_router_matches_fifo_and_drops_extras() {

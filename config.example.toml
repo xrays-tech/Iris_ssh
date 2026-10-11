@@ -66,6 +66,10 @@ auth_rejection_pad = "1s"
 # Idle-session garbage collection; also the effective deadline for a peer that
 # stalls mid-authentication (russh has no dedicated auth-phase timeout knob).
 inactivity_timeout = "600s"
+# Maximal number of allowed authentication attempts (anti-bruteforce). Russh's
+# own encoding: 0 = unlimited. Default 10 matches russh's built-in default, so
+# omitting it changes nothing.
+max_auth_attempts = 10
 
 [shutdown]
 drain_wait = "60s"
@@ -73,5 +77,11 @@ disconnect_flush = "3s"
 hard_deadline = "30s"
 
 # Read-only observability endpoints: /healthz /readyz /metrics.
+#
+# Metrics naming note: `sshgw_relay_window_budget_bytes` reports the *reserved*
+# relay window budget of live sessions (`active_sessions * relay.window_size *
+# 2`) — a capacity-planning gauge, not live in-flight bytes. It was previously
+# exposed as `sshgw_relay_inflight_bytes`; map the old name to the new one in any
+# existing dashboard or alert.
 [metrics]
 addr = "127.0.0.1:9090"

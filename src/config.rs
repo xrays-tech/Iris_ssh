@@ -124,6 +124,10 @@ pub struct LimitsConfig {
     /// Idle-connection garbage-collection timeout (russh `inactivity_timeout`).
     /// Also the effective deadline for a peer that stalls mid-authentication.
     pub inactivity_timeout: Duration,
+    /// Maximal number of allowed authentication attempts (russh
+    /// `server::Config::max_auth_attempts`). `0` means unlimited, matching
+    /// russh's own encoding; the default mirrors russh's built-in default of 10.
+    pub max_auth_attempts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +289,8 @@ struct RawLimits {
     auth_rejection_pad: String,
     #[serde(default = "default_inactivity_timeout")]
     inactivity_timeout: String,
+    #[serde(default = "default_max_auth_attempts")]
+    max_auth_attempts: usize,
 }
 
 fn default_max_sessions() -> usize {
@@ -301,6 +307,9 @@ fn default_auth_rejection_pad() -> String {
 }
 fn default_inactivity_timeout() -> String {
     "600s".to_owned()
+}
+fn default_max_auth_attempts() -> usize {
+    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +365,7 @@ impl Default for RawLimits {
             auth_timeout: default_auth_timeout(),
             auth_rejection_pad: default_auth_rejection_pad(),
             inactivity_timeout: default_inactivity_timeout(),
+            max_auth_attempts: default_max_auth_attempts(),
         }
     }
 }
@@ -616,6 +626,7 @@ impl GatewayConfig {
                 "limits.inactivity_timeout",
                 &raw.limits.inactivity_timeout,
             )?,
+            max_auth_attempts: raw.limits.max_auth_attempts,
         };
         if limits.max_sessions == 0 || limits.max_sessions_per_ip == 0 {
             return Err(ConfigError::Invalid {
@@ -718,8 +729,37 @@ mod tests {
         // auth_timeout, and the dial breaker has its own knobs.
         assert_eq!(cfg.limits.auth_rejection_pad, Duration::from_secs(1));
         assert_eq!(cfg.limits.inactivity_timeout, Duration::from_secs(600));
+        assert_eq!(cfg.limits.max_auth_attempts, 10);
         assert_eq!(cfg.pool.circuit_failure_threshold, 5);
         assert_eq!(cfg.pool.circuit_reset_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn max_auth_attempts_defaults_match_russh_builtin() {
+        // The pre-config default was russh's own built-in (10); the config must
+        // resolve to the same value when omitted.
+        assert_eq!(default_max_auth_attempts(), 10);
+        let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
+        assert_eq!(cfg.limits.max_auth_attempts, 10);
+    }
+
+    #[test]
+    fn max_auth_attempts_is_overridable_including_zero() {
+        // `0` means "no attempt cap", which is russh's own encoding, so it must
+        // be accepted rather than rejected by validation.
+        let toml = minimal_toml().replace(
+            "max_sessions_per_ip = 20",
+            "max_sessions_per_ip = 20\n            max_auth_attempts = 0",
+        );
+        let cfg = GatewayConfig::parse(&toml).expect("valid config");
+        assert_eq!(cfg.limits.max_auth_attempts, 0);
+
+        let toml = minimal_toml().replace(
+            "max_sessions_per_ip = 20",
+            "max_sessions_per_ip = 20\n            max_auth_attempts = 3",
+        );
+        let cfg = GatewayConfig::parse(&toml).expect("valid config");
+        assert_eq!(cfg.limits.max_auth_attempts, 3);
     }
 
     #[test]

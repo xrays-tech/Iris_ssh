@@ -345,6 +345,9 @@ impl GatewayContext {
             // Idle-session GC; also the deadline for a peer that stalls mid-auth
             // (no dedicated auth-phase knob exists in russh 0.64.1).
             inactivity_timeout: Some(config.limits.inactivity_timeout),
+            // Anti-bruteforce attempt cap, now explicit rather than relying on
+            // russh's built-in default (`0` = unlimited, russh's encoding).
+            max_auth_attempts: config.limits.max_auth_attempts,
             ..ServerConfig::default()
         };
 
@@ -664,9 +667,11 @@ impl server::Handler for GatewaySession {
             Ok(grant) => {
                 self.ctx.metrics.auth_accept();
                 self.ctx.metrics.session_started();
+                // Reserve this session's relay *window budget* (one send window per
+                // leg). This is quota accounting, not live in-flight bytes.
                 self.ctx
                     .metrics
-                    .add_inflight((self.ctx.config.relay.window_size as usize) * 2);
+                    .add_window_budget((self.ctx.config.relay.window_size as usize) * 2);
                 self.principal = Some(principal);
                 self.auditor = Some(Auditor::new(
                     self.session_id.clone(),
@@ -794,6 +799,13 @@ impl server::Handler for GatewaySession {
         Ok(())
     }
 
+    /// Uplink channel data (client → backend).
+    ///
+    /// This is the one uplink path that goes through the [`relay::OutboundWindow`]
+    /// fuse: it carries the bulk traffic (scp/rsync/sftp transfers, `cat`, …), so
+    /// it is where an unbounded gateway buffer would actually grow. The guard is
+    /// skipped entirely when `relay.outbound_guard` is false, in which case
+    /// russh's own channel window is the sole bound.
     async fn data(
         &mut self,
         channel: ChannelId,
@@ -810,7 +822,6 @@ impl server::Handler for GatewaySession {
             }
             None => return Ok(()),
         };
-
         if self.ctx.config.relay.outbound_guard {
             // P0-2: the down-pump closes the window the instant the backend dies,
             // so this await can never wedge the session's serial event loop on a
@@ -845,6 +856,20 @@ impl server::Handler for GatewaySession {
         Ok(())
     }
 
+    /// Uplink extended data (client → backend, non-zero `ext` codes — e.g. stderr
+    /// data, debug output).
+    ///
+    /// **Deliberately not routed through the [`relay::OutboundWindow`] fuse**,
+    /// unlike [`data`](Self::data). The fuse exists to bound *bulk* uplink
+    /// buffering, and extended-data streams are small, infrequent, and bounded per
+    /// channel by russh's own send window on the backend leg (which
+    /// `ChannelWriteHalf::extended_data_bytes` respects exactly as `data_bytes`
+    /// does). Charging them against a window calibrated for bulk `data` would risk
+    /// a small stderr burst starving real payload. The byte *tally* is still
+    /// recorded so the audit record's `bytes_up` stays complete.
+    ///
+    /// Deviation note: propose.md §3.6 describes the fuse generically; this is the
+    /// one uplink path intentionally left to russh's window as the backstop.
     async fn extended_data(
         &mut self,
         channel: ChannelId,
@@ -1106,7 +1131,7 @@ impl Drop for GatewaySession {
             }
             self.ctx
                 .metrics
-                .sub_inflight((self.ctx.config.relay.window_size as usize) * 2);
+                .sub_window_budget((self.ctx.config.relay.window_size as usize) * 2);
         }
     }
 }
@@ -1269,6 +1294,35 @@ mod tests {
     ) -> Arc<GatewayContext> {
         let mut keys = TestKeyGuard::new();
         build_test_ctx(&mut keys, auth_timeout, control_plane)
+    }
+
+    /// A test context whose `[limits]` section is extended with `extra`
+    /// (TOML lines indented to match the generated template).
+    fn test_ctx_with_limits_override(
+        extra: String,
+        control_plane: Arc<FixControlPlane>,
+    ) -> Arc<GatewayContext> {
+        let mut keys = TestKeyGuard::new();
+        let host_key = keys.add_key();
+        let backend_key = keys.add_key();
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [{{ path = "{host_key}", state = "active" }}]
+            [backend]
+            private_key = "{backend_key}"
+            host_key_policy = "accept-new"
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [limits]
+            auth_timeout = "0s"
+            {extra}
+        "#
+        );
+        let config = GatewayConfig::parse(&toml).unwrap();
+        GatewayContext::build_with_client(config, control_plane).unwrap()
     }
 
     fn random_client_key() -> russh::keys::PrivateKey {
@@ -1509,6 +1563,34 @@ mod tests {
     }
 
     // ---- defect-A: auth-timeout / rejection-delay decoupling ----
+
+    #[test]
+    fn max_auth_attempts_is_wired_into_the_server_config() {
+        // The anti-bruteforce cap must come from config, not from russh's built-in
+        // default, in both directions (explicit value and the 10 default).
+        for (configured, expected) in [("10", 10usize), ("3", 3), ("0", 0)] {
+            let ctx = test_ctx_with_limits_override(
+                format!("max_auth_attempts = {configured}"),
+                Arc::new(FixControlPlane {
+                    result: Ok(ok_response()),
+                }),
+            );
+            assert_eq!(
+                ctx.server_config.max_auth_attempts, expected,
+                "limits.max_auth_attempts = {configured} must reach the server config"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_max_auth_attempts_wires_russh_builtin_default() {
+        // Backward compatibility: an unset `limits.max_auth_attempts` must behave
+        // exactly as before wiring it (russh's own default of 10).
+        let ctx = test_ctx(Arc::new(FixControlPlane {
+            result: Ok(ok_response()),
+        }));
+        assert_eq!(ctx.server_config.max_auth_attempts, 10);
+    }
 
     #[test]
     fn auth_rejection_timing_decouples_initial_from_ongoing() {
