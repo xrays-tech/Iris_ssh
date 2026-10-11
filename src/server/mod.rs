@@ -26,6 +26,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use russh::server::{self, Auth, Config as ServerConfig, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Pty};
+use tokio::sync::mpsc;
 
 use crate::audit::{Auditor, CommandInfo};
 use crate::backend::{BackendClient, BackendDialer, CredentialStore};
@@ -668,6 +669,16 @@ pub struct GatewaySession {
     audited: bool,
 }
 
+/// Result of running a buffer through the uplink tap.
+enum TapResult {
+    /// Forward the original buffer unchanged (zero-copy).
+    Pass,
+    /// Forward modified data, optionally injecting a response.
+    Rewrite { forward: Vec<u8>, inject: Vec<u8> },
+    /// Drop the buffer entirely (withhold).
+    Drop,
+}
+
 impl GatewaySession {
     fn reject_all(&self) -> Auth {
         Auth::reject()
@@ -675,17 +686,13 @@ impl GatewaySession {
 
     /// Run an uplink buffer through the channel's tap (B2/B3).
     ///
-    /// Returns `None` when nothing is forwarded, otherwise the permitted bytes
-    /// together with any bytes that must be pushed back to the client on the
-    /// **channel data stream** — a synthesized SFTP failure has to travel the same
-    /// stream the client's request arrived on, or the client waits forever for a
-    /// reply that never comes.
-    fn apply_uplink_tap(&mut self, channel: ChannelId, data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// Returns the tap result indicating how to handle the buffer.
+    fn apply_uplink_tap(&mut self, channel: ChannelId, data: &[u8]) -> TapResult {
         let Some(tap) = self.taps.get(&channel).cloned() else {
-            return Some((data.to_vec(), Vec::new()));
+            return TapResult::Pass;
         };
         match tap.on_data(relay::Direction::Up, data) {
-            relay::DataVerdict::Pass => Some((data.to_vec(), Vec::new())),
+            relay::DataVerdict::Pass => TapResult::Pass,
             relay::DataVerdict::Rewrite {
                 forward,
                 inject,
@@ -695,9 +702,9 @@ impl GatewaySession {
                     tracing::info!(target: "relay", %channel, %reason, "uplink request withheld by tap");
                 }
                 if forward.is_empty() && inject.is_empty() {
-                    None
+                    TapResult::Drop
                 } else {
-                    Some((forward, inject))
+                    TapResult::Rewrite { forward, inject }
                 }
             }
         }
@@ -1073,25 +1080,46 @@ impl server::Handler for GatewaySession {
                     .map(|a| a.byte_counters())
                     .unwrap_or_default();
                 let up = _session.handle();
+                let window = Arc::new(relay::OutboundWindow::uncalibrated());
                 tokio::spawn(relay::pump_backend_to_client(
                     backend_read,
                     up,
                     client_id,
                     ReplyRouter::default(),
-                    Arc::new(relay::OutboundWindow::uncalibrated()),
+                    Arc::clone(&window),
                     Arc::clone(&bytes),
                     self.ctx.metrics.clone(),
                     None,
                 ));
+
+                // Wrap backend writer in Arc<Mutex> for shared access.
+                let backend = Arc::new(tokio::sync::Mutex::new(backend_write));
+
+                // Create bounded mpsc channel for uplink data.
+                let window_size = self.ctx.config.relay.window_size as usize;
+                let max_packet = self.ctx.config.relay.max_packet as usize;
+                let capacity = (window_size / max_packet.max(1)).clamp(16, 256);
+                let (uplink_tx, uplink_rx) = mpsc::channel::<Bytes>(capacity);
+
+                // Spawn uplink sender task.
+                let backend_for_sender = Arc::clone(&backend);
+                let window_clone = Arc::clone(&window);
+                tokio::spawn(relay::run_uplink_sender(
+                    backend_for_sender,
+                    uplink_rx,
+                    window_clone,
+                ));
+
                 self.relays.insert(
                     client_id,
                     ChannelRelay::new(
                         client_id,
-                        backend_write,
+                        backend,
                         ReplyRouter::default(),
-                        Arc::new(relay::OutboundWindow::uncalibrated()),
+                        window,
                         bytes,
                         self.ctx.metrics.clone(),
+                        uplink_tx,
                     ),
                 );
                 self.ctx.metrics.jump_open();
@@ -1158,13 +1186,10 @@ impl server::Handler for GatewaySession {
                     .unwrap_or_default();
 
                 if let Some(entry) = &self.entry {
-                    // Default classification until exec/shell/subsystem decides.
                     entry.set_channel_class(client_id, crate::audit::CommandClass::Interactive);
                 }
 
                 let up = session.handle();
-                // B2/B3: create the per-channel data tap (recording and/or SFTP
-                // inspection). `None` keeps the plain-transmission fast path.
                 let tap_ctx = relay::ChannelCtx {
                     session_id: self.session_id.to_string(),
                     channel_id: client_id,
@@ -1184,13 +1209,37 @@ impl server::Handler for GatewaySession {
                     tap.clone(),
                 ));
 
+                // Wrap backend writer in Arc<Mutex> to share between:
+                // - uplink sender task (data_bytes for bulk data)
+                // - relay (exec, pty, shell, etc. request-path calls)
+                let backend = Arc::new(tokio::sync::Mutex::new(backend_write));
+
+                // Create bounded mpsc channel for uplink data. Capacity matches
+                // the window size in packets (window_size / max_packet), clamped
+                // to a reasonable range. This provides backpressure equivalent to
+                // the OutboundWindow semaphore.
+                let window_size = self.ctx.config.relay.window_size as usize;
+                let max_packet = self.ctx.config.relay.max_packet as usize;
+                let capacity = (window_size / max_packet.max(1)).clamp(16, 256);
+                let (uplink_tx, uplink_rx) = mpsc::channel::<Bytes>(capacity);
+
+                // Spawn uplink sender task: drains queue, calls data_bytes on backend.
+                let backend_for_sender = Arc::clone(&backend);
+                let window_clone = Arc::clone(&window);
+                tokio::spawn(relay::run_uplink_sender(
+                    backend_for_sender,
+                    uplink_rx,
+                    window_clone,
+                ));
+
                 let relay = ChannelRelay::new(
                     client_id,
-                    backend_write,
+                    backend,
                     router,
                     window,
                     bytes,
                     self.ctx.metrics.clone(),
+                    uplink_tx,
                 );
                 self.relays.insert(client_id, relay);
                 if let Some(tap) = tap {
@@ -1199,7 +1248,6 @@ impl server::Handler for GatewaySession {
                 reply.accept().await;
             }
             Ok(None) | Err(_) => {
-                // I4: fail via protocol-native open failure; no fabricated exec.
                 tracing::info!(target: "server", target_host = %grant.target.host, "backend channel open failed");
                 reply.reject(ChannelOpenFailure::ConnectFailed).await;
             }
@@ -1253,32 +1301,55 @@ impl server::Handler for GatewaySession {
         // B2/B3: the channel tap may withhold part of the payload and answer the
         // client directly (e.g. a synthesized SFTP permission-denied status). The
         // untapped fast path still forwards the client's buffer with no copy.
-        let Some((payload, inject)) = self.apply_uplink_tap(channel, data) else {
-            return Ok(());
-        };
-        let n = payload.len();
-        // The refusal answer goes on the same channel-data stream the request
-        // arrived on; writing it to stderr instead would strand the client.
-        if !inject.is_empty() {
-            // `Session::data` is synchronous (it enqueues onto the session's own
-            // send channel), unlike `Handle::data` used from detached tasks.
-            if let Err(e) = session.data(channel, Bytes::from(inject)) {
-                tracing::debug!(target: "relay", ?channel, ?e, "could not deliver tap response to client");
+        let tap_result = self.apply_uplink_tap(channel, data);
+        match tap_result {
+            TapResult::Pass => {
+                // Zero-copy fast path: forward original buffer directly.
+                // We must copy into Bytes since the original &[u8] is borrowed from
+                // russh's internal buffer.
+                if !data.is_empty() {
+                    let owned = Bytes::copy_from_slice(data);
+                    let relay = match self.relays.get(&channel) {
+                        Some(r) => r,
+                        None => return Ok(()),
+                    };
+                    relay.bytes.add_up(data.len());
+                    // Send via mpsc channel to uplink sender task (non-blocking if
+                    // queue has capacity; backpressure via OutboundWindow semaphore
+                    // acquired above).
+                    if let Err(relay::WindowClosed) = relay.send_uplink(owned).await {
+                        tracing::debug!(target: "relay", ?channel, "uplink send failed: window closed");
+                    }
+                }
+                Ok(())
+            }
+            TapResult::Drop => Ok(()),
+            TapResult::Rewrite { forward, inject } => {
+                let n = forward.len();
+                // The refusal answer goes on the same channel-data stream the request
+                // arrived on; writing it to stderr instead would strand the client.
+                if !inject.is_empty() {
+                    // `Session::data` is synchronous (it enqueues onto the session's own
+                    // send channel), unlike `Handle::data` used from detached tasks.
+                    if let Err(e) = session.data(channel, Bytes::from(inject)) {
+                        tracing::debug!(target: "relay", ?channel, ?e, "could not deliver tap response to client");
+                    }
+                }
+
+                // The relay is still present: the serial handler cannot have been
+                // re-entered during our await, and nothing else removes relays.
+                let relay = match self.relays.get(&channel) {
+                    Some(r) => r,
+                    None => return Ok(()),
+                };
+                relay.bytes.add_up(n);
+                let owned = Bytes::from(forward);
+                if let Err(relay::WindowClosed) = relay.send_uplink(owned).await {
+                    tracing::debug!(target: "relay", ?channel, "uplink send failed: window closed");
+                }
+                Ok(())
             }
         }
-
-        // The relay is still present: the serial handler cannot have been
-        // re-entered during our await, and nothing else removes relays.
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        relay.bytes.add_up(n);
-        let owned = Bytes::from(payload);
-        if let Err(e) = relay.backend.data_bytes(owned).await {
-            tracing::debug!(target: "relay", ?channel, ?e, "uplink forward failed");
-        }
-        Ok(())
     }
 
     /// Uplink extended data (client → backend, non-zero `ext` codes — e.g. stderr
@@ -1309,7 +1380,8 @@ impl server::Handler for GatewaySession {
         let n = data.len();
         relay.bytes.add_up(n);
         let owned = Bytes::copy_from_slice(data);
-        if let Err(e) = relay.backend.extended_data_bytes(ext, owned).await {
+        let backend = relay.backend.lock().await;
+        if let Err(e) = backend.extended_data_bytes(ext, owned).await {
             tracing::debug!(target: "relay", ?channel, ?e, "uplink ext-data forward failed");
         }
         Ok(())
@@ -1331,8 +1403,8 @@ impl server::Handler for GatewaySession {
             None => return Ok(()),
         };
         let mut rx = relay.router.push(true);
-        relay
-            .backend
+        let backend = relay.backend.lock().await;
+        backend
             .request_pty(
                 true, term, col_width, row_height, pix_width, pix_height, modes,
             )
@@ -1356,7 +1428,8 @@ impl server::Handler for GatewaySession {
             None => return Ok(()),
         };
         let mut rx = relay.router.push(true);
-        relay.backend.request_shell(true).await?;
+        let backend = relay.backend.lock().await;
+        backend.request_shell(true).await?;
         if let Some(rx) = rx.as_mut() {
             deliver_reply(session, channel, rx).await?;
         }
@@ -1424,7 +1497,8 @@ impl server::Handler for GatewaySession {
             entry.set_channel_class(channel, CommandInfo::Subsystem(name.to_owned()).classify());
         }
         let mut rx = relay.router.push(true);
-        relay.backend.request_subsystem(true, name).await?;
+        let backend = relay.backend.lock().await;
+        backend.request_subsystem(true, name).await?;
         if let Some(rx) = rx.as_mut() {
             deliver_reply(session, channel, rx).await?;
         }
@@ -1446,15 +1520,11 @@ impl server::Handler for GatewaySession {
         let allowed =
             crate::policy::env_allowed(variable_name, &self.ctx.config.relay.env_allowlist);
         if matches!(allowed, crate::policy::ForwardDecision::DenyLocally { .. }) {
-            // Destined for a filtered-out env: drop silently (client never wanted a
-            // reply for env, typically).
             return Ok(());
         }
         let mut rx = relay.router.push(true);
-        relay
-            .backend
-            .set_env(true, variable_name, variable_value)
-            .await?;
+        let backend = relay.backend.lock().await;
+        backend.set_env(true, variable_name, variable_value).await?;
         if let Some(rx) = rx.as_mut() {
             deliver_reply(session, channel, rx).await?;
         }
@@ -1471,8 +1541,8 @@ impl server::Handler for GatewaySession {
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         if let Some(relay) = self.relays.get(&channel) {
-            relay
-                .backend
+            let backend = relay.backend.lock().await;
+            backend
                 .window_change(col_width, row_height, pix_width, pix_height)
                 .await?;
         }
@@ -1486,7 +1556,8 @@ impl server::Handler for GatewaySession {
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         if let Some(relay) = self.relays.get(&channel) {
-            relay.backend.signal(signal).await?;
+            let backend = relay.backend.lock().await;
+            backend.signal(signal).await?;
         }
         Ok(())
     }
@@ -1521,7 +1592,8 @@ impl server::Handler for GatewaySession {
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         if let Some(relay) = self.relays.get(&channel) {
-            relay.backend.eof().await?;
+            let backend = relay.backend.lock().await;
+            backend.eof().await?;
         }
         Ok(())
     }
@@ -1532,10 +1604,10 @@ impl server::Handler for GatewaySession {
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         if let Some(relay) = self.relays.remove(&channel) {
-            relay.backend.close().await?;
+            let backend = relay.backend.lock().await;
+            backend.close().await?;
         }
         if let Some(tap) = self.taps.remove(&channel) {
-            // Deterministic flush/close of any recording for this channel (B2).
             tap.flush();
         }
         if let Some(entry) = &self.entry {
