@@ -76,7 +76,7 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `timeout` | `2s` | 控制面请求超时 |
 | | `fail_open` | `false`（注释） | 控制面故障时用旧缓存放行 |
 | `[limits]` | `max_sessions` / `max_sessions_per_ip` | `10000` / `20` | 准入 |
-| | `auth_timeout` | `30s` | 认证阶段预算（`0s` 关闭 initial backoff，仅测试） |
+| | `auth_timeout` | `30s` | 首个 "none" 认证探测的 backoff 上限（实际延迟 = `min(auth_timeout, auth_rejection_pad)`；`0s` 关闭每连接 initial backoff，**保留每次拒绝的持续 pad**，公钥/证书为主的生产可用；非整个认证期预算） |
 | | `auth_rejection_pad` | `1s` | 每次认证拒绝的恒时填充（防时间泄露） |
 | | `inactivity_timeout` | `600s` | 空闲回收 + 认证停滞 deadline |
 | | `max_auth_attempts` | `10` | 防爆破尝试上限（`0`=不限） |

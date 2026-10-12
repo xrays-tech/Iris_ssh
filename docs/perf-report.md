@@ -25,9 +25,10 @@
 - 归属：`auth` 阶段（russh 服务器侧），非中继数据路径。
 - 影响与缓解：**每次新连接**多 ~1s；复用连接（多 channel / 连接池）不受影响。若产品对「新连接首包延迟」敏感，可在 `[limits] auth_rejection_pad`/`auth_timeout` 上权衡（调小会削弱防爆破时间混淆）。
 
-## scp 吞吐损耗 ~88% 的归因（记录项，供调优）
-- 数据路径两段加密（客户端→网关、网关→后端）+ 网关内 await 转发 + `max_packet=32KB` 较小 → 本地回环下包数放大，吞吐受限。
-- 已知可调维度：`[relay] max_packet`（SFTP 大读取可调 256KB）、`window_size`；连接复用（ControlMaster/池）摊薄建立成本。
+## scp 吞吐损耗 ~88% 的归因（更正：测量伪影，2026-10-12）
+- **更正**：此前把 ~88% 损耗归因于数据路径双加密 / `max_packet`。T3 实测（连接复用 `ControlMaster`，同主机）显示**数据面单向持续 356–486 MB/s（trace transfer phase），复用连接端到端 386–602 MB/s** —— 数据面**不存在 ~50MB/s 上限**。
+- 真正原因：每次**新建连接**的 ~1s initial auth-backoff（上节设计意图项）被摊到 32-64MiB 小文件上，掩盖了真实数据面速度。`max_packet`/`window_size`/nodelay/解耦等 A/B 在 pre-existing 固定成本下**欠功效**（<10% 的数据面变化被 1s 淹没，不可检出）。
+- 正确测法：连接复用（ControlMaster/多 channel）、或 `auth_timeout="0s"`、或用 trace 的 transfer-phase。详阅 `docs/perf-investigation.md` §16 / §18。
 
 ## M2-U6 调优结论（2026-10-12，含外部调研 + 门禁裁决）
 **目标测判**：单连接 scp 吞吐损耗 ≤15% **判定为当前架构限制（双隧道 + russh），非可调参达成**。

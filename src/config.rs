@@ -134,10 +134,13 @@ pub struct ControlPlaneConfig {
 pub struct LimitsConfig {
     pub max_sessions: usize,
     pub max_sessions_per_ip: usize,
-    /// Upper bound on the whole authentication phase. Combined with
-    /// `auth_rejection_pad` and russh's `max_auth_attempts` this bounds how long
-    /// an unauthenticated peer can occupy a session. `0s` disables the
-    /// initial-probe back-off (dev/test convenience).
+    /// Ceiling on the initial-probe back-off: the first `"none"` authentication
+    /// probe every SSH client sends is delayed by `min(auth_timeout,
+    /// auth_rejection_pad)` (russh `auth_rejection_time_initial`). It is NOT
+    /// the whole auth-phase deadline — that is `inactivity_timeout` +
+    /// `max_auth_attempts`. `0s` removes the per-connection initial back-off
+    /// (production option for latency-sensitive pubkey deployments; the
+    /// per-rejection pad is retained).
     pub auth_timeout: Duration,
     /// Constant-time padding applied on each auth rejection (russh
     /// `auth_rejection_time`), so a rejected key's latency doesn't leak *why* it

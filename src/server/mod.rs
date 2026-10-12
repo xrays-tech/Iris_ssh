@@ -382,10 +382,11 @@ pub struct AuthRejectionTiming {
 /// stalled on the full 30s before auth could even begin, and each *rejected*
 /// attempt also burned 30s. That conflated two unrelated concerns:
 ///
-/// * **`auth_timeout`** — the auth-phase budget (propose §5.2 `limits.auth_timeout`).
-///   Enforced as the ceiling on the initial probe (and, together with
-///   `max_auth_attempts`, the total time an unauthenticated peer can occupy a
-///   session).
+/// * **`auth_timeout`** — the ceiling on the initial `"none"`-probe back-off
+///   (`min(auth_timeout, auth_rejection_pad)`), per `limits.auth_timeout`.
+///   It is not itself a stall deadline: the unauthenticated-session bound is
+///   `inactivity_timeout` + `max_auth_attempts`. `0s` removes the per-connection
+///   initial back-off (production option) while keeping the per-rejection pad.
 /// * **`auth_rejection_pad`** — the constant-time padding per rejection
 ///   (anti-timing leak / anti-bruteforce), default 1s (russh's own default), not
 ///   inherited from `auth_timeout`.

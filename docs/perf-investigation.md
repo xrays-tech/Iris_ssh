@@ -1,5 +1,7 @@
 # Performance Investigation — Gateway Throughput Ceiling (~50 MB/s)
 
+> **2026-10-12 最终更正（§16/§18）**：标题所述的 ~50 MB/s "天花板"已被证伪——它是默认配置下**每个新建连接 ~1s 的 initial auth-backoff**被摊到 32-64MiB 小文件上的**测量伪影**。数据面持续吞吐**356–486 MB/s**，复用连接（OpenSSH ControlMaster）端到端**386–602 MB/s**。早期 §3/§4/§5/§11 中"数据面上限 / 窗口补窗调度"的结论**以 §16/§18 为准**，`auth_timeout=1s` 下跑过的 A/B（route1/route2/nodelay/window/max_packet/cipher/lto）均**欠功效**，不能作为"数据面不受该因素影响"的强证据。
+
 Status: **CLOSED** — engineering investigation and route adjudication, archived.
 Date: 2026-10-12. Applies to relay/data-plane work on `main`.
 
@@ -223,7 +225,9 @@ byte-verified, alternating:
 No default-config change is warranted by this axis; warpgate-aligned
 `nodelay+2MiB` does not reproduce its reported performance. Blind spot closed.
 
-## 11. Final decision-tree outcome
+## 11. Final decision-tree outcome — **SUPERSEDED by §16/§18** (see banner)
+
+> 以下"~50 MB/s 天花板 = 双链窗口/补窗调度"的结论已被 §16/§18 更正：那是每连接 ~1s auth-backoff 摊到小文件的测量伪影。数据面持续 356–486 MB/s。保留本节的**错误分析作为反面记录**，不作操作依据。
 
 | Route | Verdict | Basis |
 |---|---|---|
@@ -240,3 +244,254 @@ scheduling shape, or crypto. Single-leg plumbing does ~220-480 MB/s on this
 host; the gateway spends the rest on window-refill round-trips. The single
 promising lever left is a russh upstream patch (B), which requires forking /
 vendoring russh — a maintenance commitment to approve explicitly.
+
+---
+
+# T3 — window-binding diagnostic (2026-10-12)
+
+**Scope**: identify which window binds per direction, the refill RTT, and the
+effective window, so route B (half-window eager top-up / russh #770) can be
+adjudicated. Measurement only — all instrumentation lives in a throwaway copy;
+mainline `src/` and `Cargo.toml` are untouched.
+
+## 12. Environment & method
+
+| item | value |
+|---|---|
+| host | Fedora 44, Linux 7.2.9-200.fc44.x86_64, Intel Core Ultra 5 235 (14C), load 0.06, governor=performance |
+| transport | loopback only; OpenSSH_10.2p1 / OpenSSL 3.5.9; russh 0.64.1 |
+| payload | 64 MiB, 3 timed runs per direction, **byte-verified every run, 0 failures** |
+| gateway config | `relay.window_size=1MB`, `max_packet=32KB`, `nodelay=false`, `outbound_guard=true`, `pool.enabled=false` (i.e. T2 baseline cell) |
+| isolation | `cp -a` repo → `/tmp/t3/gw`, `rm -rf target`; russh unpacked to `/tmp/t3/russh-0.64.1`; linked with `cargo --config 'patch.crates-io.russh.path="…"'` (worked first try — no `[patch.crates-io]` edit needed) |
+| harness | `/tmp/t3/pure_legs_trace.sh` (derived from `scripts/pure_legs.sh`; WORK pinned to `/tmp/t3/work_$TAG`, `T3_TRACE=1` on gateway stderr → `gw_${TAG}_<dir>.trace`, gateway restarted per direction so traces are unambiguous) |
+| artifacts | `/tmp/t3/{gw_*.trace, cpusample_*.txt, metrics_*.txt, parse.py, pure_legs_trace.sh, cpusample.py}` |
+
+Instrumentation (russh copy only) — 7 events, `eprintln!` behind `T3_TRACE=1`,
+`OnceLock` gate so the disabled path is one relaxed read:
+
+`TXBLOCK`/`TXWAKE` (`reserve_writable_chunk`, window==0 → parked → woken) ·
+`TXQUEUE` (`data_noqueue_direct`, peer window truncated a send) ·
+`TXRESUME` (`flush_pending_with_writer`, queued bytes drained) ·
+`RXADJ_SEND` (`adjust_window_size`, we refilled **our** advertised window) ·
+`WADJ_RX` (peer refilled **our send** window) · `RXADJ_TGT` (client-leg
+`tgt_const` vs `tgt_dyn` — the #770 observation point) · `SAMPLE` (per ~1 MiB:
+`bytes_total`, `win_now`).
+
+## 13. Results — pure up / pure down, three configurations
+
+All figures MB/s, medians of 3 timed runs, byte-verified.
+
+| configuration | connect-only | denied principal | pure-up | pure-down |
+|---|---|---|---|---|
+| **mainline** (`auth_timeout=1s`, `auth_rejection_pad=1s`) | 1167 ms | **2062 ms** | **48.8** | **51.8** |
+| pad off (`pad=0s`) | 165 ms | 60 ms ⚠ | 202.6 | 266.1 |
+| **decoupled** (`auth_timeout=0s`, `pad=1s`) | 170 ms | **1061 ms** ✅ | **202.4** | **264.1** |
+| mainline + **one reused connection** (OpenSSH `ControlMaster`) | 1172 ms first, then **54 ms** | — | **386 / 400 / 377 / 402** | **335 / 408 / 602 / 486** |
+| *T2 baseline (§10) for reference* | — | — | 49.6 | 52.8 |
+
+Trace-derived **transfer phase only** (per 64 MiB run, from `SAMPLE`
+timestamps): up **420–486 MB/s**, down **356–438 MB/s** in *all three*
+configurations — the data plane is identical; only the fixed per-connection cost
+differs.
+
+Decomposition model `measured = connect_overhead + transfer` reproduces every
+cell within noise (e.g. mainline up: 1.167 s + 0.130 s = 1.297 s → 49.3 vs
+measured 48.8; decoupled up: 0.170 + 0.142 = 0.312 → 205 vs measured 202).
+
+## 14. Window-binding fields (decoupled suite; pad1s/pad0s agree within noise)
+
+**UP — client → gateway → backend**
+
+| field | value |
+|---|---|
+| **binding** | leg C (gw→backend) on the **backend sshd's advertised receive window** — *peer-controlled* |
+| block/queue events | `TXBLOCK=326`, `TXWAKE=166`, `TXQUEUE=98`, `TXRESUME=98` |
+| effective window | mean **715 KiB**, min 32 KiB, max 1664 KiB = **43 %** of the peer's window |
+| refill RTT (TXBLOCK→TXWAKE) | p50 **28.96 ms**, p95 **39.56 ms**, max 46.95 ms (n=34) |
+| sender duty blocked | 0.119 s of 0.142 s = **83.7 %** (interval-union, not sum) |
+| peer top-up granularity | `WADJ_RX` n=931, amount median **64 KiB** |
+| **our** advertised window | `RXADJ_SEND` n=480, target **1024 KiB**, low-water mean 480 KiB (47 %) → `target/2` threshold fires as designed; **zero `TXQUEUE side=S` ⇒ our 1 MiB window never constrained the client→gw hop** |
+| gw CPU | mean 2.5 %, max 10.0 % of one core — **not processing-bound** |
+| `sshgw_window_exhausted_total` | 0 → 168 (relay uplink fuse; orthogonal to the russh window) |
+| consistency `est = win/refill_rtt` | ≈ **2 MB/s** vs measured **202 MB/s** → **model decisively falsified** |
+
+**DOWN — backend → gateway → client**
+
+| field | value |
+|---|---|
+| **binding** | leg S (gw→client) on the **OpenSSH client's advertised receive window** — *peer-controlled* |
+| block/queue events | `TXQUEUE=41`, `TXRESUME=41`, **`TXBLOCK=0`** (the downlink sender parks in russh's 100-deep channel mpsc, not in the window) |
+| effective window | mean **1322 KiB**, min 0 KiB, max 1920 KiB = **69 %** of the peer's window |
+| refill RTT | n/a on this leg (no park) |
+| peer top-up granularity | `WADJ_RX side=S` n=838, amount median **64 KiB** |
+| **#770 observation point** | `RXADJ_TGT side=C`: `tgt_const == tgt_dyn == 1048576` — the gateway never overrides `adjust_window`, so the dynamic-window defect is **inert today** |
+| gw CPU | mean 6.5 %, max 13.0 % |
+| `sshgw_window_exhausted_total` | 0 → 0 |
+| consistency | window/RTT model inapplicable (no park); trace rate 356 MB/s vs measured 264 MB/s |
+
+## 15. Decision-table adjudication → **route B: NO-GO**
+
+| decision-table row | T3 observation | outcome |
+|---|---|---|
+| sender frequently blocked **and** binding = *our* advertised receive window → GO B2 | sender is blocked a lot on the uplink (83.7 % duty) but on the **backend sshd's** window, not ours; our own window never truncates a send (`TXQUEUE side=S = 0`) | **fails the GO condition** |
+| binding = peer window (sshd / OpenSSH) → NO-GO russh patch | **both** directions bind on a peer's window (backend sshd up, OpenSSH client down) | **NO-GO confirmed** |
+| sender rarely blocked / CPU saturated → processing-bound | CPU 2.5–6.5 %, so not processing-bound — but the window row already decides | same verdict |
+| refill RTT abnormally large while window near-full → relay queueing / wakeup latency | peer top-up granularity is only ~64 KiB with a ~29 ms adjust latency, yet the transfer still runs at 356–486 MB/s | not limiting; no relay change warranted |
+| no `side=C WADJ_RX` / `RXADJ_SEND` frequent but D missing → #770 | `RXADJ_TGT` shows `tgt_const == tgt_dyn` — defect present but **inert** | #770 = robustness value only, **no throughput effect today** |
+| consistency check fails → abandon the window hypothesis | `est ≈ 2 MB/s` vs `measured 202 MB/s` | **hypothesis rejected** |
+
+**Verdict: route B (half-window eager top-up at `session.rs:321`, and/or a
+russh #770 dynamic-window patch) is NO-GO as a throughput lever.** Neither
+bound window belongs to us; enlarging our advertised window or refilling it
+earlier cannot raise a peer's window. Expected gain ≈ 0 %, against a
+fork/vendoring maintenance cost.
+
+**Additional NO-GO evidence for the "window/refill scheduling" premise itself**:
+the data plane is not window-bound at all — it sustains 356–486 MB/s while the
+window sits at 43–69 % of the peer's. `est = win/refill_rtt` misses the measured
+rate by ~100×.
+
+## 16. Root cause of the ~50 MB/s ceiling (conflicts with §11)
+
+The ceiling is **not** a data-plane limit. It is the **1 s russh auth-rejection
+pad charged to the initial `"none"` probe of every connection**.
+
+* russh `server/encrypted.rs` (`process_packet`): when `auth_attempts == 0`
+  the session waits `Config::auth_rejection_time_initial` before answering the
+  first `USERAUTH_REQUEST` — i.e. before *any* credential is presented.
+* Gateway `auth_rejection_timing()`: `initial = auth_timeout.min(rejection_pad)`
+  ⇒ **1 s** with the mainline default (`min(30 s, 1 s)`) and **1 s** with
+  `pure_legs.sh` (`min(1 s, 1 s)`). The comment says "the initial probe must be
+  fast" — the `min` does not achieve that.
+* Every OpenSSH client sends that probe, so every timed `ssh` run in T2/bench
+  carries a fixed +1 s. At 64 MB that alone maps a true ~200–400 MB/s transfer
+  onto an apparent ~50 MB/s.
+* Wire-level corroboration (tcpdump, medium confidence): in the decoupled
+  capture each 64 MiB run is one continuous burst of ~5 000 packets lasting
+  83–193 ms; in the mainline capture the same bursts are each preceded by
+  ~1.2 s of silence.
+* Accidental control: with `ControlMaster` reusing one connection, the **same
+  mainline config** yields 386–602 MB/s; the one run where the master had
+  expired and a fresh connection was needed dropped to **48.3 / 51.5 MB/s** —
+  exactly the T2 number.
+
+**Recommended fix (config-only, no code)**: set `limits.auth_timeout = "0s"` and
+leave `auth_rejection_pad = "1s"` unchanged. Then `initial = 0`, `ongoing` stays
+1 s, so a *rejected* principal still pays the pad. Measured on this host:
+
+| | mainline | decoupled | Δ |
+|---|---|---|---|
+| connect-only | 1167 ms | 170 ms | −85 % |
+| denied principal (anti-bruteforce) | 2062 ms | 1061 ms | **still 1 s ✅** |
+| pure-up | 48.8 MB/s | 202.4 MB/s | **4.1×** |
+| pure-down | 51.8 MB/s | 264.1 MB/s | **5.1×** |
+
+`limits.auth_timeout` is used **only** as an input to `auth_rejection_timing()`
+— it is not a stall deadline anywhere in `src/`, and the gateway's own test
+helper already builds its "fast" context with `auth_timeout = "0s"`. The doc
+comment claiming it is "the deadline for a peer that stalls mid-auth" is not
+backed by code. Alternative one-line code fix: `auth_rejection_time_initial:
+Some(Duration::ZERO)` at `src/server/mod.rs:523`, keeping `auth_rejection_time`
+= the pad (same effect, makes the intent explicit).
+
+## 17. Log-perturbation assessment & engineering notes
+
+* **Perturbation: none measurable.** The instrumented binary with `T3_TRACE`
+  *unset* reproduces T2 (48.7 / 52.2 vs T2's 49.6 / 52.8). Traced runs emit
+  ~5.5 k lines per 256 MiB up (~1 per 47 KiB) and ~3.3 k down; the three suites'
+  trace-derived transfer phases (0.130 / 0.142 / 0.150 s) sit inside run-to-run
+  noise. The gate is a `OnceLock` read; `ts()` is only called inside the branch.
+* **Line drift vs the approved design**: `data_noqueue_direct` and
+  `flush_pending_with_writer` live in the shared `Encrypted` impl in
+  `src/session.rs` (not `server/session.rs`). They cannot distinguish the
+  server from the client role, so a `t3_side: u8` had to be threaded through
+  `data_with_writer`, `extended_data_with_writer`, `flush_channel_with_writer`,
+  `flush_pending_with_writer`, `flush_all_pending_with_writer` and
+  `adjust_window_size` (`b'S'` from `server/{session,encrypted}.rs`, `b'C'` from
+  `client/{session,encrypted}.rs`). Hook A likewise could not hardcode `C`:
+  `ChannelWriteHalf<S>` is generic over both roles, so the side comes from
+  `std::any::type_name::<S>()`. `ChannelId` is a private-field tuple struct →
+  needed a `t3trace::ch()` accessor. Hook F initially double-counted the client
+  leg (sampled in both `reserve_writable_chunk` and `data_noqueue_direct`);
+  gated to one site per leg.
+* **Compile**: one russh build + one gateway build, no errors after the first
+  signature-propagation wave (7 × `E0061`, all "missing `t3_side`").
+* **Harness issues found and fixed**: `cross_instrument`/`cross_stop` were
+  briefly lost in a rewrite; `pidstat` is not installed on this host → replaced
+  with a `/proc` sampler (`cpusample.py`); an early probe script had invalid
+  JSON in `rules.json` and, more importantly, tested a *wrong key* — but the
+  mock control plane grants any key for principal `plegs`, so the correct
+  negative test is a **denied principal**; a stray `sudo tcpdump` wrote ~3 GB of
+  pcaps (bounded with `-c`, deleted).
+* **Design deviations** (deliberate, in service of the same goal): gateway
+  restarted per direction so each trace is unambiguous; a third "decoupled"
+  configuration added after the pad was found to dominate; `ControlMaster`
+  control added as the decisive causality test.
+* **Open question for ops**: with the pad removed the per-connection cost is
+  ~54 ms (reused) / ~170 ms (fresh), so short-lived and high-connection-rate
+  workloads gain the most. Sustained single-connection throughput reaches
+  386–602 MB/s on this host.
+
+## 18. Independent reconciliation & unified narrative (2026-10-12, @oracle review)
+
+Independent review of §12–§17. **Agrees with the reversal**; **corrects** the
+"defect" framing and downgrades the window quantitative metrics.
+
+### What stands (verified)
+- **No ~50 MB/s data-plane ceiling.** Sustained one-way transfer phase
+  **356–486 MB/s (up) / 356–438 MB/s (down)**; connection-reused end-to-end
+  **386–602 MB/s** (loopback). The ~26–50 MB/s figures were a fixed per-new-
+  connection cost amortised over 32–64 MiB files.
+- The fixed cost is the **1 s initial auth-backoff** on every connection's first
+  `"none"` probe: `initial = min(auth_timeout, auth_rejection_pad)` =
+  `min(30s, 1s)` = 1 s (`src/server/mod.rs:392-402`, mapped at `:519-523`).
+  This is **russh's stock default** (`auth_rejection_time_initial=None ->
+  auth_rejection_time=1s`), adopted, not introduced, by the gateway.
+- Causal chain is solid: `auth_timeout` is consumed **only** at
+  `src/server/mod.rs:398` (verified by grep); changing it `1s -> 0s` moves
+  connect-only 1167→170 ms (≈1 s) and leaves the transfer phase identical;
+  `measured = connect + transfer` reproduces every cell.
+- **route B NO-GO stands** — but on **binding attribution**, not the blocked%
+  metrics: both directions bind on a *peer's* window (backend sshd up;
+  OpenSSH client down); our own advertised windows never truncate a send.
+- Route C (de-encryption) NO-GO still stands (crypto is not limiting; single
+  leg is 218–480 MB/s). warpgate study (stock russh, no magic) unaffected.
+
+### Corrected
+- **The 1 s is NOT a code defect.** Existing tests assert `initial=1s` is the
+  intended mapping (`:2412-2434`), `config.example.toml` and ops-runbook call
+  it deliberate anti-bruteforce/anti-timing, and `docs/perf-report.md:24-26`
+  already documented it. The real error was **measurement methodology**: timing
+  bulk transfers over fresh connections without charging the fixed per-connection
+  cost, then attributing the residual to the data plane.
+- **Window quantitative metrics (§14) are unreliable**: `sender duty blocked
+  83.7 %` is inconsistent with `444 MB/s` and `est = win/rtt ≈ 2 MB/s`
+  (`TXBLOCK=326` vs `TXWAKE=166` — per-32KB pairing under-counts). These
+  numbers are **descoped**; the NO-GO decision does not depend on them.
+- **Underpowered prior A/Bs**: route1/route2 (decoupling, zero-copy), nodelay,
+  window, max_packet, cipher, lto all ran under `auth_timeout=1s`; a fixed 1 s
+  per connection swamps <10% data-plane changes. Those runs cannot serve as
+  strong evidence the data plane is unaffected — only that no *large* effect
+  was measurable in that (flawed) methodology.
+
+### Security posture & operator guidance
+- **Ongoing pad retained**: `auth_rejection_pad=1s` + `max_auth_attempts=10` is
+  the real anti-bruteforce lever and is unchanged in every option below
+  (denied principal still pays ~1 s, measured 1061 ms).
+- **Initial back-off (`min(auth_timeout, pad)` = 1 s default)**: gives every
+  connection (including attackers) a flat ~1 s cost. For a pubkey/cert-only
+  gateway it has little guessing value (guesses pay the ongoing pad); removing
+  it halves an attacker's *full-attempt* cost (~2 s -> ~1 s) — a small
+  defence-in-depth posture change, not zero-cost.
+- **Latency / high-connection-rate pubkey deployments**:
+  `[limits] auth_timeout = "0s"` (keep `auth_rejection_pad = "1s"`)
+  → new-connection ~1.17 s → ~0.17 s, and 64MiB-scale transfers appear
+  4-5× faster. Keep `max_sessions` / `max_sessions_per_ip`.
+- **Public-facing / high-risk or russh-default parity**: keep
+  `auth_timeout="30s"` (initial = 1 s).
+- **Decision: defaults are UNCHANGED** (`auth_timeout=30s`, pad=1s). Flipping
+  the default is a separate security-review item (would also require updating
+  `src/config.rs:1011` and `:2412-2434` tests).
+- **Future measurement rule**: any data-plane A/B must use connection reuse
+  (ControlMaster / multi-channel), `auth_timeout="0s"`, or trace transfer-phase;
+  otherwise the fixed 1 s/connection makes the experiment underpowered.
