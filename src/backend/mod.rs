@@ -9,7 +9,10 @@
 //! * **Host-key trust**: [`BackendClient::check_server_key`] computes the
 //!   backend's SHA256 fingerprint and defers to the [`HostKeyVerifier`], so a
 //!   `pinned` policy rejects an unexpected backend before userauth.
-//! * **Dialing/auth** ([`BackendDialer::connect`]): TCP + KEX + publickey auth.
+//! * **Dialing/auth** ([`BackendDialer::connect`]): TCP + KEX + publickey auth
+//!   with the gateway's own key or certificate, and — with the agent kill-switch
+//!   on — [`BackendDialer::connect_agent`], which authenticates with the user's
+//!   forwarded agent instead.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +30,21 @@ use crate::types::Grant;
 /// Unix file mode bit that must be clear for a private key to be considered
 /// safe: group and other must have no access.
 const KEY_UNSAFE_MODE_MASK: u32 = 0o077;
+
+/// The agent transport for one user session: the channel *we* opened towards
+/// the client with `channel_open_agent()`, wrapped for the SSH-agent protocol.
+pub type AgentChannelStream = russh::ChannelStream<russh::server::Msg>;
+
+/// This session's forwarded agent, as an SSH-agent client speaking over that
+/// channel.
+///
+/// The concrete type is deliberate. russh 0.64.1 keeps its `auth` module (and
+/// hence its `Signer` trait) **private**, so no code outside the crate can name
+/// a `SG: Signer` bound — the generic shape the plan sketch had in mind is not
+/// expressible. Freezing the surface to exactly this one type is also what red
+/// line 4 asks for: the only signer the gateway can ever dial a backend with is
+/// the user's own agent, reached through this session's agent channel.
+pub type SessionAgentClient = russh::keys::agent::client::AgentClient<AgentChannelStream>;
 
 /// How the gateway authenticates itself to the backend (propose §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +489,18 @@ impl BackendDialer {
         self.backend_auth
     }
 
+    /// The credential a grant actually resolves to, or the error that makes it
+    /// unusable (currently only the agent kill-switch veto).
+    ///
+    /// This is the single admission decision for agent mode: the server leg
+    /// asks it before spawning a supervisor, so nothing else has to re-derive
+    /// "is this session an agent session" and risk disagreeing with the dialer.
+    pub fn resolved_backend_auth(&self, grant: &Grant) -> Result<BackendAuthMethod> {
+        let resolved = self.resolved_method_lenient(grant);
+        ensure_agent_backend_auth(resolved, self.allow_agent_backend_auth)?;
+        Ok(resolved)
+    }
+
     /// The breaker key for a grant's target (one breaker per `host:port`).
     fn breaker_key(grant: &Grant) -> String {
         format!("{}:{}", grant.target.host, grant.target.port)
@@ -489,11 +519,92 @@ impl BackendDialer {
         }
     }
 
-    /// Establish an authenticated backend session for the grant's target.
-    ///
-    /// Fail-fast gate: if the per-target dial breaker is open, this returns
-    /// [`BackendError::CircuitOpen`] without touching the network, so a dead
-    /// backend can't stall every channel open. Every outcome feeds the breaker.
+    /// Enter the dial gate: return the breaker key, or fail fast on an open
+    /// breaker without touching the network (so a dead backend can't stall every
+    /// channel open). Shared verbatim by both credential paths.
+    fn enter_dial_gate(&self, grant: &Grant) -> Result<String> {
+        let key = Self::breaker_key(grant);
+        if !self.dial_breaker.allows(&key) {
+            self.metrics.backend_dial_fail();
+            return Err(BackendError::CircuitOpen { target: key }.into());
+        }
+        Ok(key)
+    }
+
+    /// TCP connect + KEX + host-key verification, **before** any user
+    /// authentication. Credential-agnostic: used by both the key/cert path and
+    /// the agent path (C2), which differ only in how they authenticate after
+    /// this returns. Records breaker/metric failures exactly as before.
+    async fn connect_inner(&self, grant: &Grant, key: &str) -> Result<Handle<BackendClient>> {
+        let addr = (grant.target.host.as_str(), grant.target.port);
+        let last_rejection: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let handler = BackendClient::new(
+            Arc::clone(&self.verifier),
+            Arc::clone(&last_rejection),
+            // Host-certificate validation must check the certificate names *this*
+            // host, so the handler needs the name we set out to reach.
+            grant.target.host.clone(),
+        );
+
+        let connect_fut =
+            client::connect::<BackendClient, _>(Arc::clone(&self.client_config), addr, handler);
+        tokio::time::timeout(self.dial_timeout, connect_fut)
+            .await
+            .map_err(|_| {
+                self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(key);
+                BackendError::Dial {
+                    addr: format!("{}:{}", grant.target.host, grant.target.port),
+                    source: Box::new(crate::error::Error::Invariant(
+                        "backend dial timed out".into(),
+                    )),
+                }
+            })?
+            .map_err(|e| {
+                self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(key);
+                self.dial_error(grant, last_rejection, e)
+            })
+            .map_err(Into::into)
+    }
+
+    /// Fold a completed authentication attempt into breaker + metrics + result.
+    /// Shared by both credential paths so success/failure bookkeeping cannot
+    /// drift between them.
+    fn settle_auth(
+        &self,
+        key: &str,
+        started: std::time::Instant,
+        handle: Handle<BackendClient>,
+        user: &str,
+        outcome: std::result::Result<AuthResult, BackendError>,
+    ) -> Result<Handle<BackendClient>> {
+        match outcome {
+            Err(e) => {
+                self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(key);
+                Err(e.into())
+            }
+            Ok(AuthResult::Success) => {
+                self.metrics.backend_dial_ok();
+                self.metrics.backend_dial_latency(started.elapsed());
+                // A full handshake succeeded: the target is healthy again.
+                self.dial_breaker.record_success(key);
+                Ok(handle)
+            }
+            Ok(_) => {
+                self.metrics.backend_dial_fail();
+                self.dial_breaker.record_failure(key);
+                Err(BackendError::Auth {
+                    user: user.to_owned(),
+                }
+                .into())
+            }
+        }
+    }
+
+    /// Establish an authenticated backend session for the grant's target using
+    /// the **gateway's own** credential (`key` or `cert`, M4-T2/T3).
     pub async fn connect(&self, grant: &Grant) -> Result<Handle<BackendClient>> {
         // C1 kill-switch veto, evaluated at *credential-resolve* time and before
         // any network I/O: a resolved `agent` with the switch off is an error,
@@ -516,42 +627,9 @@ impl BackendDialer {
             .into());
         }
 
-        let key = Self::breaker_key(grant);
-        if !self.dial_breaker.allows(&key) {
-            self.metrics.backend_dial_fail();
-            return Err(BackendError::CircuitOpen { target: key }.into());
-        }
-
+        let key = self.enter_dial_gate(grant)?;
         let started = std::time::Instant::now();
-        let addr = (grant.target.host.as_str(), grant.target.port);
-        let last_rejection: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let handler = BackendClient::new(
-            Arc::clone(&self.verifier),
-            Arc::clone(&last_rejection),
-            // Host-certificate validation must check the certificate names *this*
-            // host, so the handler needs the name we set out to reach.
-            grant.target.host.clone(),
-        );
-
-        let connect_fut =
-            client::connect::<BackendClient, _>(Arc::clone(&self.client_config), addr, handler);
-        let mut handle = tokio::time::timeout(self.dial_timeout, connect_fut)
-            .await
-            .map_err(|_| {
-                self.metrics.backend_dial_fail();
-                self.dial_breaker.record_failure(&key);
-                BackendError::Dial {
-                    addr: format!("{}:{}", grant.target.host, grant.target.port),
-                    source: Box::new(crate::error::Error::Invariant(
-                        "backend dial timed out".into(),
-                    )),
-                }
-            })?
-            .map_err(|e| {
-                self.metrics.backend_dial_fail();
-                self.dial_breaker.record_failure(&key);
-                self.dial_error(grant, last_rejection, e)
-            })?;
+        let mut handle = self.connect_inner(grant, &key).await?;
 
         // Authenticate with the credential the routed method selects (M4-T2/T3).
         // A per-grant override wins over `[backend] backend_auth`; a malformed
@@ -591,28 +669,42 @@ impl BackendDialer {
             }),
         };
 
-        match outcome {
-            Err(e) => {
-                self.metrics.backend_dial_fail();
-                self.dial_breaker.record_failure(&key);
-                Err(e.into())
-            }
-            Ok(AuthResult::Success) => {
-                self.metrics.backend_dial_ok();
-                self.metrics.backend_dial_latency(started.elapsed());
-                // A full handshake succeeded: the target is healthy again.
-                self.dial_breaker.record_success(&key);
-                Ok(handle)
-            }
-            Ok(_) => {
-                self.metrics.backend_dial_fail();
-                self.dial_breaker.record_failure(&key);
-                Err(BackendError::Auth {
-                    user: grant.target.user.clone(),
-                }
-                .into())
-            }
-        }
+        self.settle_auth(&key, started, handle, &grant.target.user, outcome)
+    }
+
+    /// Establish an authenticated backend session using the **user's forwarded
+    /// agent** as the signing credential (`backend_auth = "agent"`, C2).
+    ///
+    /// `public_key` / `signer` describe the *one* identity the supervisor
+    /// already matched against `grant.fingerprint`; the agent is only ever asked
+    /// to sign for a key **we offered** (`auth::Method::FuturePublicKey`), so it
+    /// never signs under another identity on our behalf (red line 4).
+    ///
+    /// Shares the dial gate, TCP/KEX path, breaker and metrics with
+    /// [`connect`](Self::connect) — the two paths differ solely in how the user
+    /// is authenticated after the transport is up.
+    pub async fn connect_agent(
+        &self,
+        grant: &Grant,
+        public_key: russh::keys::PublicKey,
+        signer: &mut SessionAgentClient,
+    ) -> Result<Handle<BackendClient>> {
+        let key = self.enter_dial_gate(grant)?;
+        let started = std::time::Instant::now();
+        let mut handle = self.connect_inner(grant, &key).await?;
+
+        // Hash algorithm: mirror the key/cert path's `PrivateKeyWithHashAlg::
+        // new(key, None)` — i.e. let russh pick the default. Non-RSA keys ignore
+        // it entirely; RSA falls back to the same legacy default the key path
+        // already uses, so agent mode never introduces a *new* algorithm policy.
+        let outcome = handle
+            .authenticate_publickey_with(&grant.target.user, public_key, None, signer)
+            .await
+            .map_err(|e| BackendError::Auth {
+                user: format!("{} ({e})", grant.target.user),
+            });
+
+        self.settle_auth(&key, started, handle, &grant.target.user, outcome)
     }
 
     /// Authenticate to the backend with a **freshly issued** short-lived user

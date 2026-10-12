@@ -28,7 +28,7 @@ use russh::server::{self, Auth, Config as ServerConfig, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Pty};
 
 use crate::audit::{Auditor, CommandInfo};
-use crate::backend::{BackendClient, BackendDialer, CredentialStore};
+use crate::backend::{BackendAuthMethod, BackendClient, BackendDialer, CredentialStore};
 use crate::config::GatewayConfig;
 use crate::error::{BackendError, Error, Result};
 use crate::metrics::Metrics;
@@ -667,6 +667,7 @@ impl server::Server for GatewayServer {
             backend: None,
             relays: HashMap::new(),
             taps: HashMap::new(),
+            agent: None,
             entry: None,
             limiter_reject,
             audited: false,
@@ -692,9 +693,23 @@ pub struct GatewaySession {
     relays: HashMap<ChannelId, Arc<ChannelRelay>>,
     /// Per-channel data taps (recording / SFTP inspection), keyed by channel.
     taps: HashMap<ChannelId, Arc<dyn relay::ChannelTap>>,
+    /// Agent-passthrough mode (C2): set when the session authenticates to the
+    /// backend with the user's forwarded agent. `None` in the key/cert path,
+    /// which therefore stays byte-for-byte unchanged.
+    agent: Option<AgentSession>,
     entry: Option<Arc<SessionEntry>>,
     limiter_reject: bool,
     audited: bool,
+}
+
+/// The agent-mode channel of one session (C2).
+///
+/// Agent mode owns exactly one client channel and one supervisor task: a second
+/// concurrent channel would need a second agent leg, and there is exactly one
+/// forwarded agent per session (see [`relay::agent`]).
+struct AgentSession {
+    client_id: ChannelId,
+    shared: relay::agent::AgentHandle,
 }
 
 impl GatewaySession {
@@ -863,6 +878,153 @@ impl GatewaySession {
             auditor.set_command(info.clone());
         }
     }
+
+    /// Whether this session authenticates to the backend with the user's
+    /// forwarded agent (C2).
+    ///
+    /// Delegates the admission decision to the dialer — the same
+    /// kill-switch + policy check the dial path runs — so the server leg can
+    /// never disagree with it about which credential a session uses.
+    fn agent_mode(&self) -> bool {
+        let Some(grant) = &self.grant else {
+            return false;
+        };
+        matches!(
+            self.ctx.dialer.resolved_backend_auth(grant),
+            Ok(BackendAuthMethod::Agent)
+        )
+    }
+
+    /// Agent mode (C2): while this session's channel belongs to the supervisor,
+    /// hand the op to its single ordered consumer instead of acting on it here
+    /// (propose.md §3.5.1).
+    ///
+    /// Returns `true` when the caller must stop: either the op was queued, or
+    /// the supervisor has already closed the channel natively (I4).
+    async fn take_over_by_agent(
+        &mut self,
+        channel: ChannelId,
+        op: relay::agent::AgentOp,
+        session: &mut Session,
+    ) -> bool {
+        let Some(agent) = &self.agent else {
+            return false;
+        };
+        if agent.client_id != channel {
+            return false;
+        }
+        let shared = Arc::clone(&agent.shared);
+        // While dialing this must never park the serial event loop (C5); once
+        // the backend is up, `send().await` is the same backpressure the inline
+        // path applies today.
+        let outcome = if shared.is_ready() {
+            shared.enqueue(op).await
+        } else {
+            shared.try_enqueue(op)
+        };
+        match outcome {
+            relay::agent::Enqueued::Accepted => true,
+            relay::agent::Enqueued::QueueFull => {
+                self.ctx.metrics.agent_channel_denied();
+                tracing::warn!(
+                    target: "server",
+                    %channel,
+                    "agent-mode queue full while dialing; failing the channel natively"
+                );
+                // The op is dropped with its reply slot, so the client learns
+                // about it from the close rather than a fabricated SUCCESS.
+                let _ = session.close(channel);
+                self.agent = None;
+                true
+            }
+            relay::agent::Enqueued::Closed => {
+                // The supervisor already answered the queue with protocol-native
+                // failures and closed the channel; nothing left to do here.
+                self.agent = None;
+                true
+            }
+        }
+    }
+
+    /// Agent mode (C2): open this session's single channel to a new supervisor
+    /// task rather than dialing inline.
+    ///
+    /// The channel is accepted *immediately* (the client needs its confirmation
+    /// before it can request agent forwarding at all), and every later request
+    /// is queued by [`take_over_by_agent`](Self::take_over_by_agent) until the
+    /// backend is up. Failure to reach the backend closes the channel
+    /// natively — it never falls back to the gateway's own key (red line 3).
+    async fn open_agent_channel(
+        &mut self,
+        channel: Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
+        session: &mut Session,
+        grant: &Grant,
+    ) -> Result<()> {
+        if self.agent.is_some() {
+            // MVP (red line 12 scope): one channel per agent session. A second
+            // would need a second agent leg, and there is one forwarded agent
+            // per session.
+            self.ctx.metrics.agent_channel_denied();
+            tracing::warn!(
+                target: "server",
+                channel = %channel.id(),
+                "agent mode allows one session channel; refusing the second"
+            );
+            reply.reject(ChannelOpenFailure::ResourceShortage).await;
+            return Ok(());
+        }
+
+        let client_id = channel.id();
+        if let Some(entry) = &self.entry {
+            entry.set_channel_class(client_id, crate::audit::CommandClass::Interactive);
+        }
+        let bytes = self
+            .auditor
+            .as_ref()
+            .map(|a| a.byte_counters())
+            .unwrap_or_default();
+        let tap_ctx = relay::ChannelCtx {
+            session_id: self.session_id.to_string(),
+            channel_id: client_id,
+            principal: grant.principal.as_str().to_owned(),
+            command_class: crate::audit::CommandClass::Interactive,
+            record: grant.policy.recording,
+        };
+        let tap = self.ctx.interceptor.observe(&tap_ctx);
+        if let Some(tap) = &tap {
+            self.taps.insert(client_id, Arc::clone(tap));
+        }
+        if let Some(auditor) = &self.auditor {
+            // The audit record has to say *which credential reached the
+            // backend*, even if the dial then fails (red line 10).
+            auditor.set_auth_kind("agent");
+        }
+
+        let shared = relay::agent::spawn(
+            relay::agent::AgentSupervisorArgs {
+                grant: grant.clone(),
+                client_id,
+                up: session.handle(),
+                dialer: Arc::clone(&self.ctx.dialer),
+                metrics: self.ctx.metrics.clone(),
+                tap,
+                bytes,
+                auditor: self.auditor.clone(),
+                session_id: self.session_id.to_string(),
+            },
+            self.ctx.config.relay.window_size,
+            self.ctx.config.relay.max_packet,
+        );
+        // Register the handle *before* confirming the open, so the client's
+        // first request can never outrun it. The supervisor cannot reply to or
+        // close this channel before then either: its first act is to wait for
+        // the client's `auth-agent-req@openssh.com`, which the client only sends
+        // once it has this confirmation.
+        self.agent = Some(AgentSession { client_id, shared });
+        reply.accept().await;
+        Ok(())
+    }
 }
 
 /// Await the backend reply receiver and answer the client with the protocol
@@ -1029,6 +1191,25 @@ impl server::Handler for GatewaySession {
         reply: server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        // C2 agent passthrough: jump forwarding and the agent leg do not
+        // coexist in the MVP — the supervisor owns this session's single
+        // backend channel, so there is nothing to pivot a forwarded TCP
+        // connection through. Refuse natively (I4) and count it.
+        if self.agent_mode() {
+            self.ctx.metrics.agent_channel_denied();
+            tracing::info!(
+                target: "server",
+                originator = originator_address,
+                host = host_to_connect,
+                port = port_to_connect,
+                "refusing direct-tcpip: jump forwarding is unavailable in agent mode"
+            );
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+
         let target = crate::jump::JumpTarget {
             host: host_to_connect.to_owned(),
             port: u16::try_from(port_to_connect).unwrap_or(0),
@@ -1159,6 +1340,16 @@ impl server::Handler for GatewaySession {
             }
         };
 
+        // C2 agent passthrough: this session authenticates to the backend with
+        // the *user's* forwarded agent, so the channel goes to a supervisor
+        // task instead of being dialled inline. Everything after the channel is
+        // up is the ordinary relay path.
+        if self.agent_mode() {
+            return self
+                .open_agent_channel(channel, reply, session, &grant)
+                .await;
+        }
+
         // Per-connection channel cap (§3.8 / sshd MaxSessions): one backend
         // connection carries this session's channels, so refuse to open more than
         // the configured (hard-capped) limit rather than overloading the backend.
@@ -1249,6 +1440,28 @@ impl server::Handler for GatewaySession {
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         let n = data.len();
+        // C2 agent passthrough: the supervisor owns this channel's uplink, so
+        // the tap still runs here (it has the per-channel record) and only the
+        // already-filtered bytes are handed over.
+        if self.agent.is_some() {
+            let Some((payload, inject)) = self.apply_uplink_tap(channel, data) else {
+                return Ok(());
+            };
+            if !inject.is_empty() {
+                if let Err(e) = session.data(channel, Bytes::from(inject)) {
+                    tracing::debug!(target: "relay", ?channel, ?e, "could not deliver tap response to client");
+                }
+            }
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::Data {
+                    data: Bytes::from(payload),
+                },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         // One map lookup per packet: take an owned `Arc` handle (and the metrics
         // snapshot it carries) so the relay survives the awaits below without
         // borrowing `self.relays` across them.
@@ -1326,8 +1539,20 @@ impl server::Handler for GatewaySession {
         channel: ChannelId,
         ext: u32,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        if self.agent.is_some() {
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::ExtendedData {
+                    ext,
+                    data: Bytes::copy_from_slice(data),
+                },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         let relay = match self.relays.get(&channel) {
             Some(r) => r,
             None => return Ok(()),
@@ -1352,6 +1577,23 @@ impl server::Handler for GatewaySession {
         modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        if self.agent.is_some() {
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::Pty {
+                    term: term.to_owned(),
+                    col_width,
+                    row_height,
+                    pix_width,
+                    pix_height,
+                    modes: modes.to_vec(),
+                    want_reply: true,
+                },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         let relay = match self.relays.get(&channel) {
             Some(r) => r,
             None => return Ok(()),
@@ -1377,6 +1619,15 @@ impl server::Handler for GatewaySession {
         if let Some(entry) = &self.entry {
             entry.set_channel_class(channel, crate::audit::CommandClass::Interactive);
         }
+        if self.agent.is_some() {
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::Shell { want_reply: true },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         let relay = match self.relays.get(&channel) {
             Some(r) => r,
             None => return Ok(()),
@@ -1401,6 +1652,18 @@ impl server::Handler for GatewaySession {
             entry.set_channel_class(channel, class);
         }
         self.record_channel_command(channel, &CommandInfo::Exec(cmd));
+        if self.agent.is_some() {
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::Exec {
+                    command: data.to_vec(),
+                    want_reply: true,
+                },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         let relay = match self.relays.get(&channel) {
             Some(r) => r,
             None => return Ok(()),
@@ -1421,6 +1684,18 @@ impl server::Handler for GatewaySession {
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         self.record_channel_command(channel, &CommandInfo::Subsystem(name.to_owned()));
+        if self.agent.is_some() {
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::Subsystem {
+                    name: name.to_owned(),
+                    want_reply: true,
+                },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         let relay = match self.relays.get(&channel) {
             Some(r) => r,
             None => return Ok(()),
@@ -1468,6 +1743,27 @@ impl server::Handler for GatewaySession {
             Some(r) => r,
             None => return Ok(()),
         };
+        if self.agent.is_some() {
+            // M1's env allowlist is applied here, before anything reaches the
+            // backend, so agent mode cannot be used to smuggle a filtered
+            // variable past it.
+            let allowed =
+                crate::policy::env_allowed(variable_name, &self.ctx.config.relay.env_allowlist);
+            if matches!(allowed, crate::policy::ForwardDecision::DenyLocally { .. }) {
+                return Ok(());
+            }
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::Env {
+                    name: variable_name.to_owned(),
+                    value: variable_value.to_owned(),
+                    want_reply: true,
+                },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         // M1: pass-through unless an allowlist is configured (propose §3.4).
         let allowed =
             crate::policy::env_allowed(variable_name, &self.ctx.config.relay.env_allowlist);
@@ -1494,8 +1790,22 @@ impl server::Handler for GatewaySession {
         row_height: u32,
         pix_width: u32,
         pix_height: u32,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        if self.agent.is_some() {
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOp::WindowChange {
+                    col_width,
+                    row_height,
+                    pix_width,
+                    pix_height,
+                },
+                session,
+            )
+            .await;
+            return Ok(());
+        }
         if let Some(relay) = self.relays.get(&channel) {
             relay
                 .backend
@@ -1511,6 +1821,11 @@ impl server::Handler for GatewaySession {
         signal: russh::Sig,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        if self.agent.is_some() {
+            self.take_over_by_agent(channel, relay::agent::AgentOp::Signal { signal }, _session)
+                .await;
+            return Ok(());
+        }
         if let Some(relay) = self.relays.get(&channel) {
             relay.backend.signal(signal).await?;
         }
@@ -1541,6 +1856,11 @@ impl server::Handler for GatewaySession {
                 %channel,
                 "agent-forwarding request denied (session has no grant)"
             );
+            if let Some(agent) = &self.agent {
+                // The supervisor is waiting on this decision; a refusal must
+                // unblock it immediately rather than run out the deadline.
+                agent.shared.grant_decision(false);
+            }
             return Ok(false);
         };
         // Both gates (instance kill-switch + grant policy) live in one pure
@@ -1556,6 +1876,9 @@ impl server::Handler for GatewaySession {
                     principal = %grant.principal,
                     "agent forwarding permitted for this grant"
                 );
+                if let Some(agent) = &self.agent {
+                    agent.shared.grant_decision(true);
+                }
                 Ok(true)
             }
             crate::policy::ForwardDecision::DenyLocally { reason } => {
@@ -1565,6 +1888,9 @@ impl server::Handler for GatewaySession {
                     %reason,
                     "agent-forwarding request denied"
                 );
+                if let Some(agent) = &self.agent {
+                    agent.shared.grant_decision(false);
+                }
                 Ok(false)
             }
         }
@@ -1589,6 +1915,11 @@ impl server::Handler for GatewaySession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        if self.agent.is_some() {
+            self.take_over_by_agent(channel, relay::agent::AgentOp::Eof, _session)
+                .await;
+            return Ok(());
+        }
         if let Some(relay) = self.relays.get(&channel) {
             relay.backend.eof().await?;
         }
@@ -1600,6 +1931,23 @@ impl server::Handler for GatewaySession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        if let Some(agent) = self.agent.take() {
+            if agent.client_id == channel {
+                // The supervisor closes the backend channel itself as soon as
+                // it drains this op (its sender is dropped with `self.agent`).
+                let shared = agent.shared;
+                let _ = shared.enqueue(relay::agent::AgentOp::Close).await;
+                if let Some(tap) = self.taps.remove(&channel) {
+                    tap.flush();
+                }
+                if let Some(entry) = &self.entry {
+                    entry.forget_channel(channel);
+                }
+                return Ok(());
+            }
+            // Not this session's channel: put the handle back untouched.
+            self.agent = Some(agent);
+        }
         if let Some(relay) = self.relays.remove(&channel) {
             relay.backend.close().await?;
         }

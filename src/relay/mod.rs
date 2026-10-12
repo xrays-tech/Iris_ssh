@@ -6,6 +6,9 @@
 //!   *inside* the per-packet callback. Because russh invokes those callbacks
 //!   serially in arrival order, awaiting inside the callback is exactly the
 //!   strict FIFO the design demands — no spawning, no aggregation.
+//!   Agent-passthrough mode (C2) is the one documented exception: it keeps the
+//!   same FIFO by handing every op to a **single** per-session consumer, and is
+//!   authorised by propose.md §3.5.1.
 //! * **I2 (want_reply)**: the `want_reply` flag is passed through verbatim;
 //!   backend SUCCESS/FAILURE replies are routed back to the originating
 //!   callback in FIFO order via [`ReplyRouter`].
@@ -49,6 +52,11 @@ use tokio::sync::{oneshot, Semaphore};
 
 use russh::client::Msg as ClientMsg;
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+
+/// Agent-passthrough supervisor (C2): the one documented exception to the
+/// "everything happens inside the serial handler callback" rule, authorised by
+/// propose.md §3.5.1 and unreachable unless the agent kill-switch is on.
+pub mod agent;
 
 /// Re-exported so callers can name the type without depending on `russh`'s path.
 pub use russh::ChannelId;

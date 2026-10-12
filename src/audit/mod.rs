@@ -156,6 +156,14 @@ pub struct Auditor {
     /// mutability so `Arc<Auditor>` handles (the serial handler *and* the
     /// detached up-pump task) can record without exclusive access.
     command: Mutex<Option<CommandInfo>>,
+    /// How the gateway authenticated *to the backend* for this session:
+    /// `"key"`/`"cert"` (the gateway's own credential) or `"agent"` (the end
+    /// user's forwarded agent — plan-agent-passthrough C2).
+    auth_kind: Mutex<String>,
+    /// The agent identity fingerprint used for `"agent"`, when there was one.
+    agent_identity: Mutex<Option<String>>,
+    /// How many signatures the gateway relayed to the user's agent.
+    agent_signatures: AtomicU64,
     metrics: Metrics,
 }
 
@@ -177,6 +185,9 @@ impl Auditor {
             started_at: Instant::now(),
             bytes: Arc::new(ByteCounters::default()),
             command: Mutex::new(None),
+            auth_kind: Mutex::new("key".to_owned()),
+            agent_identity: Mutex::new(None),
+            agent_signatures: AtomicU64::new(0),
             metrics,
         }
     }
@@ -184,6 +195,29 @@ impl Auditor {
     /// A cloneable handle to the byte counters for the relay to increment.
     pub fn byte_counters(&self) -> Arc<ByteCounters> {
         Arc::clone(&self.bytes)
+    }
+
+    /// Record which credential the gateway used to reach the backend. The
+    /// default is `"key"`; agent mode sets `"agent"` (C2), which is what makes
+    /// an agent-forwarded session distinguishable in the audit trail.
+    pub fn set_auth_kind(&self, kind: &str) {
+        let mut guard = self.auth_kind.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = kind.to_owned();
+    }
+
+    /// Record the agent identity (its `SHA256:` fingerprint) that the session
+    /// was authorized with — the "who signed" half of red line 10.
+    pub fn set_agent_identity(&self, fingerprint: &str) {
+        let mut guard = self
+            .agent_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(fingerprint.to_owned());
+    }
+
+    /// Count one signature relayed to the user's agent.
+    pub fn note_agent_signature(&self) {
+        self.agent_signatures.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record what the (first) channel asked to run. `&self` so it is callable
@@ -223,6 +257,17 @@ impl Auditor {
             target_host: self.grant.target.host.clone(),
             target_port: self.grant.target.port,
             target_user: self.grant.target.user.clone(),
+            auth_kind: self
+                .auth_kind
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            agent_identity: self
+                .agent_identity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            agent_signatures: self.agent_signatures.load(Ordering::Relaxed),
             command_class: class.as_str().to_owned(),
             command: command_repr,
             started_at_ms: 0, // relative epoch not needed; duration below suffices
@@ -254,6 +299,17 @@ pub struct AuditRecord {
     pub target_user: String,
     pub command_class: String,
     pub command: Option<String>,
+    /// How the gateway authenticated to the backend: `"key"`/`"cert"` for its
+    /// own credential, `"agent"` when the end user's forwarded agent signed
+    /// (plan-agent-passthrough C2). An auditor must be able to tell a
+    /// user-signed session from a gateway-signed one without cross-referencing
+    /// anything (red line 10).
+    pub auth_kind: String,
+    /// The `SHA256:` fingerprint of the agent identity that signed, when
+    /// `auth_kind == "agent"`.
+    pub agent_identity: Option<String>,
+    /// How many signatures the gateway relayed to that agent.
+    pub agent_signatures: u64,
     pub started_at_ms: i64,
     pub bytes_up: u64,
     pub bytes_down: u64,

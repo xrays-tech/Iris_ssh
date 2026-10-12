@@ -75,6 +75,20 @@ struct MetricsInner {
     recorded_bytes_total: AtomicU64,
     recorded_sessions_total: AtomicU64,
 
+    // C2: agent passthrough (plan-agent-passthrough)
+    /// Agent-mode sessions whose backend handshake succeeded.
+    agent_backend_auth_ok_total: AtomicU64,
+    /// Agent-mode sessions that could not authenticate to the backend. Every
+    /// one of these ends in a protocol-native channel close — never in a
+    /// fallback to the gateway's own key or certificate.
+    agent_backend_auth_fail_total: AtomicU64,
+    /// Signature operations the gateway relayed to the user's agent. Bounded by
+    /// one per agent-mode session (we offer exactly one authorized identity).
+    agent_signatures_total: AtomicU64,
+    /// Channel opens refused *because* agent mode caps the session at one
+    /// channel, or because jump forwarding is unavailable there.
+    agent_channel_denied_total: AtomicU64,
+
     // disconnect reason histogram, indexed by SSH reason code (0..=15).
     disconnect_reason: [AtomicU64; 16],
 
@@ -364,6 +378,39 @@ impl Metrics {
         }
     }
 
+    /// An agent-mode session authenticated to the backend with the user's
+    /// forwarded agent (C2).
+    pub fn agent_backend_auth_ok(&self) {
+        self.inner
+            .agent_backend_auth_ok_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An agent-mode session could **not** authenticate to the backend. The
+    /// channel is closed natively; no other credential is ever tried.
+    pub fn agent_backend_auth_fail(&self) {
+        self.inner
+            .agent_backend_auth_fail_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One signature request was relayed to the user's agent. We offer exactly
+    /// one authorized identity per session, so this is one per successful
+    /// agent-mode dial.
+    pub fn agent_signature(&self) {
+        self.inner
+            .agent_signatures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A channel open was refused because agent mode caps the session at one
+    /// channel, or because it does not support jump forwarding.
+    pub fn agent_channel_denied(&self) {
+        self.inner
+            .agent_channel_denied_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Current active session count (for readiness / assertions in tests).
     pub fn active_sessions(&self) -> usize {
         self.inner.active_sessions.load(Ordering::Relaxed)
@@ -496,6 +543,26 @@ impl Metrics {
             &mut out,
             "sshgw_recorded_sessions_total",
             &self.inner.recorded_sessions_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_agent_backend_auth_ok_total",
+            &self.inner.agent_backend_auth_ok_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_agent_backend_auth_fail_total",
+            &self.inner.agent_backend_auth_fail_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_agent_signatures_total",
+            &self.inner.agent_signatures_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_agent_channel_denied_total",
+            &self.inner.agent_channel_denied_total,
         );
 
         for (code, counter) in self.inner.disconnect_reason.iter().enumerate().skip(1) {
