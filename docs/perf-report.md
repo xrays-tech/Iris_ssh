@@ -43,8 +43,10 @@
 | 基线（Nagle 开，chacha20 默认） | 167.2 MB/s | 25.8 MB/s | 84.6% |
 | `nodelay=true`（双腿 TCP_NODELAY） | 220.9 MB/s | 26.7 MB/s | 87.9% |
 | `ciphers=["aes256-gcm","aes128-gcm"]` | 168.7 MB/s | 25.9 MB/s | 84.6% |
+| `lto="fat"`（构建优化 a） | 163.0 MB/s | 25.6 MB/s | 84.3% |
+| `target-cpu=native`（RUSTFLAGS，构建优化 a） | 167.8 MB/s | 25.6 MB/s | 84.7% |
 
-**结论**：`nodelay=true` 与 `ciphers` 调整对经网关吞吐**均无实质影响**（26.7 / 25.9 vs 基线 25.8 MB/s，均落在 run 间噪声内；direct 的提升源于 OpenSSH 直连本腿，不经网关）。→ 逐包加解密/协议栈本身不是该损耗的主因；瓶颈更可能在**路由/中继结构**（每包 await 串行链、腿间 round-trip 耦合）而非 Nagle/算法。
+**结论**：`nodelay=true`、`ciphers` 调整、构建优化（lto=fat / target-cpu=native）对经网关吞吐**均无实质影响**（25.6-26.7 MB/s 区间，run 间噪声内；direct 的提升源于 OpenSSH 直连本腿，不经网关）。→ 逐包加解密/协议栈/构建**不是该损耗的主因**；瓶颈更可能在**中继结构**（每包 await 串行链、双腿 round-trip 耦合）。
 - 选项仍保留在 config 与 example 注释（低成本、无害），但**不作为吞吐解**。
 - 剩余候选（需实测/架构评审）：腿 A/B 隔离诊断、写路径流水化（仿 bssh 6.2x）、或架构级 ProxyJump 直通 / 可信后端裸 TCP（见 known-limitations #7）。
 
