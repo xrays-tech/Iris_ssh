@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::{Channel, ChannelOpenFailure};
 
 use crate::error::{BackendError, Result};
 use crate::metrics::Metrics;
@@ -38,12 +39,19 @@ pub type AgentChannelStream = russh::ChannelStream<russh::server::Msg>;
 /// This session's forwarded agent, as an SSH-agent client speaking over that
 /// channel.
 ///
-/// The concrete type is deliberate. russh 0.64.1 keeps its `auth` module (and
-/// hence its `Signer` trait) **private**, so no code outside the crate can name
-/// a `SG: Signer` bound — the generic shape the plan sketch had in mind is not
-/// expressible. Freezing the surface to exactly this one type is also what red
-/// line 4 asks for: the only signer the gateway can ever dial a backend with is
-/// the user's own agent, reached through this session's agent channel.
+/// The concrete type is deliberate, and it is a **design** choice rather than a
+/// language limitation. For the record: russh 0.64.1 keeps its `auth` module
+/// private (`mod auth;` in `lib_inner.rs`), so `russh::auth::Signer` is not a
+/// path one can write — but `Signer` itself *is* re-exported publicly as
+/// `russh::Signer` (`pub use auth::{... Signer}`), so a generic
+/// `SG: russh::Signer` bound is expressible and is used elsewhere in this repo
+/// (see the `GarbageSigner` test double in `server/mod.rs`).
+///
+/// We freeze the surface to exactly this one type anyway because red line 4
+/// asks for it: the smallest signing surface is one that cannot be pointed at
+/// anything but the user's own agent, reached through this session's own agent
+/// channel. A generic `Signer` would widen the set of things `connect_agent`
+/// could be handed in a future refactor; this alias makes that a compile error.
 pub type SessionAgentClient = russh::keys::agent::client::AgentClient<AgentChannelStream>;
 
 /// A live backend transport, as returned by [`BackendDialer::connect`] and
@@ -373,6 +381,31 @@ impl client::Handler for BackendClient {
                 Ok(false)
             }
         }
+    }
+
+    /// Red line 2, second layer: never act as the *target* of agent forwarding.
+    ///
+    /// The gateway is the party that *asks* a client for its agent
+    /// (`channel_open_agent`), never the party that accepts one back. russh's
+    /// default implementation of this hook accepts, so "we never request it" is
+    /// the only thing standing between a misbehaving peer and a channel the
+    /// gateway would then have to service. Rejecting explicitly turns the rule
+    /// from a property of our own behaviour into a property of the protocol
+    /// state machine, which is where a defence belongs.
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        tracing::warn!(
+            target: "backend",
+            "refusing an inbound agent-forward channel: the gateway is never an agent forward target"
+        );
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
     }
 }
 

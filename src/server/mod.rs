@@ -945,6 +945,42 @@ impl GatewaySession {
         }
     }
 
+    /// Run the subsystem interceptor and, on a Deny, answer the client with a
+    /// native failure.
+    ///
+    /// Shared by the inline and the agent path so the two cannot drift: a Deny
+    /// has to mean exactly the same thing whichever side of the supervisor the
+    /// request sits on. Today's only interceptor (`SftpAuditInterceptor`)
+    /// returns `Tap`/`Pass`, but the agent path must not become the hole a
+    /// future `Deny` falls through.
+    ///
+    /// Returns `false` when the request was denied *and* the client has already
+    /// been answered; the caller must then return immediately.
+    async fn allow_subsystem(
+        &self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<bool> {
+        // Interceptor hook (default: zero-cost Pass). A Deny short-circuits with a
+        // native failure; never fabricate output (I4).
+        let Some(grant) = self.grant.clone() else {
+            session.channel_failure(channel)?;
+            return Ok(false);
+        };
+        let verdict = self
+            .ctx
+            .interceptor
+            .on_subsystem_request(name, &grant)
+            .await;
+        if let relay::Verdict::Deny(reason) = verdict {
+            tracing::info!(target: "server", %reason, %name, "subsystem request denied by interceptor");
+            session.channel_failure(channel)?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Agent mode (C2): open this session's single channel to a new supervisor
     /// task rather than dialing inline.
     ///
@@ -1684,6 +1720,11 @@ impl server::Handler for GatewaySession {
     ) -> std::result::Result<(), Self::Error> {
         self.record_channel_command(channel, &CommandInfo::Subsystem(name.to_owned()));
         if self.agent.is_some() {
+            // The interceptor runs on both sides of the supervisor (see
+            // `allow_subsystem`), so an agent-mode sftp cannot sidestep a Deny.
+            if !self.allow_subsystem(channel, name, session).await? {
+                return Ok(());
+            }
             self.take_over_by_agent(
                 channel,
                 relay::agent::AgentOp::Subsystem {
@@ -1700,23 +1741,7 @@ impl server::Handler for GatewaySession {
             None => return Ok(()),
         };
 
-        // Interceptor hook (default: zero-cost Pass). A Deny short-circuits with a
-        // native failure; never fabricate output (I4).
-        let grant = match &self.grant {
-            Some(g) => g.clone(),
-            None => {
-                session.channel_failure(channel)?;
-                return Ok(());
-            }
-        };
-        let verdict = self
-            .ctx
-            .interceptor
-            .on_subsystem_request(name, &grant)
-            .await;
-        if let relay::Verdict::Deny(reason) = verdict {
-            tracing::info!(target: "server", %reason, %name, "subsystem request denied by interceptor");
-            session.channel_failure(channel)?;
+        if !self.allow_subsystem(channel, name, session).await? {
             return Ok(());
         }
 
@@ -1738,10 +1763,10 @@ impl server::Handler for GatewaySession {
         variable_value: &str,
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
+        // The agent branch comes *before* the relay lookup, like every other
+        // request handler: an agent session deliberately has no inline relay, so
+        // looking one up first would make this the single handler that silently
+        // drops the client's request instead of handing it to the supervisor.
         if self.agent.is_some() {
             // M1's env allowlist is applied here, before anything reaches the
             // backend, so agent mode cannot be used to smuggle a filtered
@@ -1763,6 +1788,10 @@ impl server::Handler for GatewaySession {
             .await;
             return Ok(());
         }
+        let relay = match self.relays.get(&channel) {
+            Some(r) => r,
+            None => return Ok(()),
+        };
         // M1: pass-through unless an allowlist is configured (propose §3.4).
         let allowed =
             crate::policy::env_allowed(variable_name, &self.ctx.config.relay.env_allowlist);
@@ -1932,10 +1961,16 @@ impl server::Handler for GatewaySession {
     ) -> std::result::Result<(), Self::Error> {
         if let Some(agent) = self.agent.take() {
             if agent.client_id == channel {
-                // The supervisor closes the backend channel itself as soon as
-                // it drains this op (its sender is dropped with `self.agent`).
-                let handle = agent.handle;
-                let _ = handle.enqueue(relay::agent::AgentOp::Close).await;
+                // Best-effort only (red line 8): this callback runs on the
+                // serial event loop, and `enqueue().await` would park it for as
+                // long as the bounded queue stayed full while the backend was
+                // still dialing — the same deadlock shape §3.5.1 exists to
+                // avoid. `try_enqueue` either hands the op over or tells us not
+                // to bother; either way the handle is dropped right here, which
+                // closes the queue and lets the supervisor finish (its dial
+                // guard and the down-pump's completion signal both end it), and
+                // the supervisor closes the backend channel on the way out.
+                let _ = agent.handle.try_enqueue(relay::agent::AgentOp::Close);
                 if let Some(tap) = self.taps.remove(&channel) {
                     tap.flush();
                 }

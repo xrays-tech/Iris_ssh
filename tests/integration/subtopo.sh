@@ -61,6 +61,9 @@ SUBTOP_HOSTKEY="${SUBTOP_HOSTKEY:-$IT_ASSET_DIR/hostkey_ed25519}"
 #   SUBTOP_AGENT_FORWARDING  "true" -> the default resolve rule carries
 #                              policy.agent_forwarding=true, i.e. the control plane
 #                              allows THIS grant to forward its agent.
+#   SUBTOP_ENV_ALLOWLIST     space-separated names -> [relay] env_allowlist, i.e.
+#                              the gateway filters `env` requests (M1). Empty
+#                              means forward every variable.
 SUBTOP_SSHD_HOST_CERT="${SUBTOP_SSHD_HOST_CERT:-}"
 SUBTOP_SSHD_USER_CA="${SUBTOP_SSHD_USER_CA:-}"
 # Authorized-keys override (for cert-only backends where the gateway key must NOT
@@ -74,6 +77,7 @@ SUBTOP_SIGNING_KEY="${SUBTOP_SIGNING_KEY:-}"
 SUBTOP_BACKEND_AUTH="${SUBTOP_BACKEND_AUTH:-}"
 SUBTOP_ALLOW_AGENT_BACKEND_AUTH="${SUBTOP_ALLOW_AGENT_BACKEND_AUTH:-false}"
 SUBTOP_AGENT_FORWARDING="${SUBTOP_AGENT_FORWARDING:-false}"
+SUBTOP_ENV_ALLOWLIST="${SUBTOP_ENV_ALLOWLIST:-}"
 
 # toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
 toml_arr() {
@@ -102,7 +106,11 @@ subtopo_start() {
   ST_SSHD_PORT="$(alloc_port)"; ST_CP_PORT="$(alloc_port)"
   ST_GW_PORT="$(alloc_port)";   ST_MET_PORT="$(alloc_port)"
 
-  printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s\nStrictModes no\nUsePAM no\nMaxSessions 10\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
+  # The agent-env case needs the backend to actually *accept* the variable the
+  # gateway forwards; without an AcceptEnv line sshd drops it and the case would
+  # be testing OpenSSH rather than the gateway. LANG/LC_* restated because sshd
+  # only applies its built-in default while no AcceptEnv directive is present.
+  printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s\nStrictModes no\nUsePAM no\nMaxSessions 10\nAcceptEnv LANG LC_* SSHGW_AGENT_ENV\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
     "$ST_SSHD_PORT" "$SUBTOP_SSHD_HOSTKEY" "$SUBTOP_SSHD_AUTHORIZED_KEYS" "$SUBTOPO_DIR" \
     > "$SUBTOPO_DIR/sshd.cfg"
   # M4: backend presents a host certificate (M4-1) / trusts a user CA (M4-2).
@@ -124,6 +132,9 @@ subtopo_start() {
       "$PRINCIPAL" "$ST_SSHD_PORT" "$BACKEND_USER" "$_pol_extra" > "$SUBTOPO_DIR/rules.json"
   fi
 
+  local _env_al=""
+  [ -n "$SUBTOP_ENV_ALLOWLIST" ] && _env_al="env_allowlist=$(toml_arr "$SUBTOP_ENV_ALLOWLIST")"
+
   local _ba=""
   [ "$SUBTOP_BACKEND_AUTH" = "cert" ] && _ba='backend_auth="cert"
 '
@@ -131,8 +142,8 @@ subtopo_start() {
 '
   [ "$SUBTOP_ALLOW_AGENT_BACKEND_AUTH" = "true" ] && _ba="${_ba}allow_agent_backend_auth=true
 "
-  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n%s[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
-    "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" \
+  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n%s[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
+    "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" "$_env_al" \
     "$IT_ASSET_DIR/backend_ed25519" "$_ba" "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
     "$ST_CP_PORT" "$SUBTOP_CACHE_TTL"     "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
 

@@ -482,6 +482,7 @@ ALL_CASES=(
   case_agent_missing
   case_agent_no_key
   case_agent_target_scope
+  case_agent_env
 )
 
 resolve_case_path() {
