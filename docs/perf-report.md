@@ -106,3 +106,47 @@ BENCH_FILE_MB=32 BENCH_ITERS=3 make bench
 | `uplink_unavoidable_copy` | **~479 ns** | 上行不可避免的 1 次拷贝（`to_vec`+`Bytes::from`），仅作参照，未改动 |
 
 复现：`cargo bench --bench downlink -- --noplot`。此为**每包微基准**，不等价于端到端吞吐（端到端仍受每包 await 串行调度支配，见上文结论）；它只证明下行方向原先每包 ~450ns 级的冗余拷贝已归零。
+
+## 路线一 C3 GO/NO-GO 实测（2026-10-12）——泵解耦无收益，按门禁回退
+
+**变更**：C2 `aed6bf9`（Auditor 内部可变，行为不变）+ C3 `8839f9f`（上行数据面从串行
+Handler 回调迁移到独立任务 `pump_client_to_backend`，与下行泵对称；上行 owned-Bytes
+零拷贝、读前进 russh 有界 channel mpsc）。门禁要求（plan-route1.md §1）：
+**pure-uplink / pure-downlink 相对基线 ≥15% 且 RSS/延迟不回退，否则 revert C3**。
+
+**方法**（比历史「临时脚本」更严格的同方法学 A/B）：`pure_legs.sh`（自包含拓扑同
+`scripts/bench.sh`；64MB、best-of-3、远端/本地字节校验独立非计时通过；计时腿为纯管道
+`ssh GW 'cat >/dev/null' < f`（上行）/ `ssh GW 'cat f' >/dev/null`（下行），两端无磁盘）。
+两个二进制**交替各测 2 轮**（基线 = db05543 重建 release，C3 = 8839f9f release）。
+
+| 腿（经网关） | 基线 db05543 | C3 | 相对 |
+|---|---|---|---|
+| 纯上行 | 49.4 / 49.4 MB/s | 49.6 / 49.2 MB/s | **≈ 0%** |
+| 纯下行 | 52.3 / 53.0 MB/s | 52.0 / 52.1 MB/s | **≈ -1%** |
+| 握手（本脚本方法学） | 2060.8 / 2061.1 ms | 2060.6 / 2060.6 ms | 持平 |
+
+`make bench`（64MB×5，含 scp 三张数字）同轮复核：
+
+| 指标 | 基线 db05543 | C3 |
+|---|---|---|
+| direct scp | 315.4 MB/s | 320.4 MB/s |
+| via-gw scp | 45.7 MB/s | **45.6 MB/s** |
+| via 握手（bench.sh 方法学） | 1166.4 ms | 1163.0 ms |
+
+**RSS/延迟**：`case_backpressure`（上行 200MB 洪泛）与 `case_backpressure_down` 在 C3 下
+PASS（RSS ≤150MB 上界内，无回退）；两方法学的握手延迟均与基线持平。
+
+**判定：NO-GO**（收益 ~0%，远低于 ≥15% 门槛）→ 按门禁执行
+`git revert 8839f9f`（回退单元 = C3 全部；**保留 C2 `aed6bf9` 与 sftp clippy 修复
+`edbf6ae`**）。回退提交见下方 git log。
+
+**结论**：在本机回环、32KB 包 / 1MB 窗口配置下，「串行 handler 内逐包 await」**不是**
+吞吐主因——把上行迁出串行回调并零拷贝化后两条纯腿与 scp 吞吐均无变化（49-53 MB/s
+不变）。瓶颈更可能在 russh 双腿自身的每 chunk 写路径（`reserve_writable_chunk` 逐
+≤32KB 分片 + 每分片一条 mpsc 消息 + 双腿各自加解密），即库内路径而非本仓库的转发调度。
+下一步候选应指向「减少每字节的库内固定成本」（更大 `max_packet` 扫描需重测上限、
+单腿 cipher/CPU 亲和、或架构级 ProxyJump 直通/可信后端裸 TCP，见上文调研），
+而非继续改转发调度形态（0dc281b、8839f9f 两次实证均为 ~0 收益）。
+
+> 备注：本脚本握手绝对值（~2.06s）高于 bench.sh（~1.17s）系脚本差异（计时含一次
+> 认证 backoff 重试窗口），两二进制在两方法学下均完全一致，不影响 A/B 结论。
