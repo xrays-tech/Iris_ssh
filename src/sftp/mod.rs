@@ -398,10 +398,7 @@ impl SftpInspector {
     fn drain_frames(&self, pending: &mut Vec<u8>) -> Vec<DecodedFrame> {
         let mut frames = Vec::new();
         let mut consumed = 0usize;
-        loop {
-            let Some(frame) = pending.get(consumed..) else {
-                break;
-            };
+        while let Some(frame) = pending.get(consumed..) {
             if frame.len() < 4 {
                 break; // not even a length prefix yet
             }
