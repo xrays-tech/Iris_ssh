@@ -51,6 +51,13 @@ ssh-key = { version = "0.7.0-rc.11", features = ["ed25519", "rsa", "std"] }
 # by decoding it — the same path the library itself uses.
 ssh-encoding = "0.3"
 
+# Per-packet micro-bench harness (benches/downlink.rs).
+criterion = "0.5"
+
+[[bench]]
+name = "downlink"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"

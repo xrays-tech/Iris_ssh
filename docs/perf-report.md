@@ -93,3 +93,16 @@ make bench                 # 默认 64MB / 5 次
 BENCH_FILE_MB=32 BENCH_ITERS=3 make bench
 ```
 重跑后更新本表。报告文件随每次 `make bench` 复核更新（若数值显著偏离，注明时间与环境）。
+
+## 证据补充：下行数据路径 micro-bench（2026-10-12，cargo bench）
+
+`benches/downlink.rs`（criterion 0.5，32KB 载荷，本机 Fedora / rustc 1.98，dev profile 无 LTO）：
+
+| 基准 | 中位数 | 说明 |
+|---|---|---|
+| `downlink_no_tap` | **~16.9 ns** | 零拷贝快路径：owned `Bytes` 直接透传（消除旧实现的冗余 `to_vec()`） |
+| `downlink_tap_pass` | **~21.1 ns** | tap 已装但 Pass：仍零拷贝（虚调用 + 判别而已） |
+| `downlink_tap_rewrite` | **~454 ns** | tap 改写路径：tap 内 1 次 `to_vec()`，文档化其成本 |
+| `uplink_unavoidable_copy` | **~479 ns** | 上行不可避免的 1 次拷贝（`to_vec`+`Bytes::from`），仅作参照，未改动 |
+
+复现：`cargo bench --bench downlink -- --noplot`。此为**每包微基准**，不等价于端到端吞吐（端到端仍受每包 await 串行调度支配，见上文结论）；它只证明下行方向原先每包 ~450ns 级的冗余拷贝已归零。

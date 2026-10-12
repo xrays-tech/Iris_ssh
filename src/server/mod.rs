@@ -683,7 +683,10 @@ pub struct GatewaySession {
     auditor: Option<Auditor>,
     signature_algorithm: String,
     backend: Option<russh::client::Handle<BackendClient>>,
-    relays: HashMap<ChannelId, ChannelRelay>,
+    /// Per-channel relay state, `Arc`-shared so the serial handler callbacks can
+    /// take an owned handle with a single map lookup and hold it across their
+    /// awaits without borrowing `self.relays`.
+    relays: HashMap<ChannelId, Arc<ChannelRelay>>,
     /// Per-channel data taps (recording / SFTP inspection), keyed by channel.
     taps: HashMap<ChannelId, Arc<dyn relay::ChannelTap>>,
     entry: Option<Arc<SessionEntry>>,
@@ -1108,14 +1111,14 @@ impl server::Handler for GatewaySession {
                 ));
                 self.relays.insert(
                     client_id,
-                    ChannelRelay::new(
+                    Arc::new(ChannelRelay::new(
                         client_id,
                         backend_write,
                         ReplyRouter::default(),
                         Arc::new(relay::OutboundWindow::uncalibrated()),
                         bytes,
                         self.ctx.metrics.clone(),
-                    ),
+                    )),
                 );
                 self.ctx.metrics.jump_open();
                 reply.accept().await;
@@ -1215,7 +1218,7 @@ impl server::Handler for GatewaySession {
                     bytes,
                     self.ctx.metrics.clone(),
                 );
-                self.relays.insert(client_id, relay);
+                self.relays.insert(client_id, Arc::new(relay));
                 if let Some(tap) = tap {
                     self.taps.insert(client_id, tap);
                 }
@@ -1244,12 +1247,13 @@ impl server::Handler for GatewaySession {
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         let n = data.len();
-        // Snapshot the window handle without holding a borrow of `self.relays`
-        // across the (blocking) acquire below.
-        let window = match self.relays.get(&channel) {
+        // One map lookup per packet: take an owned `Arc` handle (and the metrics
+        // snapshot it carries) so the relay survives the awaits below without
+        // borrowing `self.relays` across them.
+        let relay = match self.relays.get(&channel) {
             Some(r) => {
                 r.note_would_exhaust(n);
-                Arc::clone(&r.window)
+                Arc::clone(r)
             }
             None => return Ok(()),
         };
@@ -1258,7 +1262,7 @@ impl server::Handler for GatewaySession {
             // so this await can never wedge the session's serial event loop on a
             // dead backend. On close, drop the relay and close the client channel
             // natively (I4) — no fabricated output or exit code.
-            if let Err(relay::WindowClosed) = window.acquire(n).await {
+            if let Err(relay::WindowClosed) = relay.window.acquire(n).await {
                 tracing::info!(
                     target: "server",
                     %channel,
@@ -1274,8 +1278,11 @@ impl server::Handler for GatewaySession {
         }
 
         // B2/B3: the channel tap may withhold part of the payload and answer the
-        // client directly (e.g. a synthesized SFTP permission-denied status). The
-        // untapped fast path still forwards the client's buffer with no copy.
+        // client directly (e.g. a synthesized SFTP permission-denied status).
+        // NOTE: russh's handler callback lends `&[u8]`, so the untapped fast path
+        // must make one owned copy (`to_vec` in `apply_uplink_tap`) before the
+        // bytes can cross to the backend. This is the API-constrained minimum;
+        // unlike the downlink path there is no redundant second allocation.
         let Some((payload, inject)) = self.apply_uplink_tap(channel, data) else {
             return Ok(());
         };
@@ -1290,12 +1297,6 @@ impl server::Handler for GatewaySession {
             }
         }
 
-        // The relay is still present: the serial handler cannot have been
-        // re-entered during our await, and nothing else removes relays.
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
         relay.bytes.add_up(n);
         let owned = Bytes::from(payload);
         if let Err(e) = relay.backend.data_bytes(owned).await {

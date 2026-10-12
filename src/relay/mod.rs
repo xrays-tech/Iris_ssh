@@ -459,36 +459,28 @@ pub async fn pump_backend_to_client(
             ChannelMsg::Data { data } => {
                 // B2/B3: a downlink tap may withhold or rewrite the payload
                 // (e.g. an SFTP denial response injected back to the client).
-                let (payload, inject) = apply_tap_down(tap.as_ref(), &data, client_id);
+                // The owned `Bytes` russh handed us is forwarded as-is whenever
+                // the tap passes it through (zero-copy).
+                let (payload, inject) = apply_tap_down(tap.as_ref(), data, client_id);
                 let n = payload.len();
-                if !inject.is_empty() && up.data(client_id, Bytes::from(inject)).await.is_err() {
+                if !inject.is_empty() && up.data(client_id, inject).await.is_err() {
                     stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
-                if !payload.is_empty() && up.data(client_id, Bytes::from(payload)).await.is_err() {
+                if !payload.is_empty() && up.data(client_id, payload).await.is_err() {
                     stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
                 bytes.add_down(n);
             }
             ChannelMsg::ExtendedData { data, ext } => {
-                let (payload, inject) = apply_tap_down(tap.as_ref(), &data, client_id);
+                let (payload, inject) = apply_tap_down(tap.as_ref(), data, client_id);
                 let n = payload.len();
-                if !inject.is_empty()
-                    && up
-                        .extended_data(client_id, ext, Bytes::from(inject))
-                        .await
-                        .is_err()
-                {
+                if !inject.is_empty() && up.extended_data(client_id, ext, inject).await.is_err() {
                     stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
-                if !payload.is_empty()
-                    && up
-                        .extended_data(client_id, ext, Bytes::from(payload))
-                        .await
-                        .is_err()
-                {
+                if !payload.is_empty() && up.extended_data(client_id, ext, payload).await.is_err() {
                     stop_reason = StopReason::ClientWriteFailed;
                     break;
                 }
@@ -569,17 +561,22 @@ pub async fn pump_backend_to_client(
 
 /// Run a downlink buffer through the channel tap, returning `(forward, inject)`.
 ///
-/// `None` tap (the default) returns the payload untouched with no allocation.
-fn apply_tap_down(
+/// When there is no tap (the default) or the tap verdicts `Pass`, the original
+/// owned `Bytes` is forwarded unchanged with zero allocation or copy. Only a
+/// `Rewrite` verdict allocates (the tap already owns its `Vec<u8>` payloads).
+///
+/// Takes the owned `Bytes` russh's down-pump already holds, so the untapped
+/// fast path crosses to the client leg without a second buffer.
+pub fn apply_tap_down(
     tap: Option<&Arc<dyn ChannelTap>>,
-    data: &[u8],
+    data: Bytes,
     client_id: ChannelId,
-) -> (Vec<u8>, Vec<u8>) {
+) -> (Bytes, Bytes) {
     let Some(tap) = tap else {
-        return (data.to_vec(), Vec::new());
+        return (data, Bytes::new()); // zero-copy: forward the owned buffer as-is
     };
-    match tap.on_data(Direction::Down, data) {
-        DataVerdict::Pass => (data.to_vec(), Vec::new()),
+    match tap.on_data(Direction::Down, &data) {
+        DataVerdict::Pass => (data, Bytes::new()),
         DataVerdict::Rewrite {
             forward,
             inject,
@@ -588,7 +585,7 @@ fn apply_tap_down(
             if let Some(reason) = denied {
                 tracing::info!(target: "relay", ?client_id, %reason, "downlink data withheld by tap");
             }
-            (forward, inject)
+            (Bytes::from(forward), Bytes::from(inject))
         }
     }
 }
