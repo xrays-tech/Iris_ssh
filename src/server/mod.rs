@@ -9,8 +9,12 @@
 //!   verified the signature and makes the authoritative accept/reject (D3/D4);
 //! * **channel_open_session** — lazily dials the backend and, on failure,
 //!   answers `CHANNEL_OPEN_FAILURE`/`ConnectFailed` (I4);
-//! * **request + data callbacks** — forward strictly in-arrival-order inside the
-//!   callback (I1) via [`crate::relay`];
+//! * **data plane** — the channel is split into a read half consumed by the
+//!   detached [`crate::relay::pump_client_to_backend`] task (client → backend,
+//!   strict FIFO on the channel's ordered stream, I1) and a down-pump for the
+//!   reverse direction; the serial handler callbacks no longer forward.
+//! * **requests** — `agent`/`x11` are refused locally (D6); every other client
+//!   request is forwarded by the up-pump;
 //! * **drain** — a `SIGTERM` flips readiness, injects a stderr warning into
 //!   interactive/exec channels (never sftp, D10) and sends a protocol-level
 //!   `SSH_MSG_DISCONNECT[BY_APPLICATION]` goodbye.
@@ -27,7 +31,7 @@ use bytes::Bytes;
 use russh::server::{self, Auth, Config as ServerConfig, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Pty};
 
-use crate::audit::{Auditor, CommandInfo};
+use crate::audit::Auditor;
 use crate::backend::{BackendClient, BackendDialer, CredentialStore};
 use crate::config::GatewayConfig;
 use crate::error::{BackendError, Error, Result};
@@ -701,36 +705,6 @@ impl GatewaySession {
         Auth::reject()
     }
 
-    /// Run an uplink buffer through the channel's tap (B2/B3).
-    ///
-    /// Returns `None` when nothing is forwarded, otherwise the permitted bytes
-    /// together with any bytes that must be pushed back to the client on the
-    /// **channel data stream** — a synthesized SFTP failure has to travel the same
-    /// stream the client's request arrived on, or the client waits forever for a
-    /// reply that never comes.
-    fn apply_uplink_tap(&mut self, channel: ChannelId, data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-        let Some(tap) = self.taps.get(&channel).cloned() else {
-            return Some((data.to_vec(), Vec::new()));
-        };
-        match tap.on_data(relay::Direction::Up, data) {
-            relay::DataVerdict::Pass => Some((data.to_vec(), Vec::new())),
-            relay::DataVerdict::Rewrite {
-                forward,
-                inject,
-                denied,
-            } => {
-                if let Some(reason) = denied {
-                    tracing::info!(target: "relay", %channel, %reason, "uplink request withheld by tap");
-                }
-                if forward.is_empty() && inject.is_empty() {
-                    None
-                } else {
-                    Some((forward, inject))
-                }
-            }
-        }
-    }
-
     /// Register this session in the shared registry (called once we hold a real
     /// session handle). Idempotent.
     fn register(&mut self, handle: server::Handle) {
@@ -854,27 +828,6 @@ impl GatewaySession {
             Ok(ch) => Ok(Some(ch.split())),
             Err(_) => Ok(None),
         }
-    }
-
-    /// Record the audit subject for this channel's first command (first wins).
-    fn record_channel_command(&self, _id: ChannelId, info: &CommandInfo) {
-        if let Some(auditor) = &self.auditor {
-            auditor.set_command(info.clone());
-        }
-    }
-}
-
-/// Await the backend reply receiver and answer the client with the protocol
-/// native SUCCESS/FAILURE (russh suppresses the reply if the client did not ask
-/// for one). A dropped/errored receiver is treated as FAILURE (I4).
-async fn deliver_reply(
-    session: &mut Session,
-    channel: ChannelId,
-    receiver: &mut tokio::sync::oneshot::Receiver<bool>,
-) -> Result<()> {
-    match tokio::time::timeout(Duration::from_secs(10), &mut *receiver).await {
-        Ok(Ok(true)) => session.channel_success(channel).map_err(Error::Ssh),
-        _ => session.channel_failure(channel).map_err(Error::Ssh),
     }
 }
 
@@ -1020,13 +973,13 @@ impl server::Handler for GatewaySession {
     #[allow(clippy::too_many_arguments)]
     async fn channel_open_direct_tcpip(
         &mut self,
-        _channel: Channel<server::Msg>,
+        channel: Channel<server::Msg>,
         host_to_connect: &str,
         port_to_connect: u32,
         originator_address: &str,
         _originator_port: u32,
         reply: server::ChannelOpenHandle,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         let target = crate::jump::JumpTarget {
             host: host_to_connect.to_owned(),
@@ -1092,35 +1045,48 @@ impl server::Handler for GatewaySession {
         };
         match opened {
             Some(channel_half) => {
-                let client_id = _channel.id();
+                let client_id = channel.id();
+                let (client_read, _client_write) = channel.split();
                 let (backend_read, backend_write) = channel_half.split();
                 let bytes = self
                     .auditor
                     .as_ref()
                     .map(|a| a.byte_counters())
                     .unwrap_or_default();
-                let up = _session.handle();
+                let up = session.handle();
+                let router = ReplyRouter::default();
+                let window = Arc::new(relay::OutboundWindow::uncalibrated());
                 tokio::spawn(relay::pump_backend_to_client(
                     backend_read,
-                    up,
+                    up.clone(),
                     client_id,
-                    ReplyRouter::default(),
-                    Arc::new(relay::OutboundWindow::uncalibrated()),
+                    router.clone(),
+                    Arc::clone(&window),
                     Arc::clone(&bytes),
                     self.ctx.metrics.clone(),
                     None,
                 ));
-                self.relays.insert(
-                    client_id,
-                    Arc::new(ChannelRelay::new(
+                // Uplink pump (route 1 C3): raw forward traffic, no requests.
+                tokio::spawn(relay::pump_client_to_backend(
+                    client_read,
+                    relay::RelayUpstream {
                         client_id,
-                        backend_write,
-                        ReplyRouter::default(),
-                        Arc::new(relay::OutboundWindow::uncalibrated()),
-                        bytes,
-                        self.ctx.metrics.clone(),
-                    )),
-                );
+                        backend: backend_write,
+                        up,
+                        router,
+                        window,
+                        bytes: Arc::clone(&bytes),
+                        metrics: self.ctx.metrics.clone(),
+                        tap: None,
+                        config: Arc::clone(&self.ctx.config),
+                        interceptor: Arc::clone(&self.ctx.interceptor),
+                        grant: Some(grant),
+                        entry: self.entry.clone(),
+                        auditor: self.auditor.clone(),
+                    },
+                ));
+                self.relays
+                    .insert(client_id, Arc::new(ChannelRelay::new(client_id, bytes)));
                 self.ctx.metrics.jump_open();
                 reply.accept().await;
             }
@@ -1176,6 +1142,10 @@ impl server::Handler for GatewaySession {
         match self.open_backend_channel().await {
             Ok(Some((backend_read, backend_write))) => {
                 let client_id = channel.id();
+                // Route 1 C3: split the client channel; the read half is owned
+                // by the up-pump (client → backend), which forwards strictly in
+                // arrival order and yields owned `Bytes` to the backend writer.
+                let (client_read, _client_write) = channel.split();
                 let router = ReplyRouter::default();
                 let window = Arc::new(relay::OutboundWindow::uncalibrated());
                 let bytes = self
@@ -1202,7 +1172,7 @@ impl server::Handler for GatewaySession {
                 let tap = self.ctx.interceptor.observe(&tap_ctx);
                 tokio::spawn(relay::pump_backend_to_client(
                     backend_read,
-                    up,
+                    up.clone(),
                     client_id,
                     router.clone(),
                     Arc::clone(&window),
@@ -1210,16 +1180,27 @@ impl server::Handler for GatewaySession {
                     self.ctx.metrics.clone(),
                     tap.clone(),
                 ));
+                tokio::spawn(relay::pump_client_to_backend(
+                    client_read,
+                    relay::RelayUpstream {
+                        client_id,
+                        backend: backend_write,
+                        up,
+                        router,
+                        window,
+                        bytes: Arc::clone(&bytes),
+                        metrics: self.ctx.metrics.clone(),
+                        tap: tap.clone(),
+                        config: Arc::clone(&self.ctx.config),
+                        interceptor: Arc::clone(&self.ctx.interceptor),
+                        grant: Some(grant),
+                        entry: self.entry.clone(),
+                        auditor: self.auditor.clone(),
+                    },
+                ));
 
-                let relay = ChannelRelay::new(
-                    client_id,
-                    backend_write,
-                    router,
-                    window,
-                    bytes,
-                    self.ctx.metrics.clone(),
-                );
-                self.relays.insert(client_id, Arc::new(relay));
+                self.relays
+                    .insert(client_id, Arc::new(ChannelRelay::new(client_id, bytes)));
                 if let Some(tap) = tap {
                     self.taps.insert(client_id, tap);
                 }
@@ -1234,289 +1215,124 @@ impl server::Handler for GatewaySession {
         Ok(())
     }
 
-    /// Uplink channel data (client → backend).
+    /// Uplink channel data (client → backend) — **forwarded by the up-pump**.
     ///
-    /// This is the one uplink path that goes through the [`relay::OutboundWindow`]
-    /// fuse: it carries the bulk traffic (scp/rsync/sftp transfers, `cat`, …), so
-    /// it is where an unbounded gateway buffer would actually grow. The guard is
-    /// skipped entirely when `relay.outbound_guard` is false, in which case
-    /// russh's own channel window is the sole bound.
+    /// Route 1 C3: the detached [`relay::pump_client_to_backend`] task owns the
+    /// channel read half and does the actual forwarding (window fuse, tap,
+    /// zero-copy write). This serial callback is deliberately a no-op so that
+    /// nothing is forwarded twice and the session's read loop is free to run
+    /// ahead into russh's bounded per-channel buffer.
     async fn data(
         &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut Session,
+        _channel: ChannelId,
+        _data: &[u8],
+        _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        let n = data.len();
-        // One map lookup per packet: take an owned `Arc` handle (and the metrics
-        // snapshot it carries) so the relay survives the awaits below without
-        // borrowing `self.relays` across them.
-        let relay = match self.relays.get(&channel) {
-            Some(r) => {
-                r.note_would_exhaust(n);
-                Arc::clone(r)
-            }
-            None => return Ok(()),
-        };
-        if self.ctx.config.relay.outbound_guard {
-            // P0-2: the down-pump closes the window the instant the backend dies,
-            // so this await can never wedge the session's serial event loop on a
-            // dead backend. On close, drop the relay and close the client channel
-            // natively (I4) — no fabricated output or exit code.
-            if let Err(relay::WindowClosed) = relay.window.acquire(n).await {
-                tracing::info!(
-                    target: "server",
-                    %channel,
-                    "uplink window closed (backend gone); dropping relay and closing channel"
-                );
-                self.relays.remove(&channel);
-                if let Some(entry) = &self.entry {
-                    entry.forget_channel(channel);
-                }
-                session.close(channel).map_err(Error::Ssh)?;
-                return Ok(());
-            }
-        }
-
-        // B2/B3: the channel tap may withhold part of the payload and answer the
-        // client directly (e.g. a synthesized SFTP permission-denied status).
-        // NOTE: russh's handler callback lends `&[u8]`, so the untapped fast path
-        // must make one owned copy (`to_vec` in `apply_uplink_tap`) before the
-        // bytes can cross to the backend. This is the API-constrained minimum;
-        // unlike the downlink path there is no redundant second allocation.
-        let Some((payload, inject)) = self.apply_uplink_tap(channel, data) else {
-            return Ok(());
-        };
-        let n = payload.len();
-        // The refusal answer goes on the same channel-data stream the request
-        // arrived on; writing it to stderr instead would strand the client.
-        if !inject.is_empty() {
-            // `Session::data` is synchronous (it enqueues onto the session's own
-            // send channel), unlike `Handle::data` used from detached tasks.
-            if let Err(e) = session.data(channel, Bytes::from(inject)) {
-                tracing::debug!(target: "relay", ?channel, ?e, "could not deliver tap response to client");
-            }
-        }
-
-        relay.bytes.add_up(n);
-        let owned = Bytes::from(payload);
-        if let Err(e) = relay.backend.data_bytes(owned).await {
-            tracing::debug!(target: "relay", ?channel, ?e, "uplink forward failed");
-        }
         Ok(())
     }
 
-    /// Uplink extended data (client → backend, non-zero `ext` codes — e.g. stderr
-    /// data, debug output).
+    /// Uplink extended data (client → backend, non-zero `ext` codes — e.g.
+    /// stderr) — forwarded by the up-pump, like [`data`](Self::data).
     ///
-    /// **Deliberately not routed through the [`relay::OutboundWindow`] fuse**,
-    /// unlike [`data`](Self::data). The fuse exists to bound *bulk* uplink
-    /// buffering, and extended-data streams are small, infrequent, and bounded per
-    /// channel by russh's own send window on the backend leg (which
-    /// `ChannelWriteHalf::extended_data_bytes` respects exactly as `data_bytes`
-    /// does). Charging them against a window calibrated for bulk `data` would risk
-    /// a small stderr burst starving real payload. The byte *tally* is still
-    /// recorded so the audit record's `bytes_up` stays complete.
-    ///
-    /// Deviation note: propose.md §3.6 describes the fuse generically; this is the
-    /// one uplink path intentionally left to russh's window as the backstop.
+    /// Still **not** routed through the [`relay::OutboundWindow`] fuse (same
+    /// deviation as before: the fuse bounds *bulk* uplink buffering, while
+    /// extended-data streams are small, infrequent and bounded by russh's own
+    /// backend-leg send window; the byte *tally* still feeds the audit record).
     async fn extended_data(
         &mut self,
-        channel: ChannelId,
-        ext: u32,
-        data: &[u8],
+        _channel: ChannelId,
+        _ext: u32,
+        _data: &[u8],
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        let n = data.len();
-        relay.bytes.add_up(n);
-        let owned = Bytes::copy_from_slice(data);
-        if let Err(e) = relay.backend.extended_data_bytes(ext, owned).await {
-            tracing::debug!(target: "relay", ?channel, ?e, "uplink ext-data forward failed");
-        }
         Ok(())
     }
 
+    /// `pty-req` is forwarded by the up-pump (I1/I2); nothing to do here.
     async fn pty_request(
         &mut self,
-        channel: ChannelId,
-        term: &str,
-        col_width: u32,
-        row_height: u32,
-        pix_width: u32,
-        pix_height: u32,
-        modes: &[(Pty, u32)],
-        session: &mut Session,
+        _channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        let mut rx = relay.router.push(true);
-        relay
-            .backend
-            .request_pty(
-                true, term, col_width, row_height, pix_width, pix_height, modes,
-            )
-            .await?;
-        if let Some(rx) = rx.as_mut() {
-            deliver_reply(session, channel, rx).await?;
-        }
         Ok(())
     }
 
+    /// `shell` is forwarded by the up-pump (I1/I2); nothing to do here.
     async fn shell_request(
         &mut self,
-        channel: ChannelId,
-        session: &mut Session,
+        _channel: ChannelId,
+        _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        if let Some(entry) = &self.entry {
-            entry.set_channel_class(channel, crate::audit::CommandClass::Interactive);
-        }
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        let mut rx = relay.router.push(true);
-        relay.backend.request_shell(true).await?;
-        if let Some(rx) = rx.as_mut() {
-            deliver_reply(session, channel, rx).await?;
-        }
         Ok(())
     }
 
+    /// `exec` is forwarded by the up-pump, which also records the command's
+    /// classification and audit subject (I1/I2/I3); nothing to do here.
     async fn exec_request(
         &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut Session,
+        _channel: ChannelId,
+        _data: &[u8],
+        _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        let cmd = String::from_utf8_lossy(data).into_owned();
-        let class = crate::audit::classify_exec_bytes(data);
-        if let Some(entry) = &self.entry {
-            entry.set_channel_class(channel, class);
-        }
-        self.record_channel_command(channel, &CommandInfo::Exec(cmd));
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        let rx = relay::forward_exec(relay, true, data)
-            .await
-            .map_err(|reason| Error::Backend(BackendError::Send { reason }))?;
-        if let Some(mut rx) = rx {
-            deliver_reply(session, channel, &mut rx).await?;
-        }
         Ok(())
     }
 
+    /// `subsystem` is forwarded by the up-pump, which consults the interceptor
+    /// and answers a local denial with a native channel failure (I4);
+    /// nothing to do here.
     async fn subsystem_request(
         &mut self,
-        channel: ChannelId,
-        name: &str,
-        session: &mut Session,
+        _channel: ChannelId,
+        _name: &str,
+        _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        self.record_channel_command(channel, &CommandInfo::Subsystem(name.to_owned()));
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-
-        // Interceptor hook (default: zero-cost Pass). A Deny short-circuits with a
-        // native failure; never fabricate output (I4).
-        let grant = match &self.grant {
-            Some(g) => g.clone(),
-            None => {
-                session.channel_failure(channel)?;
-                return Ok(());
-            }
-        };
-        let verdict = self
-            .ctx
-            .interceptor
-            .on_subsystem_request(name, &grant)
-            .await;
-        if let relay::Verdict::Deny(reason) = verdict {
-            tracing::info!(target: "server", %reason, %name, "subsystem request denied by interceptor");
-            session.channel_failure(channel)?;
-            return Ok(());
-        }
-
-        if let Some(entry) = &self.entry {
-            entry.set_channel_class(channel, CommandInfo::Subsystem(name.to_owned()).classify());
-        }
-        let mut rx = relay.router.push(true);
-        relay.backend.request_subsystem(true, name).await?;
-        if let Some(rx) = rx.as_mut() {
-            deliver_reply(session, channel, rx).await?;
-        }
         Ok(())
     }
 
+    /// `env` is filtered + forwarded by the up-pump (allowlist, §3.4).
     async fn env_request(
         &mut self,
-        channel: ChannelId,
-        variable_name: &str,
-        variable_value: &str,
-        session: &mut Session,
+        _channel: ChannelId,
+        _variable_name: &str,
+        _variable_value: &str,
+        _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        let relay = match self.relays.get(&channel) {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        // M1: pass-through unless an allowlist is configured (propose §3.4).
-        let allowed =
-            crate::policy::env_allowed(variable_name, &self.ctx.config.relay.env_allowlist);
-        if matches!(allowed, crate::policy::ForwardDecision::DenyLocally { .. }) {
-            // Destined for a filtered-out env: drop silently (client never wanted a
-            // reply for env, typically).
-            return Ok(());
-        }
-        let mut rx = relay.router.push(true);
-        relay
-            .backend
-            .set_env(true, variable_name, variable_value)
-            .await?;
-        if let Some(rx) = rx.as_mut() {
-            deliver_reply(session, channel, rx).await?;
-        }
         Ok(())
     }
 
+    /// `window-change` is forwarded by the up-pump (no reply per RFC 4254).
     async fn window_change_request(
         &mut self,
-        channel: ChannelId,
-        col_width: u32,
-        row_height: u32,
-        pix_width: u32,
-        pix_height: u32,
+        _channel: ChannelId,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        if let Some(relay) = self.relays.get(&channel) {
-            relay
-                .backend
-                .window_change(col_width, row_height, pix_width, pix_height)
-                .await?;
-        }
         Ok(())
     }
 
+    /// `signal` is forwarded by the up-pump (no reply per RFC 4254).
     async fn signal(
         &mut self,
-        channel: ChannelId,
-        signal: russh::Sig,
+        _channel: ChannelId,
+        _signal: russh::Sig,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        if let Some(relay) = self.relays.get(&channel) {
-            relay.backend.signal(signal).await?;
-        }
         Ok(())
     }
 
     /// agent-forwarding default-deny (D6): locally refuse, don't forward.
+    ///
+    /// Stays on the serial handler (the up-pump never forwards this request):
+    /// russh turns the `false` return into the single native channel failure.
     async fn agent_request(
         &mut self,
         channel: ChannelId,
@@ -1527,6 +1343,8 @@ impl server::Handler for GatewaySession {
     }
 
     /// X11 forwarding unsupported (D6): deny locally.
+    ///
+    /// Stays on the serial handler (the up-pump never forwards this request).
     async fn x11_request(
         &mut self,
         channel: ChannelId,
@@ -1540,29 +1358,28 @@ impl server::Handler for GatewaySession {
         Ok(())
     }
 
+    /// Client EOF is forwarded to the backend by the up-pump.
     async fn channel_eof(
         &mut self,
-        channel: ChannelId,
+        _channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        if let Some(relay) = self.relays.get(&channel) {
-            relay.backend.eof().await?;
-        }
         Ok(())
     }
 
+    /// Channel teardown bookkeeping only.
+    ///
+    /// The up-pump already forwarded `backend.close()` (§3.5 coupled close) and
+    /// the down-pump owns the tap's flush (B2), so this callback must do
+    /// neither — otherwise the backend would see a second close and the
+    /// recording would flush twice.
     async fn channel_close(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        if let Some(relay) = self.relays.remove(&channel) {
-            relay.backend.close().await?;
-        }
-        if let Some(tap) = self.taps.remove(&channel) {
-            // Deterministic flush/close of any recording for this channel (B2).
-            tap.flush();
-        }
+        self.relays.remove(&channel);
+        self.taps.remove(&channel);
         if let Some(entry) = &self.entry {
             entry.forget_channel(channel);
         }

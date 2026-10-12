@@ -2,13 +2,16 @@
 //!
 //! ## Invariants preserved here
 //!
-//! * **I1 (ordering)**: the server handler awaits each client→backend forward
-//!   *inside* the per-packet callback. Because russh invokes those callbacks
-//!   serially in arrival order, awaiting inside the callback is exactly the
-//!   strict FIFO the design demands — no spawning, no aggregation.
+//! * **I1 (ordering)**: one detached pump per direction owns one leg's read
+//!   half. [`pump_client_to_backend`](uplink::pump_client_to_backend) consumes
+//!   the client channel's ordered stream (data + requests + eof + close share
+//!   one cursor) and awaits each forward *before* consuming the next message.
+//!   A single pump on a single ordered stream is strict FIFO by construction —
+//!   no spawning, no aggregation.
 //! * **I2 (want_reply)**: the `want_reply` flag is passed through verbatim;
 //!   backend SUCCESS/FAILURE replies are routed back to the originating
-//!   callback in FIFO order via [`ReplyRouter`].
+//!   request in FIFO order via [`ReplyRouter`], and the up-pump answers the
+//!   client with the protocol-native primitives.
 //! * **I3 (execution requests)**: emitting a `shell`/`exec`/`subsystem` is the
 //!   last thing forwarded; afterwards only data/eof/signal/exit/close flow. The
 //!   relay never injects a request of its own.
@@ -21,23 +24,28 @@
 //! (`ChannelWriteHalf::data_bytes` blocks when the send window is exhausted).
 //! [`OutboundWindow`] is the defense-in-depth fuse the design mandates
 //! (§3.6 / D5) — it mirrors the backend's advertised send window with a
-//! `tokio::sync::Semaphore` and blocks the `data` callback *before* bytes enter
-//! the pipeline, so gateway memory stays bounded even if the library's internal
+//! `tokio::sync::Semaphore` and blocks the up-pump *before* bytes enter the
+//! pipeline, so gateway memory stays bounded even if the library's internal
 //! buffering behaviour changes. Because a semaphore is a *fair, wake-free-by-
 //! construction* primitive — `add_permits`/`acquire` hand the waiter its permit
 //! atomically rather than relying on a `Notified` that is only registered on
 //! first poll — the "wake-up lost in the lock-release → first-poll window" race
 //! that plagued a hand-rolled `Mutex + Notify` fuse cannot happen here.
 //!
+//! Read-ahead beyond the window is bounded by russh's per-channel mpsc
+//! (`channel_buffer_size` messages × `max_packet` bytes): the session read loop
+//! parks on the channel sender once the pump falls behind, which propagates
+//! back-pressure onto the client socket. The pump adds no buffer of its own.
+//!
 //! ## Liveness coupling (§3.5 / P0-2)
 //!
 //! The down-pump owns the *only* reader of the backend channel. When it ends
 //! (backend died, `Close`, or the client leg broke) it calls
 //! [`OutboundWindow::close`], which wakes every blocked `acquire` with an error
-//! so the server's serial `data` callback can never wedge the whole session on
-//! a dead backend. On an *abnormal* backend death the pump additionally sends
-//! the client a protocol-level `SSH_MSG_DISCONNECT[BY_APPLICATION]` goodbye
-//! (§3.8 destroy semantics) instead of a silent TCP reset.
+//! so the up-pump can never wedge a channel on a dead backend. On an *abnormal*
+//! backend death the pump additionally sends the client a protocol-level
+//! `SSH_MSG_DISCONNECT[BY_APPLICATION]` goodbye (§3.8 destroy semantics)
+//! instead of a silent TCP reset.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +57,9 @@ use tokio::sync::{oneshot, Semaphore};
 
 use russh::client::Msg as ClientMsg;
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+
+pub mod uplink;
+pub use uplink::{pump_client_to_backend, RelayUpstream};
 
 /// Re-exported so callers can name the type without depending on `russh`'s path.
 pub use russh::ChannelId;
@@ -157,6 +168,44 @@ impl OutboundWindow {
     /// Whether a send of `n` bytes would currently exceed the available window.
     pub fn would_exhaust(&self, n: usize) -> bool {
         (n as u64) > self.sem.available_permits() as u64
+    }
+
+    /// Try to take `n` permits **without ever yielding** to the executor: the
+    /// fast path the up-pump runs for every packet.
+    ///
+    /// Returns `Ok(true)` when the permits were taken immediately (they are
+    /// consumed exactly as [`acquire`](Self::acquire) consumes them),
+    /// `Ok(false)` when the window has no room for `n` bytes — the caller
+    /// should fall back to the blocking `acquire` — and
+    /// `Err(WindowClosed)` once the window is closed.
+    ///
+    /// The slow path is *equivalent* to a blocking `acquire`: `Ok(false)` is
+    /// returned precisely when [`would_exhaust`](Self::would_exhaust) is true,
+    /// and a failed try consumes nothing.
+    pub fn try_acquire(&self, n: usize) -> Result<bool, WindowClosed> {
+        // Early exit: a closed window rejects immediately (no permit churn).
+        if self.is_closed() {
+            return Err(WindowClosed);
+        }
+        // An empty send needs no budget.
+        if n == 0 {
+            return Ok(true);
+        }
+        match self.sem.try_acquire_many(n as u32) {
+            // Consume the permits permanently (same contract as `acquire`).
+            Ok(permit) => {
+                permit.forget();
+                if self.is_closed() {
+                    return Err(WindowClosed);
+                }
+                Ok(true)
+            }
+            // Not enough room right now: nothing was taken, fall back to the
+            // blocking path (the caller records `window_exhausted` there).
+            Err(tokio::sync::TryAcquireError::NoPermits) => Ok(false),
+            // The semaphore was closed while we held no lock on it.
+            Err(tokio::sync::TryAcquireError::Closed) => Err(WindowClosed),
+        }
     }
 
     /// Block until at least `n` permits are available, then consume them.
@@ -333,47 +382,23 @@ impl SubsystemInterceptor for PassThroughInterceptor {
     }
 }
 
-/// All per-channel relay state shared between the request path (handler
-/// callbacks) and the down-pump.
+/// Per-channel bookkeeping kept in the session's relay map.
+///
+/// Since route 1 (C3) the actual forwarding state lives in the pump tasks
+/// ([`RelayUpstream`] for client→backend, the arguments of
+/// [`pump_backend_to_client`] for the reverse): the handler callbacks only need
+/// a counting/cleanup handle (the per-connection channel cap counts entries in
+/// the map, and `channel_close` forgets them).
 pub struct ChannelRelay {
     /// Client-side channel id (the map key).
     pub client_id: ChannelId,
-    /// Writable half of the backend channel (client → backend).
-    pub backend: BackendWriter,
-    /// FIFO router for want_reply replies (I2).
-    pub router: ReplyRouter,
-    /// Uplink window fuse (§3.6).
-    pub window: std::sync::Arc<OutboundWindow>,
     /// Shared up/down byte counters (fed to the audit record).
     pub bytes: std::sync::Arc<ByteCounters>,
-    metrics: Metrics,
 }
 
 impl ChannelRelay {
-    pub fn new(
-        client_id: ChannelId,
-        backend: BackendWriter,
-        router: ReplyRouter,
-        window: std::sync::Arc<OutboundWindow>,
-        bytes: std::sync::Arc<ByteCounters>,
-        metrics: Metrics,
-    ) -> Self {
-        ChannelRelay {
-            client_id,
-            backend,
-            router,
-            window,
-            bytes,
-            metrics,
-        }
-    }
-
-    /// Whether the fuse is currently exhausted for `n` bytes (records the
-    /// `window_exhausted_total` metric as a side-channel signal).
-    pub fn note_would_exhaust(&self, n: usize) {
-        if self.window.would_exhaust(n) {
-            self.metrics.window_exhausted();
-        }
+    pub fn new(client_id: ChannelId, bytes: std::sync::Arc<ByteCounters>) -> Self {
+        ChannelRelay { client_id, bytes }
     }
 }
 
@@ -590,20 +615,34 @@ pub fn apply_tap_down(
     }
 }
 
-/// Forward an `exec` request (raw command bytes), enqueuing the reply slot
-/// *before* the send (I2). Returns the receiver the request-path driver awaits.
-pub async fn forward_exec(
-    relay: &ChannelRelay,
-    want_reply: bool,
-    command: &[u8],
-) -> Result<Option<oneshot::Receiver<bool>>, String> {
-    let rx = relay.router.push(want_reply);
-    relay
-        .backend
-        .exec(want_reply, command.to_vec())
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(rx)
+/// Run an uplink buffer through the channel tap, returning `(forward, inject)`.
+///
+/// Symmetric to [`apply_tap_down`]: with no tap (the default) or a `Pass`
+/// verdict, the owned `Bytes` russh handed the up-pump is forwarded unchanged
+/// with zero allocation or copy — which is exactly what removes the old
+/// `&[u8] -> to_vec()` copy from the uplink hot path (route 1). Only a
+/// `Rewrite` verdict allocates (the tap already owns its `Vec<u8>` payloads).
+pub fn apply_tap_up(
+    tap: Option<&Arc<dyn ChannelTap>>,
+    data: Bytes,
+    client_id: ChannelId,
+) -> (Bytes, Bytes) {
+    let Some(tap) = tap else {
+        return (data, Bytes::new()); // zero-copy: forward the owned buffer as-is
+    };
+    match tap.on_data(Direction::Up, &data) {
+        DataVerdict::Pass => (data, Bytes::new()),
+        DataVerdict::Rewrite {
+            forward,
+            inject,
+            denied,
+        } => {
+            if let Some(reason) = denied {
+                tracing::info!(target: "relay", ?client_id, %reason, "uplink request withheld by tap");
+            }
+            (Bytes::from(forward), Bytes::from(inject))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +725,54 @@ mod tests {
         // An uncalibrated window must not block a large send.
         w.acquire(1_000_000).await.expect("uncalibrated acquire");
         assert!(!w.would_exhaust(10));
+    }
+
+    #[tokio::test]
+    async fn try_acquire_fast_path_is_equivalent_to_the_slow_path() {
+        let w = OutboundWindow::uncalibrated();
+        w.note_window(10);
+
+        // Whenever the fuse has room, the fast path takes the same budget the
+        // blocking path would have taken — and consumes it identically.
+        assert_eq!(w.try_acquire(6), Ok(true));
+        assert_eq!(w.try_acquire(4), Ok(true));
+        assert!(
+            w.would_exhaust(1),
+            "the two fast takes must have drained the window exactly"
+        );
+
+        // Whenever the fuse is exhausted, the fast path declines *without
+        // consuming anything* (the exact condition under which the blocking
+        // path would park).
+        for n in [1usize, 5, 99] {
+            assert!(w.would_exhaust(n));
+            assert_eq!(w.try_acquire(n), Ok(false));
+            assert!(w.would_exhaust(n), "a failed try must consume nothing");
+        }
+
+        // The slow path still works after the misses, and the two paths agree
+        // again once room returns.
+        w.note_window(5);
+        assert_eq!(w.try_acquire(6), Ok(false));
+        assert_eq!(w.try_acquire(5), Ok(true));
+    }
+
+    #[tokio::test]
+    async fn try_acquire_reports_a_closed_window() {
+        let w = OutboundWindow::uncalibrated();
+        w.close();
+        assert_eq!(w.try_acquire(1), Err(WindowClosed));
+        // A zero-length send on a closed window also refuses: nothing may flow.
+        assert_eq!(w.try_acquire(0), Err(WindowClosed));
+        assert_eq!(w.acquire(1).await, Err(WindowClosed));
+    }
+
+    #[tokio::test]
+    async fn try_acquire_takes_zero_bytes_without_consuming() {
+        let w = OutboundWindow::uncalibrated();
+        w.note_window(3);
+        assert_eq!(w.try_acquire(0), Ok(true));
+        assert!(!w.would_exhaust(3), "an empty send needs no budget");
     }
 
     #[tokio::test]
@@ -872,5 +959,59 @@ mod tests {
             interceptor.on_subsystem_request("sftp", &grant).await,
             Verdict::Pass
         );
+    }
+
+    /// A tap that always passes — used to prove the zero-copy contract of the
+    /// untapped/`Pass` fast path on both directions.
+    struct PassTap;
+    impl ChannelTap for PassTap {
+        fn on_data(&self, _dir: Direction, _buf: &[u8]) -> DataVerdict {
+            DataVerdict::Pass
+        }
+    }
+
+    fn test_channel_id() -> ChannelId {
+        use ssh_encoding::Decode;
+        ChannelId::decode(&mut &7u32.to_be_bytes()[..]).expect("valid channel id")
+    }
+
+    #[test]
+    fn apply_tap_up_pass_is_zero_copy() {
+        let owned = Bytes::from_static(b"client-to-backend payload");
+        let ptr = owned.as_ptr();
+        // Untapped fast path.
+        let (forward, inject) = apply_tap_up(None, owned, test_channel_id());
+        assert_eq!(
+            forward.as_ptr(),
+            ptr,
+            "untapped forward must not reallocate"
+        );
+        assert!(inject.is_empty());
+        // `Pass` verdict must keep the same allocation too.
+        let owned = Bytes::from_static(b"client-to-backend payload");
+        let ptr = owned.as_ptr();
+        let tap: Arc<dyn ChannelTap> = Arc::new(PassTap);
+        let (forward, inject) = apply_tap_up(Some(&tap), owned, test_channel_id());
+        assert_eq!(forward.as_ptr(), ptr, "a Pass verdict must not reallocate");
+        assert!(inject.is_empty());
+    }
+
+    #[test]
+    fn apply_tap_down_pass_is_zero_copy() {
+        let owned = Bytes::from_static(b"backend-to-client payload");
+        let ptr = owned.as_ptr();
+        let (forward, inject) = apply_tap_down(None, owned, test_channel_id());
+        assert_eq!(
+            forward.as_ptr(),
+            ptr,
+            "untapped forward must not reallocate"
+        );
+        assert!(inject.is_empty());
+        let owned = Bytes::from_static(b"backend-to-client payload");
+        let ptr = owned.as_ptr();
+        let tap: Arc<dyn ChannelTap> = Arc::new(PassTap);
+        let (forward, inject) = apply_tap_down(Some(&tap), owned, test_channel_id());
+        assert_eq!(forward.as_ptr(), ptr, "a Pass verdict must not reallocate");
+        assert!(inject.is_empty());
     }
 }

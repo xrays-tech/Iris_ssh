@@ -194,9 +194,10 @@ async fn pump_backend_to_client(mut bch: Channel<client::Msg>, up: ServerUpstrea
 - 后端发送速率受其后端声明的 channel window 约束；russh 消费 `wait()` 后按需自动补 WINDOW_ADJUST（Spike #2 验证）。
 - ⇒ 下行在网关驻留量 ≈ 后端声明的窗口大小，天然有界。
 
-**方向 B（客户端→后端，上行）：**
-- `data()` 回调内 await 转发写；后端窗口耗尽时写路径挂起 → russh 停读客户端 socket → 客户端窗口耗尽 → 停发。链式背压成立。
-- **保险丝（默认开启）**：若 Spike #2 发现 russh client 侧 `Channel::data()` 在窗口耗尽时不阻塞（内部缓冲增长），则启用 per-channel `Semaphore`（permits = 后端初始窗口），`WindowAdjusted` 到达时增量补充 permits——保证即使库行为变化，网关内存依然有界。
+**方向 B（客户端→后端，上行泵）：**
+- 上行由 `pump_client_to_backend` 任务在 `client.wait()` 取数后 **await** 转发写（route 1 C3：与下行泵对称，数据/请求/eof/close 共享同一有序游标，I1 保序）；后端窗口耗尽时写路径挂起 → russh 停读客户端 socket → 客户端窗口耗尽 → 停发。链式背压成立。
+- **读前缓冲（有界）**：上行泵落后时，russh 会话读循环停在 per-channel mpsc 上（容量 = `channel_buffer_size`，默认 100 条），每条 ≤ `max_packet` 字节——即额外驻留的上界，泵自身不加任何缓冲。
+- **保险丝（默认开启）**：per-channel `Semaphore`（`[relay] outbound_guard`，permits = 后端初始窗口），`WindowAdjusted` 到达时按后端报告的绝对剩余窗口校准 permits——保证即使库行为变化，网关内存依然有界；后端失联时下泵关闭保险丝，上泵不会挂死（P0-2）。
 
 **参数与准入：**
 
@@ -204,7 +205,7 @@ async fn pump_backend_to_client(mut bch: Channel<client::Msg>, up: ServerUpstrea
 |---|---|---|
 | 初始 window_size | 1MB（可调 256KB~8MB） | 过小伤吞吐，过大伤内存 |
 | max packet size | 32KB（SFTP 大读取场景可调至 256KB） | 两侧配置一致 |
-| 内存公式（最坏） | ≈ 活跃会话 × (上行窗口 + 下行窗口) | 10k 会话全满载 ≈ 20GB → 按实例内存预算做**准入控制**（max_sessions 动态计算） |
+| 内存公式（最坏） | ≈ 活跃通道 × (channel_buffer_size × max_packet + 上行窗口 + 下行窗口) | 即每通道 ≤ 100×32KB 读前缓冲 + 双向窗口；10k 通道全满载按实例内存预算做**准入控制**（max_sessions 动态计算） |
 | 监控 | `relay_inflight_bytes`、`window_exhausted_total`、RSS/活跃会话比 | 超阈值告警 |
 
 **反例测试（必须进 CI）：** `cat 2GB 文件 | 慢消费者`、`yes` 洪泛、tc/netem 限速 1Mbps 下 scp 大文件——RSS 必须平稳、无 OOM。
