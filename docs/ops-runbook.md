@@ -47,9 +47,10 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 ```
 `[host_keys] keys` 可多算法同时 offer（`state=active` 签名 / `passive` 仅通告学习）。
 
-### 2.4 后端授权（两种模式）
+### 2.4 后端授权（三种模式）
 - **key 模式（默认）**：网关后端私钥 `[backend] private_key`（或 `credential_map`），对应公钥加入后端 `authorized_keys`。
 - **cert 模式（可选）**：后端 sshd 配 `TrustedUserCAKeys <网关CA公钥>`，网关 `[backend] backend_auth="cert"` + `[ca] signing_key`，拨号时现签短期用户证书（后端不再需要网关公钥）。
+- **agent 模式（可选，C2）**：以**终端用户自己的 ssh-agent** 作为后端凭据，即 `ssh -A` 语义的 agent 穿透。后端 `authorized_keys` 放用户公钥；网关既不需要也不使用自己的 key/CA（`private_key` 与 `[ca]` 均可省略）。详见 §5.7。
 - 后端 host key 信任：生产用 `host_key_policy="pinned"`（首次 await 后固化指纹）；初次联调可 `accept-new` 并尽快 pin。
 
 ---
@@ -66,8 +67,9 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `env_allowlist` | `[]` | 空=env 原样透传；非空=过滤变量名 |
 | `[backend]` | `private_key` / `credential_map` | — | **key 模式必须其一**（该模式无 key 拒绝启动） |
 | | `host_key_policy` | `pinned` | `pinned` / `accept-new` |
-| | `backend_auth` | `key` | `key` / `cert`；**cert 模式要求 `[ca] signing_key`**；`signing_key` 又要求至少一个 `trusted_ca_keys` |
-| `[pool]` | `enabled` | `false` | opt-in 池化；**熔断/channel 上限与 enabled 无关（始终生效）** |
+| | `backend_auth` | `key` | `key` / `cert` / `agent`；**cert 模式要求 `[ca] signing_key`**；`signing_key` 又要求至少一个 `trusted_ca_keys`；**agent 模式要求 `allow_agent_backend_auth=true`，且与 `[pool] enabled=true` 互斥** |
+| | `allow_agent_backend_auth` | `false` | agent 模式的**全局 kill-switch**；为 false 时 agent 授权被整体拒绝（不降级为 key） |
+| `[pool]` | `enabled` | `false` | opt-in 池化；**熔断/channel 上限与 enabled 无关（始终生效）**；**与 `backend_auth="agent"` 互斥（启动即报错）** |
 | | `channels_per_conn` | `8` | 每连接 ≤8（sshd MaxSessions 安全界） |
 | | `keepalive_interval` / `keepalive_max_miss` | `15s` / `2` | 假死检测（`keepalive_timeout` 为保留字段，实际语义见 §5.3） |
 | | `circuit_failure_threshold` / `circuit_reset_timeout` | `5` / `30s` | 拨号熔断 |
@@ -92,7 +94,7 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 ## 4. 认证
 
 - **客户端 → 网关**：公钥（`auth_publickey`）或用户证书（`auth_openssh_certificate`，按 CA / 有效期 / principals 校验）。`auth_publickey_offered` 仅为预热/形状预检，**不**在该阶段做最终 accept。恶意签名一律被 russh 库拒。
-- **网关 → 后端**：见 §2.4 两种模式；cert 模式在 `connect` 时现签短期证书（不缓存）。
+- **网关 → 后端**：见 §2.4 三种模式；cert 模式在 `connect` 时现签短期证书（不缓存）；agent 模式以用户 agent 的签名认证，且**只签控制面已授权的那个指纹**（见 §5.7）。
 
 ---
 
@@ -146,6 +148,9 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 | `sshgw_pool_dead_detected_total` / `tracked_conns` | 池健康 | 池化场景启用 |
 | `sshgw_recorded_sessions_total` / `bytes_total` | 录制 | 磁盘配额预警 |
 | `sshgw_cert_auth_accept_total` / `reject_total` | 证书认证 | reject 突增=证书问题 |
+| `sshgw_agent_backend_auth_ok_total` / `fail_total` | agent 模式后端认证结果 | fail>0 且 ok 不动=用户 agent 未转发/缺 key |
+| `sshgw_agent_signatures_total` | 经网关中继的 agent 签名次数 | 与 `ok_total` 长期偏离=会话复用异常 |
+| `sshgw_agent_channel_denied_total` | agent 会话中被拒的额外通道（如 direct-tcpip） | 突增=客户端在尝试跳板 |
 
 动态采样脚本参考：`scripts/run_soak.sh`（RSS/drift 模式）、`scripts/ha_drain.sh`（排水断言模式）。
 
@@ -159,7 +164,38 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 | RSS 持续上涨 | `relay_window_budget_bytes` / 慢消费者 | 调 `window_size` / `max_packet`、排查背压 |
 | SFTP 操作被拒绝 | `sftp_requests_denied_total` + 拦截配置 | 检查 `[intercept.sftp] deny_commands/路径` |
 | 认证总失败 | `auth_*` 指标 + 审计（指纹/签名算法/principal） | 核对 key/证书与授权策略 |
-| 端口转发不通 | jump 默认拒绝 | 需 `[jump] enabled` + 白名单 + 地址类护栏 |
+| 端口转发不通 | jump 默认拒绝 | 需 `[jump] enabled` + 白名单 + 地址类护栏；**agent 会话永远拒绝跳板**（见 §5.7） |
+| `-A` 会话立刻失败 | `agent_backend_auth_fail_total` + 网关日志中的 reason | 见 §5.7 排障表 |
+| `-A` 会话成功但客户端挂住不退出 | 网关未关闭转发的 agent 通道 | 属缺陷；升级到含 C2 修复的版本 |
+
+### 5.7 Agent 穿透（`backend_auth = "agent"`）
+
+以终端用户的 ssh-agent 作为后端凭据。语义等同 `ssh -A`：**网关只做签名中继，不持有也不代管任何私钥**。
+
+**启用（三道门，缺一不可）**
+1. 配置 `[backend] backend_auth = "agent"`；
+2. 配置 `[backend] allow_agent_backend_auth = true`（全局 kill-switch，默认 `false`）；
+3. 控制面 resolve 返回 `policy.agent_forwarding: true`（按 grant 授权）。
+
+`agent` 与 `cert` 一样支持逐 resolve 覆盖（`policy.backend_auth`），但任何 agent 授权都会先过 kill-switch；kill-switch 关闭时**整体拒绝**，绝不回落为 key/cert。
+
+**约束**
+- 与 `[pool] enabled = true` **互斥**（池化连接无法携带 per-session 的 agent 身份），启动即报错。
+- 每会话只开**一个**后端通道；`direct-tcpip`（跳板）在 agent 会话中一律拒绝并计数 `sshgw_agent_channel_denied_total`。
+- 只有**控制面已授权指纹**对应的 agent 身份会被提供给后端；agent 里即便有别的可用 key 也不会用（最小签名面）。
+- 后端 `authorized_keys` 应只放用户公钥，不要放网关 key——这样一旦网关偷偷降级，会话必然失败而不是"悄悄成功"。
+
+**排障**
+| 症状 / 日志关键字 | 含义 | 处置 |
+|---|---|---|
+| `client never requested agent forwarding` | 客户端没带 `-A` | 让用户用 `ssh -A`；网关不做降级 |
+| `agent forwarding denied by policy` | 控制面 `agent_forwarding` 未开 | 在 resolve 响应中为该 grant 打开 |
+| `no agent identity matches the authorized fingerprint` | 用户 agent 里没有被授权的那个 key | `ssh-add -l` 核对；补加正确 key |
+| `backend rejected the agent signature` | 后端 `authorized_keys` 不含该用户 key | 核对后端 authorized_keys |
+| `client refused the agent channel` | 客户端拒绝打开 agent 通道 | 检查客户端 `-A`/`ForwardAgent` 配置 |
+| 会话成功但客户端不退出 | 网关未关闭转发通道 | 升级；C2 已修复 |
+
+**可观测**：审计记录带 `auth_kind="agent"`、`agent_identity`（签名身份指纹）与 `agent_signatures`（签名次数）；指标见 §5.5 agent 三行。
 
 ---
 

@@ -52,7 +52,15 @@ SUBTOP_HOSTKEY="${SUBTOP_HOSTKEY:-$IT_ASSET_DIR/hostkey_ed25519}"
 #   SUBTOP_SSHD_USER_CA    path to a user CA .pub: backend sshd trusts it (TrustedUserCAKeys).
 #   SUBTOP_TRUSTED_CA_KEYS space-separated CA .pub: gateway [ca] trusted_ca_keys (host @cert-authority).
 #   SUBTOP_SIGNING_KEY     path to a CA .priv: gateway [ca] signing_key (M4-2 cert-dial).
-#   SUBTOP_BACKEND_AUTH    "cert" -> gateway [backend] backend_auth="cert" (omitted = key default).
+#   SUBTOP_BACKEND_AUTH    "cert" -> gateway [backend] backend_auth="cert"
+#                          "agent" -> gateway [backend] backend_auth="agent"
+#                          (omitted = key default).
+#   SUBTOP_ALLOW_AGENT_BACKEND_AUTH  "true" -> [backend] allow_agent_backend_auth
+#                                    (the instance-wide kill-switch; off by default,
+#                                    and a hard requirement for backend_auth="agent").
+#   SUBTOP_AGENT_FORWARDING  "true" -> the default resolve rule carries
+#                              policy.agent_forwarding=true, i.e. the control plane
+#                              allows THIS grant to forward its agent.
 SUBTOP_SSHD_HOST_CERT="${SUBTOP_SSHD_HOST_CERT:-}"
 SUBTOP_SSHD_USER_CA="${SUBTOP_SSHD_USER_CA:-}"
 # Authorized-keys override (for cert-only backends where the gateway key must NOT
@@ -64,6 +72,8 @@ SUBTOP_SSHD_HOSTKEY="${SUBTOP_SSHD_HOSTKEY:-$IT_ASSET_DIR/sshd_host_ed25519}"
 SUBTOP_TRUSTED_CA_KEYS="${SUBTOP_TRUSTED_CA_KEYS:-}"
 SUBTOP_SIGNING_KEY="${SUBTOP_SIGNING_KEY:-}"
 SUBTOP_BACKEND_AUTH="${SUBTOP_BACKEND_AUTH:-}"
+SUBTOP_ALLOW_AGENT_BACKEND_AUTH="${SUBTOP_ALLOW_AGENT_BACKEND_AUTH:-false}"
+SUBTOP_AGENT_FORWARDING="${SUBTOP_AGENT_FORWARDING:-false}"
 
 # toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
 toml_arr() {
@@ -107,6 +117,9 @@ subtopo_start() {
       _pol_extra=",\"tcp_forwarding\":true,\"tcp_forwarding_targets\":[\"127.0.0.1:${ST_SSHD_PORT}\"]"
       case " $SUBTOP_JUMP_TARGETS " in *" $_bktgt "*) : ;; *) SUBTOP_JUMP_TARGETS="$SUBTOP_JUMP_TARGETS $_bktgt" ;; esac
     fi
+    if [ "$SUBTOP_AGENT_FORWARDING" = "true" ]; then
+      _pol_extra="$_pol_extra,\"agent_forwarding\":true"
+    fi
     printf '{"resolve":{"%s":{"status":200,"target":{"host":"127.0.0.1","port":%s,"user":"%s"},"policy":{"ttl":60%s}}},"default":{"status":404}}\n' \
       "$PRINCIPAL" "$ST_SSHD_PORT" "$BACKEND_USER" "$_pol_extra" > "$SUBTOPO_DIR/rules.json"
   fi
@@ -114,6 +127,10 @@ subtopo_start() {
   local _ba=""
   [ "$SUBTOP_BACKEND_AUTH" = "cert" ] && _ba='backend_auth="cert"
 '
+  [ "$SUBTOP_BACKEND_AUTH" = "agent" ] && _ba='backend_auth="agent"
+'
+  [ "$SUBTOP_ALLOW_AGENT_BACKEND_AUTH" = "true" ] && _ba="${_ba}allow_agent_backend_auth=true
+"
   printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n%s[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
     "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" \
     "$IT_ASSET_DIR/backend_ed25519" "$_ba" "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
@@ -186,12 +203,43 @@ for line in data.splitlines():
 PY
 }
 
-# subtopo_ssh <remote-command...> — ssh as $PRINCIPAL into the sub-topology gateway
+# subtopo_ssh <remote-command...> — ssh as $PRINCIPAL into the sub-topology gateway.
+#
+# `SUBTOP_SSH_A=1` (or the subtopo_ssh_A wrapper) adds -A, i.e. it asks the
+# gateway to forward the local agent. The agent is never used for *user* auth
+# here (`IdentitiesOnly=yes` + an explicit -i pin that), which is exactly the
+# separation the passthrough feature needs: the agent is a signing backend, not
+# a credential the client offers for itself.
 subtopo_ssh() {
-  ssh -p "$ST_GW_PORT" -i "$USER_KEY" \
+  local _a=()
+  [ "${SUBTOP_SSH_A:-0}" = "1" ] && _a+=(-A)
+  ssh -p "$ST_GW_PORT" -i "$USER_KEY" "${_a[@]}" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o IdentitiesOnly=yes -o ConnectTimeout=15 -o LogLevel=ERROR \
     "$PRINCIPAL@127.0.0.1" "$@"
+}
+
+# subtopo_ssh_A <remote-command...> — same, with agent forwarding requested.
+subtopo_ssh_A() {
+  SUBTOP_SSH_A=1 subtopo_ssh "$@"
+}
+
+# subtopo_agent_start <key-to-add...> — start a throwaway ssh-agent holding those
+# keys and export SSH_AUTH_SOCK/SSH_AGENT_PID **in the caller's shell** (so run
+# this directly, never inside `$(...)`). Pair with subtopo_agent_stop.
+subtopo_agent_start() {
+  local key
+  eval "$(ssh-agent -s)" >/dev/null 2>&1 || return 1
+  export SSH_AUTH_SOCK SSH_AGENT_PID
+  for key in "$@"; do
+    ssh-add "$key" </dev/null >/dev/null 2>&1 || return 1
+  done
+  log "agent up on $SSH_AUTH_SOCK (agent pid $SSH_AGENT_PID)"
+}
+
+subtopo_agent_stop() {
+  ssh-agent -k >/dev/null 2>&1 || true
+  unset SSH_AUTH_SOCK SSH_AGENT_PID || true
 }
 
 subtopo_stop() {

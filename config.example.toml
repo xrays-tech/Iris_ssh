@@ -36,12 +36,30 @@ env_allowlist = []      # empty = pass env through (M1); non-empty filters names
 #           inner keypair is used when omitted) and is still honoured as a
 #           stable gateway identity when present. Per-resolve override:
 #           `policy.backend_auth` in the control-plane response.
+#   "agent" — the *end user's* ssh-agent, forwarded with `ssh -A` and used as the
+#           backend credential (agent passthrough; propose §3.3 / plan-agent-
+#           passthrough). The identity offered to the backend is the one whose
+#           fingerprint the control plane already authorized for this grant —
+#           never an arbitrary key the agent happens to hold. Requires
+#           `allow_agent_backend_auth = true` below and, per grant,
+#           `policy.agent_forwarding` in the control-plane response. Neither
+#           `private_key` nor `[ca]` is needed: the gateway presents no
+#           credential of its own, and if the agent cannot produce the authorized
+#           identity the session fails instead of falling back to one.
+#           Agent mode is one backend connection for the whole session, so it is
+#           mutually exclusive with `[pool] enabled = true`; it also disables
+#           `direct-tcpip` (jump forwarding) on that session.
 [backend]
 private_key = "/etc/ssh-gw/backend_root_ed25519"   # default key
 # credential_map maps a backend username to its key path (overrides private_key).
 credential_map = { root = "/etc/ssh-gw/backend_root_ed25519" }
 host_key_policy = "pinned"     # "pinned" (prod) | "accept-new" (onboarding)
 # backend_auth = "key"         # set to "cert" to dial with a CA-issued certificate
+# Instance-wide kill-switch for backend_auth = "agent". Off (absent) by default:
+# turning agent passthrough on is a deliberate two-step act — this flag *and*
+# `backend_auth = "agent"`. When it is false, an agent-mode grant is refused
+# outright rather than silently downgraded to the gateway's own key.
+# allow_agent_backend_auth = false
 
 # Opt-in connection pool (off by default: one backend connection per session).
 # The dial circuit breaker and per-connection channel cap are active regardless

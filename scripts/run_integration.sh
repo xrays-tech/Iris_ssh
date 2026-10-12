@@ -478,6 +478,10 @@ ALL_CASES=(
   case_halfopen_lost
   case_netem_slow
   case_graceful_shutdown
+  case_agent_auth
+  case_agent_missing
+  case_agent_no_key
+  case_agent_target_scope
 )
 
 resolve_case_path() {

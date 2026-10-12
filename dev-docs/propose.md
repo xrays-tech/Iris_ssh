@@ -267,6 +267,12 @@ Checkout 防护：
  - 默认模式仍是每会话独连，池化 opt-in
 ```
 
+> **落地口径（agent 穿透落地时收紧为互斥）**：上表的「池化连接上禁用 agent forwarding」在实现中被收紧为 **`[backend] backend_auth = "agent"` 与 `[pool] enabled = true` 直接互斥、启动即报错**，而不是运行时对池化连接禁用转发。
+>
+> 原因是语义而非保守：agent 穿透的身份是 **per-session 的**（每个终端用户自己的 agent、自己被授权的指纹），而池化连接是 **per-target 跨会话共享的**，一条共享连接无法携带"下一条 channel 属于哪个用户、该用哪把 key 签名"这样的身份。运行时"对池化连接禁用转发"会让同一份配置在池开/关时给出两种后端凭据，属于静默降级的一种，正是 plan-agent-passthrough 红线 3 要避免的形状。因此选择在配置校验期一次性拒绝（`src/config.rs` 的 `agent_backend_auth_is_incompatible_with_pooling`），把矛盾暴露在部署时而不是用户会话里。
+>
+> 两者的连接模型也因此天然分层：非 agent 会话可以选择池化摊薄 RTT，agent 会话独占一条后端连接（正是 §3.5.1 允许单 FIFO 消费者的前提）。
+
 ---
 
 ## 四、性能设计
