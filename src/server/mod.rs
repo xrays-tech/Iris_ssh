@@ -709,7 +709,7 @@ pub struct GatewaySession {
 /// forwarded agent per session (see [`relay::agent`]).
 struct AgentSession {
     client_id: ChannelId,
-    shared: relay::agent::AgentHandle,
+    handle: relay::agent::AgentHandle,
 }
 
 impl GatewaySession {
@@ -913,14 +913,13 @@ impl GatewaySession {
         if agent.client_id != channel {
             return false;
         }
-        let shared = Arc::clone(&agent.shared);
         // While dialing this must never park the serial event loop (C5); once
         // the backend is up, `send().await` is the same backpressure the inline
         // path applies today.
-        let outcome = if shared.is_ready() {
-            shared.enqueue(op).await
+        let outcome = if agent.handle.is_ready() {
+            agent.handle.enqueue(op).await
         } else {
-            shared.try_enqueue(op)
+            agent.handle.try_enqueue(op)
         };
         match outcome {
             relay::agent::Enqueued::Accepted => true,
@@ -1001,7 +1000,7 @@ impl GatewaySession {
             auditor.set_auth_kind("agent");
         }
 
-        let shared = relay::agent::spawn(
+        let handle = relay::agent::spawn(
             relay::agent::AgentSupervisorArgs {
                 grant: grant.clone(),
                 client_id,
@@ -1021,7 +1020,7 @@ impl GatewaySession {
         // close this channel before then either: its first act is to wait for
         // the client's `auth-agent-req@openssh.com`, which the client only sends
         // once it has this confirmation.
-        self.agent = Some(AgentSession { client_id, shared });
+        self.agent = Some(AgentSession { client_id, handle });
         reply.accept().await;
         Ok(())
     }
@@ -1859,7 +1858,7 @@ impl server::Handler for GatewaySession {
             if let Some(agent) = &self.agent {
                 // The supervisor is waiting on this decision; a refusal must
                 // unblock it immediately rather than run out the deadline.
-                agent.shared.grant_decision(false);
+                agent.handle.grant_decision(false);
             }
             return Ok(false);
         };
@@ -1877,7 +1876,7 @@ impl server::Handler for GatewaySession {
                     "agent forwarding permitted for this grant"
                 );
                 if let Some(agent) = &self.agent {
-                    agent.shared.grant_decision(true);
+                    agent.handle.grant_decision(true);
                 }
                 Ok(true)
             }
@@ -1889,7 +1888,7 @@ impl server::Handler for GatewaySession {
                     "agent-forwarding request denied"
                 );
                 if let Some(agent) = &self.agent {
-                    agent.shared.grant_decision(false);
+                    agent.handle.grant_decision(false);
                 }
                 Ok(false)
             }
@@ -1935,8 +1934,8 @@ impl server::Handler for GatewaySession {
             if agent.client_id == channel {
                 // The supervisor closes the backend channel itself as soon as
                 // it drains this op (its sender is dropped with `self.agent`).
-                let shared = agent.shared;
-                let _ = shared.enqueue(relay::agent::AgentOp::Close).await;
+                let handle = agent.handle;
+                let _ = handle.enqueue(relay::agent::AgentOp::Close).await;
                 if let Some(tap) = self.taps.remove(&channel) {
                     tap.flush();
                 }

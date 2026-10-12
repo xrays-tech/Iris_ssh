@@ -46,6 +46,16 @@ pub type AgentChannelStream = russh::ChannelStream<russh::server::Msg>;
 /// the user's own agent, reached through this session's agent channel.
 pub type SessionAgentClient = russh::keys::agent::client::AgentClient<AgentChannelStream>;
 
+/// A live backend transport, as returned by [`BackendDialer::connect`] and
+/// [`BackendDialer::connect_agent`].
+///
+/// Carrying this type explicitly matters for agent mode: russh's client driver
+/// task is spawned by `client::connect_stream` and ends when the `Handle` is
+/// dropped, so a caller that dials a backend must keep the handle for as long
+/// as it intends to use the channel it opened on it. The relayed path stores it
+/// beside the channel for exactly that reason.
+pub type BackendHandle = Handle<BackendClient>;
+
 /// How the gateway authenticates itself to the backend (propose §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendAuthMethod {

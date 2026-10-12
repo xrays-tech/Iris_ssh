@@ -290,9 +290,15 @@ pub enum Enqueued {
     Closed,
 }
 
-/// Session-wide handle the serial handler keeps while agent mode is active.
+/// State visible to both sides of one agent session.
+///
+/// Deliberately **does not own the op sender**: if it did, the supervisor's own
+/// strong reference would keep the queue open forever, `rx.recv()` would never
+/// return `None`, and the supervisor would never exit — which in turn would
+/// leave the agent-forwarding channel open and pin the client's connection
+/// alive after the session ended. The sender lives in [`AgentHandle`], which
+/// only the handler holds.
 pub struct AgentShared {
-    tx: mpsc::Sender<AgentOp>,
     state: AtomicU8,
     /// Set by [`AgentShared::grant_decision`] from `agent_request`; a permit is
     /// stored even if the supervisor has not started waiting yet, so the
@@ -303,52 +309,12 @@ pub struct AgentShared {
 }
 
 impl AgentShared {
-    fn new(tx: mpsc::Sender<AgentOp>) -> Self {
+    fn new() -> Self {
         AgentShared {
-            tx,
             state: AtomicU8::new(STATE_DIALING),
             grant: Notify::new(),
             denied: AtomicBool::new(false),
         }
-    }
-
-    /// Hand an op to the supervisor.
-    ///
-    /// While dialing the caller is expected to use [`try_enqueue`](Self::try_enqueue)
-    /// instead (C5). Once ready this awaits — exactly the backpressure the
-    /// inline `data()` path applies today — and holds no lock while it does
-    /// (D11).
-    pub async fn enqueue(&self, op: AgentOp) -> Enqueued {
-        if self.is_closed() {
-            return Enqueued::Closed;
-        }
-        match self.tx.send(op).await {
-            Ok(()) => Enqueued::Accepted,
-            Err(_) => Enqueued::Closed,
-        }
-    }
-
-    /// Non-blocking enqueue, used by the handler while the backend is still
-    /// dialing so the serial event loop is never parked on a full queue (C5).
-    pub fn try_enqueue(&self, op: AgentOp) -> Enqueued {
-        if self.is_closed() {
-            return Enqueued::Closed;
-        }
-        match self.tx.try_send(op) {
-            Ok(()) => Enqueued::Accepted,
-            Err(mpsc::error::TrySendError::Full(_)) => Enqueued::QueueFull,
-            Err(mpsc::error::TrySendError::Closed(_)) => Enqueued::Closed,
-        }
-    }
-
-    /// Report the agent-forwarding decision so the supervisor can stop waiting.
-    ///
-    /// `granted` is the outcome of the C1 policy check: `true` means the client
-    /// may open an agent channel, `false` means the request arrived but policy
-    /// refused it.
-    pub fn grant_decision(&self, granted: bool) {
-        self.denied.store(!granted, Ordering::Release);
-        self.grant.notify_one();
     }
 
     fn is_closed(&self) -> bool {
@@ -370,8 +336,70 @@ impl AgentShared {
     }
 }
 
-/// Cloneable handle the handler stores for the lifetime of the agent session.
-pub type AgentHandle = Arc<AgentShared>;
+/// The handler's handle for one agent session, and the only owner of the queue
+/// sender.
+///
+/// Dropping it is the supervisor's stop signal: the drain loop ends, the
+/// supervisor drops the forwarded agent channel, and the client's connection is
+/// free to close.
+pub struct AgentHandle {
+    shared: Arc<AgentShared>,
+    tx: mpsc::Sender<AgentOp>,
+}
+
+impl AgentHandle {
+    fn new(tx: mpsc::Sender<AgentOp>) -> Self {
+        AgentHandle {
+            shared: Arc::new(AgentShared::new()),
+            tx,
+        }
+    }
+
+    /// Hand an op to the supervisor.
+    ///
+    /// While dialing the caller is expected to use [`try_enqueue`](Self::try_enqueue)
+    /// instead (C5). Once ready this awaits — exactly the backpressure the
+    /// inline `data()` path applies today — and holds no lock while it does
+    /// (D11).
+    pub async fn enqueue(&self, op: AgentOp) -> Enqueued {
+        if self.shared.is_closed() {
+            return Enqueued::Closed;
+        }
+        match self.tx.send(op).await {
+            Ok(()) => Enqueued::Accepted,
+            Err(_) => Enqueued::Closed,
+        }
+    }
+
+    /// Non-blocking enqueue, used by the handler while the backend is still
+    /// dialing so the serial event loop is never parked on a full queue (C5).
+    pub fn try_enqueue(&self, op: AgentOp) -> Enqueued {
+        if self.shared.is_closed() {
+            return Enqueued::Closed;
+        }
+        match self.tx.try_send(op) {
+            Ok(()) => Enqueued::Accepted,
+            Err(mpsc::error::TrySendError::Full(_)) => Enqueued::QueueFull,
+            Err(mpsc::error::TrySendError::Closed(_)) => Enqueued::Closed,
+        }
+    }
+
+    /// Report the agent-forwarding decision so the supervisor can stop waiting.
+    ///
+    /// `granted` is the outcome of the C1 policy check: `true` means the client
+    /// may open an agent channel, `false` means the request arrived but policy
+    /// refused it.
+    pub fn grant_decision(&self, granted: bool) {
+        self.shared.denied.store(!granted, Ordering::Release);
+        self.shared.grant.notify_one();
+    }
+
+    /// Whether the backend session is up and the supervisor is applying queued
+    /// ops.
+    pub fn is_ready(&self) -> bool {
+        self.shared.is_ready()
+    }
+}
 
 /// Everything the supervisor needs, bundled once so the spawned task owns its
 /// whole world and borrows nothing from the session.
@@ -407,18 +435,25 @@ fn queue_capacity(window_size: u32, max_packet: u32) -> usize {
 /// Build the handler-side handle and spawn the supervisor task.
 pub fn spawn(args: AgentSupervisorArgs, window_size: u32, max_packet: u32) -> AgentHandle {
     let (tx, rx) = mpsc::channel(queue_capacity(window_size, max_packet));
-    let shared = Arc::new(AgentShared::new(tx));
+    let handle = AgentHandle::new(tx.clone());
     // Detached: the task ends when the handler drops its handle, and a panic
     // inside it is already reported by tokio and surfaced by the channel close
-    // the handler observes.
-    tokio::spawn(run(args, Arc::clone(&shared), rx));
-    shared
+    // the handler observes. `tx` is handed to the supervisor as a *dial guard*
+    // so the queue stays open while the backend is still coming up; it is
+    // dropped the moment the handler becomes the sole owner of the sender.
+    tokio::spawn(run(args, Arc::clone(&handle.shared), tx, rx));
+    handle
 }
 
 /// The supervisor task: wait for the grant, authenticate with the user's agent,
 /// dial the backend, then replay the queue and keep draining it until the
 /// handler drops its handle.
-async fn run(args: AgentSupervisorArgs, shared: AgentHandle, mut rx: mpsc::Receiver<AgentOp>) {
+async fn run(
+    args: AgentSupervisorArgs,
+    shared: Arc<AgentShared>,
+    dial_guard: mpsc::Sender<AgentOp>,
+    mut rx: mpsc::Receiver<AgentOp>,
+) {
     let AgentSupervisorArgs {
         grant,
         client_id,
@@ -431,6 +466,9 @@ async fn run(args: AgentSupervisorArgs, shared: AgentHandle, mut rx: mpsc::Recei
         session_id,
     } = args;
 
+    // `dial_guard` keeps the queue open while we dial (the handler may be
+    // enqueueing pty/env/exec right now); it is dropped below, the moment the
+    // handler becomes the sole owner of the sender.
     let established = match establish_backend(&shared, &grant, &up, &dialer).await {
         Ok(established) => established,
         Err(reason) => {
@@ -458,6 +496,10 @@ async fn run(args: AgentSupervisorArgs, shared: AgentHandle, mut rx: mpsc::Recei
     // Keep the agent channel open for as long as the session lives: closing it
     // would tell the client its forwarding channel is gone.
     let _agent = established.agent;
+    // ...and keep the backend transport task alive for the same reason (see
+    // `Established`). Both are deliberately bound to underscore names so they
+    // live until `run` returns.
+    let _handle = established.handle;
     let backend_channel = established.backend_channel;
     metrics.agent_backend_auth_ok();
     metrics.agent_signature();
@@ -480,16 +522,35 @@ async fn run(args: AgentSupervisorArgs, shared: AgentHandle, mut rx: mpsc::Recei
 
     // The down-pump is the only reader of the backend channel and the authority
     // on its liveness (P0-2): it closes the window the instant the backend dies.
-    tokio::spawn(relay::pump_backend_to_client(
-        backend_read,
-        up.clone(),
-        client_id,
-        relay.router.clone(),
-        Arc::clone(&window),
-        Arc::clone(&bytes),
-        metrics.clone(),
-        tap,
-    ));
+    // Its completion is also what ends this supervisor, so the forwarded agent
+    // channel can never outlive the session it authenticates — a channel left
+    // open would keep the client's connection (and its agent) alive forever.
+    let (relay_done_tx, relay_done_rx) = oneshot::channel::<()>();
+    // Everything the pump needs is taken *before* the task is built: capturing
+    // `relay` or `up` itself would move them out from under the drain loop.
+    let pump_up = up.clone();
+    let pump_router = relay.router.clone();
+    let pump_window = Arc::clone(&window);
+    let pump_bytes = Arc::clone(&bytes);
+    let pump_metrics = metrics.clone();
+    tokio::spawn(async move {
+        relay::pump_backend_to_client(
+            backend_read,
+            pump_up,
+            client_id,
+            pump_router,
+            pump_window,
+            pump_bytes,
+            pump_metrics,
+            tap,
+        )
+        .await;
+        let _ = relay_done_tx.send(());
+    });
+
+    // From here on the handler owns the only sender: once it drops its handle,
+    // `rx.recv()` returns `None` and this loop ends.
+    drop(dial_guard);
 
     shared.mark_ready();
     tracing::info!(
@@ -504,9 +565,16 @@ async fn run(args: AgentSupervisorArgs, shared: AgentHandle, mut rx: mpsc::Recei
     );
 
     // Drain whatever the client queued while we were dialing, then keep draining
-    // until the handler drops its handle (which closes the sender). Single
-    // consumer, FIFO — the ordering guarantee §3.5.1 qualifier 2 asks for.
-    while let Some(op) = rx.recv().await {
+    // until either the handler drops its handle (which closes the sender) or the
+    // relayed session ends. Single consumer, FIFO — the ordering guarantee
+    // §3.5.1 qualifier 2 asks for.
+    let mut relay_done = relay_done_rx;
+    loop {
+        let op = tokio::select! {
+            op = rx.recv() => op,
+            _ = &mut relay_done => break,
+        };
+        let Some(op) = op else { break };
         if relay.window.is_closed() {
             // The backend is gone; the down-pump has already closed the client
             // channel, so replaying further ops would only write into a void.
@@ -519,9 +587,17 @@ async fn run(args: AgentSupervisorArgs, shared: AgentHandle, mut rx: mpsc::Recei
 }
 
 /// A live agent leg plus the backend channel it authenticated.
+///
+/// `handle` is not decoration: russh's client driver task is spawned by
+/// `client::connect_stream` and its lifecycle is bound to the `Handle`, which
+/// owns the reply stream and the command sender the run loop ends on. Dropping
+/// it would stop the transport while leaving the channel object — and every
+/// later request would hang forever with no error. The inline relay path keeps
+/// its handle in the session registry for exactly the same reason.
 struct Established {
     backend_channel: russh::Channel<russh::client::Msg>,
     agent: SessionAgentClient,
+    handle: crate::backend::BackendHandle,
     fingerprint: Fingerprint,
 }
 
@@ -605,6 +681,7 @@ async fn establish_backend(
     Ok(Established {
         backend_channel,
         agent,
+        handle: backend,
         fingerprint,
     })
 }
@@ -638,11 +715,11 @@ mod tests {
         // supervisor calls `wait_for_grant` is still observed. Losing that
         // decision would turn every `-A` session into a 5s timeout.
         let (tx, _rx) = mpsc::channel(4);
-        let shared = Arc::new(AgentShared::new(tx));
-        shared.grant_decision(true);
+        let handle = AgentHandle::new(tx);
+        handle.grant_decision(true);
         let waited = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_for_grant(&shared, Duration::from_secs(30)),
+            wait_for_grant(&handle.shared, Duration::from_secs(30)),
         )
         .await
         .expect("a recorded grant must not wait for the deadline");
@@ -652,12 +729,12 @@ mod tests {
     #[tokio::test]
     async fn a_denied_grant_is_terminal_even_if_a_permit_is_pending() {
         let (tx, _rx) = mpsc::channel(4);
-        let shared = Arc::new(AgentShared::new(tx));
-        shared.grant_decision(true);
-        shared.grant_decision(false); // policy refused it after all
+        let handle = AgentHandle::new(tx);
+        handle.grant_decision(true);
+        handle.grant_decision(false); // policy refused it after all
         let waited = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_for_grant(&shared, Duration::from_secs(30)),
+            wait_for_grant(&handle.shared, Duration::from_secs(30)),
         )
         .await
         .expect("a recorded decision must not wait for the deadline");
@@ -667,10 +744,10 @@ mod tests {
     #[tokio::test]
     async fn waiting_for_the_client_to_ask_expires_at_the_deadline() {
         let (tx, _rx) = mpsc::channel(4);
-        let shared = Arc::new(AgentShared::new(tx));
+        let handle = AgentHandle::new(tx);
         let started = std::time::Instant::now();
         assert!(
-            !wait_for_grant(&shared, Duration::from_millis(50)).await,
+            !wait_for_grant(&handle.shared, Duration::from_millis(50)).await,
             "a client that never asks for agent forwarding must not be dialed"
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
@@ -679,32 +756,32 @@ mod tests {
     #[tokio::test]
     async fn try_enqueue_never_blocks_and_reports_the_bounded_queue() {
         let (tx, mut rx) = mpsc::channel(2);
-        let shared = AgentShared::new(tx);
-        assert_eq!(shared.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
-        assert_eq!(shared.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
+        let handle = AgentHandle::new(tx);
+        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
+        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
         // Full: C5 says fail the channel, never await.
-        assert_eq!(shared.try_enqueue(AgentOp::Eof), Enqueued::QueueFull);
+        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::QueueFull);
         rx.recv().await.expect("one op must drain");
-        assert_eq!(shared.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
+        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
     }
 
     #[tokio::test]
     async fn a_closed_supervisor_rejects_further_ops_instead_of_buffering_them() {
         let (tx, _rx) = mpsc::channel(4);
-        let shared = AgentShared::new(tx);
-        shared.mark_closed();
-        assert_eq!(shared.try_enqueue(AgentOp::Eof), Enqueued::Closed);
-        assert_eq!(shared.enqueue(AgentOp::Eof).await, Enqueued::Closed);
+        let handle = AgentHandle::new(tx);
+        handle.shared.mark_closed();
+        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Closed);
+        assert_eq!(handle.enqueue(AgentOp::Eof).await, Enqueued::Closed);
     }
 
     #[tokio::test]
     async fn ready_state_delivers_ops_to_the_supervisor_in_order() {
         let (tx, mut rx) = mpsc::channel(8);
-        let shared = AgentShared::new(tx);
-        shared.mark_ready();
-        assert_eq!(shared.enqueue(AgentOp::Eof).await, Enqueued::Accepted);
+        let handle = AgentHandle::new(tx);
+        handle.shared.mark_ready();
+        assert_eq!(handle.enqueue(AgentOp::Eof).await, Enqueued::Accepted);
         assert_eq!(
-            shared.enqueue(AgentOp::Shell { want_reply: false }).await,
+            handle.enqueue(AgentOp::Shell { want_reply: false }).await,
             Enqueued::Accepted
         );
         assert!(matches!(rx.recv().await, Some(AgentOp::Eof)));
