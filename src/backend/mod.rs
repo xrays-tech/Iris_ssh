@@ -37,6 +37,14 @@ pub enum BackendAuthMethod {
     /// A short-lived user certificate issued by the gateway's CA, accepted by the
     /// backend's `TrustedUserCAKeys`.
     Cert,
+    /// The **end user's** ssh-agent identity, reached through agent forwarding
+    /// (`ssh -A`). The private key never leaves the client; the gateway only
+    /// relays signature requests (plan-agent-passthrough).
+    ///
+    /// Unusable unless the global kill-switch
+    /// `[backend] allow_agent_backend_auth` is also on — see
+    /// [`ensure_agent_backend_auth`].
+    Agent,
 }
 
 impl BackendAuthMethod {
@@ -45,9 +53,12 @@ impl BackendAuthMethod {
         match value.trim() {
             "key" => Ok(BackendAuthMethod::Key),
             "cert" => Ok(BackendAuthMethod::Cert),
+            "agent" => Ok(BackendAuthMethod::Agent),
             other => Err(crate::error::ConfigError::Invalid {
                 field: field.to_owned(),
-                reason: format!("unknown backend_auth {other:?} (expected \"key\" or \"cert\")"),
+                reason: format!(
+                    "unknown backend_auth {other:?} (expected \"key\", \"cert\" or \"agent\")"
+                ),
             }),
         }
     }
@@ -57,8 +68,36 @@ impl BackendAuthMethod {
         match self {
             BackendAuthMethod::Key => "key",
             BackendAuthMethod::Cert => "cert",
+            BackendAuthMethod::Agent => "agent",
         }
     }
+}
+
+/// The **kill-switch veto** for agent-mode backend auth (plan-agent-passthrough
+/// C1): `backend_auth = "agent"` is only usable when the instance-level
+/// `[backend] allow_agent_backend_auth` switch is on.
+///
+/// The switch is deliberately a one-vote *veto* rather than an enabler: an
+/// operator can opt a single grant into agent mode from the control plane only
+/// if the instance also allows it, and a mis-set switch can never be papered
+/// over. When it fires the answer is an error — **never** a silent downgrade to
+/// the gateway's own `key`/`cert` (red line 3).
+///
+/// Pure, so both config validation (default value) and the credential-resolve
+/// path (per-grant policy override) share exactly the same rule.
+pub fn ensure_agent_backend_auth(
+    method: BackendAuthMethod,
+    allow_agent_backend_auth: bool,
+) -> std::result::Result<(), crate::error::ConfigError> {
+    if method == BackendAuthMethod::Agent && !allow_agent_backend_auth {
+        return Err(crate::error::ConfigError::Invalid {
+            field: "backend.allow_agent_backend_auth".into(),
+            reason: "backend_auth = \"agent\" requires [backend] allow_agent_backend_auth = true; \
+                     refusing to continue (never downgrading silently to key/cert)"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve which credential the gateway presents to a backend.
@@ -70,6 +109,11 @@ impl BackendAuthMethod {
 ///
 /// Pure by design (plan S3): no I/O, no clock, no locks — so the routing rules
 /// are directly unit-testable.
+///
+/// Note this only picks *which* credential; it does not enforce the agent
+/// kill-switch. That gate is [`ensure_agent_backend_auth`], applied by the
+/// dialer at resolve time so an `agent` answer can never fall through to
+/// `key`/`cert`.
 pub fn resolve_backend_auth(
     instance_default: BackendAuthMethod,
     grant_override: Option<BackendAuthMethod>,
@@ -100,7 +144,14 @@ impl CredentialStore {
             default = Some(Arc::new(load_private_key_checked(path, false)?));
         }
 
-        if by_user.is_empty() && default.is_none() {
+        if by_user.is_empty()
+            && default.is_none()
+            && config.backend.backend_auth != BackendAuthMethod::Agent
+        {
+            // Agent mode is the exception: it authenticates as the *end user*
+            // through the forwarded agent, so no gateway key material exists by
+            // design (plan-agent-passthrough C1: "agent mode needs neither key
+            // nor CA").
             return Err(BackendError::ChannelOpen {
                 reason: "no backend credentials configured".into(),
             }
@@ -310,6 +361,10 @@ pub struct BackendDialer {
     /// `[backend] backend_auth`: the default credential for grants that do not
     /// carry their own override.
     backend_auth: BackendAuthMethod,
+    /// `[backend] allow_agent_backend_auth`: the global kill-switch vetoing
+    /// agent-mode backend auth (default off). One vote: it can only ever *block*
+    /// `agent`, never enable it against `backend_auth`'s intent.
+    allow_agent_backend_auth: bool,
     /// Per-target dial circuit breaker (§3.8): after `threshold` consecutive
     /// dial failures a target is short-circuited so repeated channel opens don't
     /// pile onto a dead backend.
@@ -393,6 +448,7 @@ impl BackendDialer {
             dial_timeout: config.control_plane.timeout,
             ca,
             backend_auth: config.backend.backend_auth,
+            allow_agent_backend_auth: config.backend.allow_agent_backend_auth,
             dial_breaker: DialCircuitBreaker::new(
                 config.pool.circuit_failure_threshold,
                 config.pool.circuit_reset_timeout,
@@ -420,12 +476,46 @@ impl BackendDialer {
         format!("{}:{}", grant.target.host, grant.target.port)
     }
 
+    /// The credential a grant resolves to, ignoring a *malformed* policy value.
+    ///
+    /// Malformed values are deliberately left to the authoritative (unchanged)
+    /// post-dial error path below, so this lenient view exists purely to run the
+    /// agent kill-switch veto early — it must never turn a `key`/`cert` session
+    /// into a different outcome. Pure: no I/O, no locks.
+    fn resolved_method_lenient(&self, grant: &Grant) -> BackendAuthMethod {
+        match grant.policy.backend_auth_method() {
+            Some(Ok(method)) => method,
+            _ => self.backend_auth,
+        }
+    }
+
     /// Establish an authenticated backend session for the grant's target.
     ///
     /// Fail-fast gate: if the per-target dial breaker is open, this returns
     /// [`BackendError::CircuitOpen`] without touching the network, so a dead
     /// backend can't stall every channel open. Every outcome feeds the breaker.
     pub async fn connect(&self, grant: &Grant) -> Result<Handle<BackendClient>> {
+        // C1 kill-switch veto, evaluated at *credential-resolve* time and before
+        // any network I/O: a resolved `agent` with the switch off is an error,
+        // never a silent downgrade to the gateway's own key/cert (red line 3).
+        // Non-agent grants pass this check untouched.
+        let resolved = self.resolved_method_lenient(grant);
+        ensure_agent_backend_auth(resolved, self.allow_agent_backend_auth)?;
+        if resolved == BackendAuthMethod::Agent {
+            // This is the key/cert dial path. Agent-mode dials need this
+            // session's *forwarded agent* as a Signer and are driven by the
+            // per-session supervisor through `connect_agent` (C2). Reaching here
+            // means the two paths were mixed up: say so instead of falling back
+            // to a gateway key (red line 3).
+            return Err(BackendError::ChannelOpen {
+                reason:
+                    "backend_auth = \"agent\" must dial through the agent path (connect_agent), \
+                     not the gateway key/cert path"
+                        .into(),
+            }
+            .into());
+        }
+
         let key = Self::breaker_key(grant);
         if !self.dial_breaker.allows(&key) {
             self.metrics.backend_dial_fail();
@@ -492,6 +582,13 @@ impl BackendDialer {
                     })
             }
             BackendAuthMethod::Cert => self.authenticate_with_certificate(&mut handle, grant).await,
+            // Unreachable by construction — `connect` refuses `agent` before it
+            // dials. Kept as an explicit failure (never a `panic!`, never a
+            // fall-through to `key`/`cert`) so a future refactor cannot turn this
+            // arm into a silent credential downgrade.
+            BackendAuthMethod::Agent => Err(BackendError::ChannelOpen {
+                reason: "backend_auth = \"agent\" is not served by the key/cert dial path".into(),
+            }),
         };
 
         match outcome {
@@ -748,6 +845,102 @@ mod tests {
         assert_eq!(BackendAuthMethod::Key.as_str(), "key");
         assert_eq!(BackendAuthMethod::Cert.as_str(), "cert");
         assert!(BackendAuthMethod::parse("f", "token").is_err());
+    }
+
+    #[test]
+    fn backend_auth_agent_parses_and_round_trips() {
+        use crate::backend::BackendAuthMethod;
+        assert_eq!(
+            BackendAuthMethod::parse("f", "agent").unwrap(),
+            BackendAuthMethod::Agent
+        );
+        // Whitespace tolerance matches key/cert.
+        assert_eq!(
+            BackendAuthMethod::parse("f", "  agent ").unwrap(),
+            BackendAuthMethod::Agent
+        );
+        assert_eq!(BackendAuthMethod::Agent.as_str(), "agent");
+        assert_eq!(
+            BackendAuthMethod::parse("backend.backend_auth", "agent")
+                .unwrap()
+                .as_str(),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn backend_auth_parse_error_names_all_three_accepted_values() {
+        use crate::backend::BackendAuthMethod;
+        let err = BackendAuthMethod::parse("backend.backend_auth", "token").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("\"key\""), "{msg}");
+        assert!(msg.contains("\"cert\""), "{msg}");
+        assert!(msg.contains("\"agent\""), "{msg}");
+    }
+
+    #[test]
+    fn resolve_backend_auth_carries_agent_through() {
+        use crate::backend::{resolve_backend_auth, BackendAuthMethod};
+        // Instance default wins when the grant says nothing.
+        assert_eq!(
+            resolve_backend_auth(BackendAuthMethod::Agent, None),
+            BackendAuthMethod::Agent
+        );
+        // The grant override still wins, in both directions.
+        assert_eq!(
+            resolve_backend_auth(BackendAuthMethod::Key, Some(BackendAuthMethod::Agent)),
+            BackendAuthMethod::Agent
+        );
+        assert_eq!(
+            resolve_backend_auth(BackendAuthMethod::Agent, Some(BackendAuthMethod::Key)),
+            BackendAuthMethod::Key
+        );
+    }
+
+    #[test]
+    fn agent_kill_switch_is_a_veto_and_never_a_downgrade() {
+        use crate::backend::{ensure_agent_backend_auth, BackendAuthMethod};
+
+        // Off + agent => hard error naming the switch (never `Ok(key)`).
+        let err = ensure_agent_backend_auth(BackendAuthMethod::Agent, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("allow_agent_backend_auth"), "{msg}");
+        assert!(msg.contains("downgrad"), "{msg}");
+
+        // On + agent => allowed.
+        assert!(ensure_agent_backend_auth(BackendAuthMethod::Agent, true).is_ok());
+        // The switch has no opinion about the non-agent credentials, on or off:
+        // it is a veto, not an enabler.
+        for method in [BackendAuthMethod::Key, BackendAuthMethod::Cert] {
+            assert!(
+                ensure_agent_backend_auth(method, false).is_ok(),
+                "{method:?} must be unaffected by the agent kill-switch"
+            );
+            assert!(ensure_agent_backend_auth(method, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_policy_agent_override_with_the_switch_off_fails_instead_of_downgrading() {
+        // The scenario the plan calls "resolve-time error": a control plane asks
+        // for `agent` while the instance forbids it. The answer must be an error,
+        // never the instance's `key`/`cert` default.
+        use crate::backend::{ensure_agent_backend_auth, resolve_backend_auth, BackendAuthMethod};
+        let policy = crate::types::Policy {
+            backend_auth: Some("agent".to_owned()),
+            ..Default::default()
+        };
+        let override_method = match policy.backend_auth_method() {
+            Some(Ok(method)) => method,
+            other => panic!("expected a well-formed `agent` override, got {other:?}"),
+        };
+        let resolved = resolve_backend_auth(BackendAuthMethod::Key, Some(override_method));
+        assert_eq!(resolved, BackendAuthMethod::Agent);
+        assert!(
+            ensure_agent_backend_auth(resolved, false).is_err(),
+            "an agent grant with the kill-switch off must error, not downgrade"
+        );
+        assert!(ensure_agent_backend_auth(resolved, true).is_ok());
     }
 
     #[test]

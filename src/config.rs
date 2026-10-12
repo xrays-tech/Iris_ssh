@@ -89,9 +89,17 @@ pub struct BackendConfig {
     pub credential_map: BTreeMap<String, PathBuf>,
     pub host_key_policy: HostKeyPolicy,
     /// Which credential the gateway presents: a private key (the default, and the
-    /// only mode that works without a configured CA) or a short-lived user
-    /// certificate issued on the fly (propose §3.3, M4-T3).
+    /// only mode that works without a configured CA), a short-lived user
+    /// certificate issued on the fly (propose §3.3, M4-T3), or the end user's
+    /// forwarded ssh-agent identity (`"agent"`, plan-agent-passthrough).
     pub backend_auth: crate::backend::BackendAuthMethod,
+    /// Global kill-switch for agent-mode backend auth (default **off**).
+    ///
+    /// A one-vote *veto*: `backend_auth = "agent"` (instance default or a
+    /// per-grant `policy.backend_auth` override) is refused unless this is true.
+    /// Enabling it is an explicit statement that the gateway may authenticate to
+    /// backends as whatever identity the end user's agent holds.
+    pub allow_agent_backend_auth: bool,
 }
 
 impl BackendConfig {
@@ -406,9 +414,13 @@ struct RawBackend {
     #[serde(default)]
     credential_map: BTreeMap<String, String>,
     host_key_policy: String,
-    /// `"key"` (default) or `"cert"`.
+    /// `"key"` (default), `"cert"` or `"agent"`.
     #[serde(default = "default_backend_auth")]
     backend_auth: String,
+    /// Global kill-switch for `backend_auth = "agent"` (default off; a veto —
+    /// see [`crate::backend::ensure_agent_backend_auth`]).
+    #[serde(default)]
+    allow_agent_backend_auth: bool,
 }
 
 fn default_backend_auth() -> String {
@@ -771,6 +783,25 @@ impl GatewayConfig {
                 reason: "backend_auth = \"cert\" requires [ca] signing_key (the gateway must be able to issue)".into(),
             });
         }
+        // Agent-mode rules (plan-agent-passthrough C1). No key and no CA is
+        // required — the credential is the end user's, reached through the
+        // forwarded agent — but two hard gates apply:
+        //  * the kill-switch is a veto: `backend_auth = "agent"` while it is off
+        //    is a boot error, never a silent downgrade to `key`/`cert`;
+        //  * pooling and agent mode are mutually exclusive (propose §3.8): a
+        //    shared pooled connection cannot carry a per-session agent identity.
+        crate::backend::ensure_agent_backend_auth(
+            backend_auth,
+            raw.backend.allow_agent_backend_auth,
+        )?;
+        if matches!(backend_auth, crate::backend::BackendAuthMethod::Agent) && raw.pool.enabled {
+            return Err(ConfigError::Invalid {
+                field: "pool.enabled".into(),
+                reason: "must be false while [backend] backend_auth = \"agent\" \
+                         (agent forwarding needs a per-session connection; propose §3.8)"
+                    .into(),
+            });
+        }
         for (user, path) in &raw.backend.credential_map {
             if path.trim().is_empty() {
                 return Err(ConfigError::Invalid {
@@ -789,6 +820,7 @@ impl GatewayConfig {
                 .collect(),
             host_key_policy,
             backend_auth,
+            allow_agent_backend_auth: raw.backend.allow_agent_backend_auth,
         };
 
         if raw.pool.channels_per_conn == 0 || raw.pool.channels_per_conn > 8 {
@@ -1164,6 +1196,82 @@ mod tests {
         );
         let err = GatewayConfig::parse(&bad).unwrap_err();
         assert!(err.to_string().contains("backend_auth"), "{err}");
+    }
+
+    // ---- plan-agent-passthrough C1: agent mode + kill-switch ----
+
+    /// `minimal_toml` with the backend private key stripped and `[backend]`
+    /// overrides appended — agent mode must not require key material.
+    fn agent_toml(extra: &str) -> String {
+        minimal_toml()
+            .replace("private_key = \"/etc/ssh-gw/backend_root_ed25519\"\n", "")
+            .replace("[backend]", &format!("[backend]\n{extra}"))
+    }
+
+    #[test]
+    fn allow_agent_backend_auth_defaults_to_false() {
+        let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
+        assert!(
+            !cfg.backend.allow_agent_backend_auth,
+            "the kill-switch must default OFF so an upgrade changes nothing"
+        );
+    }
+
+    #[test]
+    fn agent_backend_auth_requires_the_kill_switch() {
+        // backend_auth="agent" with the switch off: boot error, never a silent
+        // downgrade to `key`/`cert`.
+        let bad = agent_toml("backend_auth = \"agent\"\n");
+        let err = GatewayConfig::parse(&bad).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("allow_agent_backend_auth"), "{msg}");
+        assert!(msg.contains("downgrad"), "{msg}");
+    }
+
+    #[test]
+    fn agent_mode_needs_neither_a_private_key_nor_a_ca() {
+        // The credential is the end user's, reached through the forwarded agent.
+        let good = agent_toml("backend_auth = \"agent\"\nallow_agent_backend_auth = true\n");
+        let cfg = GatewayConfig::parse(&good).expect("agent mode without key/CA is valid");
+        assert_eq!(
+            cfg.backend.backend_auth,
+            crate::backend::BackendAuthMethod::Agent
+        );
+        assert!(cfg.backend.allow_agent_backend_auth);
+        assert!(cfg.backend.private_key.is_none());
+        assert!(cfg.backend.credential_map.is_empty());
+        assert!(
+            cfg.ca.signing_key.is_none(),
+            "agent mode must not need a CA"
+        );
+    }
+
+    #[test]
+    fn agent_backend_auth_is_incompatible_with_pooling() {
+        // propose §3.8: a pooled connection cannot carry a per-session agent
+        // identity — config-time error, not a runtime surprise.
+        let bad = agent_toml("backend_auth = \"agent\"\nallow_agent_backend_auth = true\n")
+            .replace("enabled = false", "enabled = true");
+        assert!(bad.contains("enabled = true"), "precondition of the test");
+        let err = GatewayConfig::parse(&bad).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pool.enabled"), "{msg}");
+        assert!(msg.contains("agent"), "{msg}");
+    }
+
+    #[test]
+    fn the_agent_kill_switch_alone_changes_nothing_for_key_auth() {
+        // It is a veto, not an enabler: turning it on with the default `key`
+        // credential (and its required key material) is a no-op.
+        let toml =
+            minimal_toml().replace("[backend]", "[backend]\nallow_agent_backend_auth = true");
+        let cfg = GatewayConfig::parse(&toml).expect("switch on + key auth is valid");
+        assert_eq!(
+            cfg.backend.backend_auth,
+            crate::backend::BackendAuthMethod::Key
+        );
+        assert!(cfg.backend.allow_agent_backend_auth);
+        assert!(cfg.backend.private_key.is_some());
     }
 
     #[test]

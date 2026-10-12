@@ -1517,14 +1517,57 @@ impl server::Handler for GatewaySession {
         Ok(())
     }
 
-    /// agent-forwarding default-deny (D6): locally refuse, don't forward.
+    /// Agent-forwarding decision (D6 + plan-agent-passthrough C1).
+    ///
+    /// Stays default-deny — byte-for-byte the old `Ok(false)` outcome — unless
+    /// **both** gates pass:
+    ///
+    /// 1. `[backend] allow_agent_backend_auth` (the instance-wide kill-switch,
+    ///    off by default), and
+    /// 2. the control-plane `policy.agent_forwarding` for *this* grant.
+    ///
+    /// `false` is the protocol-native refusal: russh answers CHANNEL_FAILURE for
+    /// `auth-agent-req@openssh.com`, exactly as an unconditional deny does. No
+    /// agent channel is ever opened on the deny path (red line 2/3: nothing is
+    /// forwarded to the backend, nothing silently downgrades).
     async fn agent_request(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<bool, Self::Error> {
-        tracing::debug!(target: "server", %channel, "agent-forwarding request denied");
-        Ok(false)
+        let Some(grant) = self.grant.as_ref() else {
+            tracing::debug!(
+                target: "server",
+                %channel,
+                "agent-forwarding request denied (session has no grant)"
+            );
+            return Ok(false);
+        };
+        // Both gates (instance kill-switch + grant policy) live in one pure
+        // helper so the combined rule is unit-tested and cannot drift here.
+        match crate::policy::agent_passthrough_allowed(
+            self.ctx.config.backend.allow_agent_backend_auth,
+            grant,
+        ) {
+            crate::policy::ForwardDecision::Forward => {
+                tracing::info!(
+                    target: "server",
+                    %channel,
+                    principal = %grant.principal,
+                    "agent forwarding permitted for this grant"
+                );
+                Ok(true)
+            }
+            crate::policy::ForwardDecision::DenyLocally { reason } => {
+                tracing::debug!(
+                    target: "server",
+                    %channel,
+                    %reason,
+                    "agent-forwarding request denied"
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// X11 forwarding unsupported (D6): deny locally.

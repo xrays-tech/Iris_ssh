@@ -207,6 +207,23 @@ pub fn agent_forwarding_allowed(grant: &Grant) -> ForwardDecision {
     }
 }
 
+/// The full gate for an incoming `auth-agent-req@openssh.com`
+/// (plan-agent-passthrough C1): the **instance kill-switch**
+/// `[backend] allow_agent_backend_auth` is a veto, and the grant must also
+/// allow agent forwarding.
+///
+/// `false` on the switch short-circuits before the grant is even consulted, so
+/// an instance with the switch off denies every agent request regardless of what
+/// the control plane says — identical to the historical unconditional deny.
+pub fn agent_passthrough_allowed(allow_agent_backend_auth: bool, grant: &Grant) -> ForwardDecision {
+    if !allow_agent_backend_auth {
+        return ForwardDecision::DenyLocally {
+            reason: "[backend] allow_agent_backend_auth is off".into(),
+        };
+    }
+    agent_forwarding_allowed(grant)
+}
+
 /// X11 forwarding is unsupported by the gateway (M1); it is always denied
 /// locally. Jump/X11 becomes a policy option only in M3.
 pub fn x11_allowed() -> ForwardDecision {
@@ -294,6 +311,41 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(agent_forwarding_allowed(&g), ForwardDecision::Forward);
+    }
+
+    #[test]
+    fn agent_passthrough_needs_both_the_kill_switch_and_the_grant() {
+        // C1: the instance kill-switch is a veto layered on top of the grant.
+        let off_switch = grant_with(Policy {
+            agent_forwarding: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            agent_passthrough_allowed(false, &off_switch),
+            ForwardDecision::DenyLocally { .. }
+        ));
+        // Switch off beats a grant that would otherwise allow it.
+        assert!(
+            agent_passthrough_allowed(false, &off_switch) != ForwardDecision::Forward,
+            "the kill-switch must veto even an agent_forwarding=true grant"
+        );
+
+        // Switch on but the grant says no => still denied.
+        let no_grant = grant_with(Policy::default());
+        assert!(matches!(
+            agent_passthrough_allowed(true, &no_grant),
+            ForwardDecision::DenyLocally { .. }
+        ));
+
+        // Both on => forwarded.
+        let allowed = grant_with(Policy {
+            agent_forwarding: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            agent_passthrough_allowed(true, &allowed),
+            ForwardDecision::Forward
+        );
     }
 
     #[test]

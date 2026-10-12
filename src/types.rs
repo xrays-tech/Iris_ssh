@@ -132,10 +132,14 @@ pub struct Policy {
     /// control plane that predates this field keeps the default-deny behaviour.
     #[serde(default)]
     pub tcp_forwarding_targets: Vec<String>,
-    /// Per-resolve override of the backend credential: `"key"` or `"cert"`.
+    /// Per-resolve override of the backend credential: `"key"`, `"cert"` or
+    /// `"agent"`.
     ///
     /// Absent means "use the gateway's `[backend] backend_auth` default", so a
     /// control plane that predates this field changes nothing (propose §3.3).
+    /// `"agent"` additionally requires the instance kill-switch
+    /// `[backend] allow_agent_backend_auth` to be on; otherwise resolution
+    /// fails loudly instead of downgrading (plan-agent-passthrough C1).
     #[serde(default)]
     pub backend_auth: Option<String>,
     #[serde(default)]
