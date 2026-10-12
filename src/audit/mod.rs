@@ -17,7 +17,7 @@
 //! by propose.md §5.5.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -152,7 +152,10 @@ pub struct Auditor {
     signature_algorithm: String,
     started_at: Instant,
     bytes: Arc<ByteCounters>,
-    command: Option<CommandInfo>,
+    /// The session's primary audit subject (first channel wins). Interior
+    /// mutability so `Arc<Auditor>` handles (the serial handler *and* the
+    /// detached up-pump task) can record without exclusive access.
+    command: Mutex<Option<CommandInfo>>,
     metrics: Metrics,
 }
 
@@ -173,7 +176,7 @@ impl Auditor {
             signature_algorithm,
             started_at: Instant::now(),
             bytes: Arc::new(ByteCounters::default()),
-            command: None,
+            command: Mutex::new(None),
             metrics,
         }
     }
@@ -183,20 +186,27 @@ impl Auditor {
         Arc::clone(&self.bytes)
     }
 
-    /// Record what the (first) channel asked to run.
-    pub fn set_command(&mut self, info: CommandInfo) {
+    /// Record what the (first) channel asked to run. `&self` so it is callable
+    /// through a shared `Arc<Auditor>` from both the handler and the up-pump.
+    pub fn set_command(&self, info: CommandInfo) {
         // Only the first command on the session is the primary audit subject;
         // subsequent channels on the same session inherit it.
-        if self.command.is_none() {
-            self.command = Some(info);
+        let mut guard = self.command.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(info);
         }
     }
 
     /// Produce and emit the final record when the session terminates.
     #[allow(clippy::too_many_arguments)]
-    pub fn finalize(self, exit_code: Option<i32>, exit_signal: Option<String>) -> AuditRecord {
+    pub fn finalize(&self, exit_code: Option<i32>, exit_signal: Option<String>) -> AuditRecord {
         let duration_ms = self.started_at.elapsed().as_millis() as u64;
-        let command_info = self.command.unwrap_or(CommandInfo::Interactive);
+        let command_info = self
+            .command
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or(CommandInfo::Interactive);
         let class = command_info.classify();
         let command_repr = match &command_info {
             CommandInfo::Interactive => None,
@@ -208,8 +218,8 @@ impl Auditor {
             session_id: self.session_id.to_string(),
             principal: self.grant.principal.as_str().to_owned(),
             fingerprint: self.grant.fingerprint.as_str().to_owned(),
-            signature_algorithm: self.signature_algorithm,
-            client_ip: self.client_ip,
+            signature_algorithm: self.signature_algorithm.clone(),
+            client_ip: self.client_ip.clone(),
             target_host: self.grant.target.host.clone(),
             target_port: self.grant.target.port,
             target_user: self.grant.target.user.clone(),
@@ -351,7 +361,7 @@ mod tests {
     #[test]
     fn finalized_audit_record_has_all_fields() {
         let session = SessionId::generate();
-        let mut auditor = Auditor::new(
+        let auditor = Auditor::new(
             session.clone(),
             "203.0.113.9".into(),
             test_grant(),
@@ -394,5 +404,49 @@ mod tests {
         assert_eq!(record.exit_code, None);
         assert_eq!(record.exit_signal.as_deref(), Some("TERM"));
         assert_eq!(record.command_class, "interactive");
+    }
+
+    #[test]
+    fn concurrent_set_command_keeps_first_wins() {
+        // The up-pump task and the serial handler may both record on a shared
+        // Arc<Auditor>; whichever lands first is the audit subject, and every
+        // later write must be ignored (no torn/replaced state under &self).
+        let auditor = Arc::new(Auditor::new(
+            SessionId::generate(),
+            "203.0.113.9".into(),
+            test_grant(),
+            "ssh-ed25519".into(),
+            Metrics::default(),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for info in [
+            CommandInfo::Exec("scp -t /tmp/first".into()),
+            CommandInfo::Exec("rsync --server . /dst".into()),
+        ] {
+            let a = Arc::clone(&auditor);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                a.set_command(info);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Whichever thread won, exactly one command is recorded and it is one
+        // of the two submitted — never a blend or a second overwrite.
+        let first = auditor.finalize(None, None);
+        assert!(
+            first.command.as_deref() == Some("scp -t /tmp/first")
+                || first.command.as_deref() == Some("rsync --server . /dst"),
+            "unexpected command subject: {:?}",
+            first.command
+        );
+        // A later set_command still cannot replace the recorded subject.
+        auditor.set_command(CommandInfo::Interactive);
+        let second = auditor.finalize(None, None);
+        assert_eq!(second.command, first.command);
+        assert_eq!(second.command_class, first.command_class);
     }
 }

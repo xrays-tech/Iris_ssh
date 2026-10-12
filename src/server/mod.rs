@@ -680,7 +680,9 @@ pub struct GatewaySession {
     client_ip: String,
     principal: Option<Principal>,
     grant: Option<Grant>,
-    auditor: Option<Auditor>,
+    /// Shared with the detached up-pump task (route 1 C3), so recording the
+    /// channel's command only needs `&self` on the auditor.
+    auditor: Option<Arc<Auditor>>,
     signature_algorithm: String,
     backend: Option<russh::client::Handle<BackendClient>>,
     /// Per-channel relay state, `Arc`-shared so the serial handler callbacks can
@@ -809,13 +811,13 @@ impl GatewaySession {
                     .add_window_budget((self.ctx.config.relay.window_size as usize) * 2);
                 self.signature_algorithm = certificate.algorithm().to_string();
                 self.principal = Some(principal.clone());
-                self.auditor = Some(Auditor::new(
+                self.auditor = Some(Arc::new(Auditor::new(
                     self.session_id.clone(),
                     self.client_ip.clone(),
                     grant.clone(),
                     self.signature_algorithm.clone(),
                     self.ctx.metrics.clone(),
-                ));
+                )));
                 self.grant = Some(grant);
                 Auth::Accept
             }
@@ -854,10 +856,9 @@ impl GatewaySession {
         }
     }
 
-    /// Deliver a want_reply result to the client via the protocol-native
-    /// success/failure primitives (russh gates on the client's real want_reply).
-    fn record_channel_command(&mut self, _id: ChannelId, info: &CommandInfo) {
-        if let Some(auditor) = self.auditor.as_mut() {
+    /// Record the audit subject for this channel's first command (first wins).
+    fn record_channel_command(&self, _id: ChannelId, info: &CommandInfo) {
+        if let Some(auditor) = &self.auditor {
             auditor.set_command(info.clone());
         }
     }
@@ -960,13 +961,13 @@ impl server::Handler for GatewaySession {
                     .metrics
                     .add_window_budget((self.ctx.config.relay.window_size as usize) * 2);
                 self.principal = Some(principal);
-                self.auditor = Some(Auditor::new(
+                self.auditor = Some(Arc::new(Auditor::new(
                     self.session_id.clone(),
                     self.client_ip.clone(),
                     grant.clone(),
                     self.signature_algorithm.clone(),
                     self.ctx.metrics.clone(),
-                ));
+                )));
                 self.grant = Some(grant);
                 Ok(Auth::Accept)
             }
