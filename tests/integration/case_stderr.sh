@@ -9,7 +9,7 @@ miss="/nonexistent_sshgw_dir_$$"
 outfile="$IT_WORK_DIR/stderr.out"
 errfile="$IT_WORK_DIR/stderr.err"
 rc=0
-ssh "${SSH_OPTS[@]}" "$TARGET" "ls $miss" >"$outfile" 2>"$errfile" || rc=$?
+ssh "${SSH_OPTS[@]}" "$TARGET" "LC_ALL=C ls $miss" >"$outfile" 2>"$errfile" || rc=$?
 # exit code must be non-zero (ls returns 1 on macOS/Linux for a missing file).
 if [ "$rc" -ne 0 ]; then pass "stderr-case rc=$rc (non-zero)"; else
   fail "expected non-zero rc from 'ls $miss', got 0"; fi
