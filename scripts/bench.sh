@@ -92,7 +92,11 @@ hard_deadline = "20s"
 [metrics]
 addr = "127.0.0.1:$M"
 EOF
-test -x "${CARGO_TARGET_DIR:-nope}/release/ssh-gw" || cargo build --release --bin ssh-gw >/dev/null 2>&1
+# Default the target dir the way pure_legs.sh does: line 96 dereferences it
+# unconditionally, so an unset CARGO_TARGET_DIR (any run outside `cargo`) aborted
+# the whole benchmark before the gateway could start.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+test -x "${CARGO_TARGET_DIR}/release/ssh-gw" || cargo build --release --bin ssh-gw >/dev/null 2>&1
 "${CARGO_TARGET_DIR}/release/ssh-gw" --config "$WORK/gw.toml" >"$WORK/gw.log" 2>&1 & GWPID=$!
 ok=0; for i in $(seq 1 40); do curl -sf "http://127.0.0.1:$M/healthz" >/dev/null 2>&1 && { ok=1; break; }; sleep 0.25; done
 [ "$ok" = 1 ] || { echo "gateway failed to start" >&2; tail -15 "$WORK/gw.log" >&2; exit 2; }
