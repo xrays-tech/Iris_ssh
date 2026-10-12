@@ -150,3 +150,29 @@ PASS（RSS ≤150MB 上界内，无回退）；两方法学的握手延迟均与
 
 > 备注：本脚本握手绝对值（~2.06s）高于 bench.sh（~1.17s）系脚本差异（计时含一次
 > 认证 backoff 重试窗口），两二进制在两方法学下均完全一致，不影响 A/B 结论。
+
+## 纯腿尺度 nodelay×window A/B（warpgate 对比，2026-10-12）
+
+`scripts/pure_legs.sh`（单方向纯腿探针，bench.sh 拓扑，64MB、2轮×3次、字节校验、交替 A/B）。
+
+| 配置（纯腿 via 网关） | pure-up | pure-down |
+|---|---|---|
+| 基线（nodelay=false, 1MB） | 49.6 | 52.8 |
+| nodelay=true, 1MB | 53.0 | 54.6 |
+| nodelay=false, 2MB | 49.2 | 51.8 |
+| **nodelay=true, 2MB（=warpgate）** | **53.2** | **54.6** |
+| nodelay=true, 8MB | 46.3 | 54.6 |
+
+相对基线：nodelay 单独 +7~8%（上/下）、window 单独 ~0%、nodelay+2MiB 组合 +7.3% 上 / +3.4% 下、8MB 反而伤上行（46.3）。**无任何格达到 ≥10% 门槛** → 此轴不触发默认配置变更。warpgate 对齐开关（nodelay+2MiB）不能复现其宣称性能；盲点闭合，天花板仍在 ~50-54 MB/s。
+
+## 单腿 SSH 吞吐（Phase 2-T1，2026-10-12）
+
+仅一跳 SSH 加密的吞吐（决定 crypto 是否瓶颈）。独立最小 harness（OpenSSH→russh 回显 / russh→sshd，`/tmp/leg-single`），64MiB、5轮中位数、字节校验、回环；协商 aes256-gcm（L1）/ chacha20（L2）。
+
+| 腿 | up | down | round-trip |
+|---|---|---|---|
+| **L0** OpenSSH→OpenSSH（基线参考） | 377.7 | 330.2 | 256.4 |
+| **L1** OpenSSH→russh server | 480.8 | 322.3 | 478.7 |
+| **L2** russh client→OpenSSH sshd | 301.1 | 368.4 | 218.8 |
+
+→ 单腿 ≥ ~219 MB/s ≫ 网关 50 MB/s：crypto 不是瓶颈，去一跳加密无法解释 ~6x 差距；天花板属双链窗口/补窗调度。完整裁决见 `docs/perf-investigation.md` Phase 2。

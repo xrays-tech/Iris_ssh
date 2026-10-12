@@ -149,3 +149,94 @@ cargo build --release
 make bench                      # via-gw scp ~45 MB/s, loss ~86% (recorded)
 scripts/run_integration.sh      # 24 PASS / 2 SKIP / 1 env-pre-existing FAIL (case_stderr, locale)
 ```
+
+---
+
+# Phase 2 — warpgate comparison, decisive measurements & closure (2026-10-12)
+
+## 9. warpgate reference study
+
+Research of warp-tech/warpgate (primary source @librarian, russh internals
+verified) — motivation: warpgate is often described as "near-direct speed" for
+the same dual-hop (client→gateway→target) shape.
+
+**Findings** (evidence marked [X]=external primary-source, [F]=verified in repo/russh):
+- warpgate uses **stock russh 0.63.3** (crates.io, not a fork; no custom
+  transport). Its data plane is the same decoupled-pump shape we built and
+  measured at ~0% gain in route-1 C3; its downlink even has an extra `to_vec()`
+  copy [X].
+- Its only real config differences vs our defaults: **`nodelay:true` on both
+  legs** (we default false = Nagle-on), **2 MiB channel window** (russh default;
+  we default 1 MB), `event_buffer_size=100` (russh default 10) [X].
+- Its own issue history shows the same walls in the same scenarios: #2292 OOM
+  (linear memory growth on large transfers), #2494 high-throughput stall, #459
+  ~6-9x slower than direct on Ansible, #479 scp OOM. **No third-party quantified
+  "near-direct" throughput evidence exists** [X].
+- russh upstream: PR #653 (removed per-packet mlock, +47%, present since
+  0.63.3); issue **#770 — client-side `adjust_window` has a code defect**: the
+  client leg calls `adjust_window_size` with the constant `config.window_size`
+  (`client/encrypted.rs:577`), so the handler's `adjust_window` return value is
+  never applied — dynamic receive-window tuning is broken client-side [F].
+  russh #770 also demonstrates receive window is the dominant throughput lever
+  (2 MiB → 560 MiB/s, 4 KiB → 92, 1 KiB → 28) [X].
+
+**Adjudication of an external "ChannelWriter" proposal** (another AI's analysis
+claiming 3-10x from a dedicated writer / event-driven / per-channel tasks): its
+claimed mechanism is exactly route-1 C3 (already implemented, measured ~0%,
+reverted); its "warpgate zero-copy" claim is false (warpgate has a downlink
+`to_vec`); its 150-500 MB/s predictions are unsourced. **Rejected.** The only
+real differences are the two config flags above, which we then measured (T2).
+
+## 10. Decisive measurements T1 & T2 (merged with oracle decision tree)
+
+### T1 — single-leg throughput (only ONE SSH crypto pass; decisive fork)
+
+Harness: minimal russh echo server + russh client in `/tmp/leg-single`
+(independent project; no production code touched). 64 MiB, 5 runs, medians,
+byte-verified, loopback; negotiated aes256-gcm (L1) / chacha20 (L2).
+
+| Leg | up | down | round-trip |
+|---|---|---|---|
+| **L0** OpenSSH→OpenSSH (baseline ref) | 377.7 | 330.2 | 256.4 MB/s |
+| **L1** OpenSSH→russh server | 480.8 | 322.3 | 478.7 MB/s |
+| **L2** russh client→OpenSSH sshd | 301.1 | 368.4 | 218.8 MB/s |
+
+→ **min ≈ 219 MB/s ≫ 50 MB/s: a single SSH leg saturates far above the gateway
+ceiling.** Crypto is **not** the bottleneck; removing one hop's encryption
+cannot produce the ~6x gap. Architecture-level de-encryption (route C) is
+**negated**.
+
+### T2 — pure-leg nodelay × window A/B (warpgate-aligned blind spot)
+
+`scripts/pure_legs.sh` (committed), same-methodology via-gateway, 64 MB, 2×3,
+byte-verified, alternating:
+
+| config | pure-up | pure-down |
+|---|---|---|
+| baseline (nodelay=false, 1 MB) | 49.6 | 52.8 |
+| nodelay=true, 1 MB | 53.0 | 54.6 |
+| nodelay=false, 2 MB | 49.2 | 51.8 |
+| nodelay=true, 2 MB (=warpgate) | 53.2 | 54.6 |
+| nodelay=true, 8 MB | 46.3 | 54.6 |
+
+→ best cell +7.3% up / +3.4% down — **no combination reaches the ≥10% gate**.
+No default-config change is warranted by this axis; warpgate-aligned
+`nodelay+2MiB` does not reproduce its reported performance. Blind spot closed.
+
+## 11. Final decision-tree outcome
+
+| Route | Verdict | Basis |
+|---|---|---|
+| A — config convergence (window 2 MiB / nodelay default) | **NO-GO** (gate ≥10%) | T2: window ~0%, nodelay +7~8% (below bar, no default flip) |
+| B — russh upstream patch (#770 dynamic window / half-window eager top-up) | **GO-candidate — only remaining lever** | T1 ⇒ window/refill scheduling is the binding constraint; targets the effective-window ÷ refill-RTT model; conservative +15~30% [S] |
+| C — architecture de-encryption (bare TCP / local channel / ProxyJump) | **NO-GO** | T1 single-leg ≫50 ⇒ crypto not the limit; ProxyJump also violates gateway auth/audit requirement |
+| T3 — window-refill RTT / binding-window diagnostic | next measurement | corroborates B before any fork |
+| T10 — record ceiling, pivot KPI to connection-level | fallback | if B declined / fails |
+
+**Conclusion**: the ~50 MB/s ceiling is a dual-SSH-chain **window/refill
+scheduling** limit (effective receive window of the opponent leg ÷ refill
+round-trip across both legs and per-chunk mpsc hops), not implementation copies,
+scheduling shape, or crypto. Single-leg plumbing does ~220-480 MB/s on this
+host; the gateway spends the rest on window-refill round-trips. The single
+promising lever left is a russh upstream patch (B), which requires forking /
+vendoring russh — a maintenance commitment to approve explicitly.
