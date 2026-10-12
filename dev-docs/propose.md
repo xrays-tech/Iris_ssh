@@ -185,6 +185,19 @@ async fn pump_backend_to_client(mut bch: Channel<client::Msg>, up: ServerUpstrea
 - 一条客户端连接 lazily 建立一条后端连接，多 channel 复用（scp/rsync 走 ControlMaster 复用连接时天然受益）。
 - 会话状态机：`Handshake → Auth → Authorized → ChannelOpen(懒拨号) → RequestRelaying(执行型请求前) → DataFlow(执行型请求后) → Closed`；任意一侧断开联动关闭另一侧，审计落盘（session-id 用 UUIDv7 串联两侧日志）。
 
+### 3.5.1 单顺序消费者例外（agent 穿透模式，红线 11）
+
+**动机。** §3.5 的设计前提是「handler 侧同步处理，不做跨会话异步等待」。agent 穿透打破了这个前提：网关必须作为 SSH 客户端，向用户端发起 `channel_open_agent()`、建立 `AgentClient`、`request_identities()` 并在需要签名时调用 `sign_request()` —— 这些都是 **await**，且必须发生在用户端连接的 session 事件循环之上。若在 `agent_request()`/handler 回调里直接 await，会阻塞 russh 的单线程串行事件循环，导致后端/用户端后续消息无法推进，形成**自锁死锁**（D11 违例）。
+
+**例外条款。** agent 模式下，允许把「agent 通道生命周期 + 后端拨号 + 队列消费」整体搬进一个 **per-session supervisor task**，handler 侧只做非阻塞入队。该例外受以下四条限定词约束，任一违反即视为越过红线 11：
+
+1. **作用域仅限 agent 模式。** supervisor 只在 `backend_auth = "agent"` 且 `allow_agent_backend_auth = true` 时存在；非 agent 路径（key/cert）**字节级不变**，不引入任何新的 task、channel 或 await 点。
+2. **每会话单一顺序消费者。** 每条用户端连接至多一个 supervisor task、一个 FIFO 队列。禁止 per-request spawn、禁止多消费者合并、禁止乱序消费、禁止注入请求。FIFO 串行消费保证 I1（channel ↔ 后端 1:1 绑定）不被破坏 —— 签名请求与后续 pty/shell/env/data 的因果顺序由串行消费天然保证。
+3. **handler 侧永不阻塞、内存有界（C5/D11）。** handler 回调内只做 `try_send`（Dialing 状态下队列满 → 该 channel 原生失败并计数，**绝不 await**）；Ready 状态下的 `send().await` 等价于今天的内联背压，不新增缓冲。队列容量 = `ceil(relay.window_size / max_packet)` 槽位，保证入队数据总量 ≤ `relay.window_size`（I2/I3 记忆体上界继续成立）。锁内不 await（D11）：就绪信号用 oneshot/watch，不用 `Mutex` 保护的条件变量。
+4. **失败走协议原生、不回退凭证（I4/红线 3）。** supervisor 任一环节失败（grant 超时、agent 通道被拒、无匹配指纹身份、`connect_agent` 认证失败、后端通道建立失败）→ 排空队列并对 pending 请求回 `Handle::channel_failure`、再 `Handle::close`，**绝不**回退到 `backend_auth = "key"`/`"cert"`，也绝不静默降级。签名面最小化（红线 4）：只对 resolve 出的目标拨号签名，且只用与 `grant.fingerprint` 匹配的 agent 身份。
+
+**可观测性。** 上述失败均需可观测：`auth_kind="agent"` 进入审计与指标，`sshgw_agent_signatures_total`、`sshgw_agent_channel_denied_total` 与 `agent_identity`（指纹）随审计记录落盘。
+
 ### 3.6 流量控制与背压（⚠️ 修正 #2）
 
 **目标：网关内存占用必须有协议级上界，禁止无限缓冲。**
