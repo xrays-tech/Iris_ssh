@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # case_agent_auth.sh — C3: agent passthrough works end to end (`ssh -A`).
 #
-# Topology: the backend's authorized_keys holds ONLY the end user's key, so the
-# gateway's own backend credential cannot log in. backend_auth="agent" plus the
-# instance kill-switch are on, and the control-plane grant allows agent
-# forwarding. A real ssh-agent holding the user's key is started locally and
-# forwarded with -A.
+# Topology: the backend's authorized_keys holds ONLY the end user's key, and the
+# gateway holds no credential of its own (plan-agent-only). The control-plane
+# grant allows agent forwarding, and a real ssh-agent holding the user's key is
+# started locally and forwarded with -A.
 #
 # Asserted: the remote command runs (the signature really came from the agent),
 # the agent counters move, and the audit record says which credential and which

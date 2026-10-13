@@ -10,12 +10,12 @@
 - **触发条件**（运维说明）：后端纳管规模化、需要 host key 证书化（CA 统一签发 host 证书）时，配合测试 CA 生成 host 证书并纳入网关 `[ca] trusted_ca_keys`。
 - **备注**：网关第 0 步 `WrongCertType` 比 OpenSSH known_hosts 的 `@cert-authority` 传统实现更严（其不区分 cert type）——此为有意的安全护栏，勿当冗余删除。
 
-## 2. 后端 `TrustedUserCAKeys`（用户证书拨号 / cert-dial）——M4 已实现（`11d42cb`）
+## 2. 后端 `TrustedUserCAKeys`（用户证书拨号 / cert-dial）——已随 agent-only 改造删除
 
-- **状态**：**M4 已实现并实跑 PASS**。后端证书拨号已落地（src/backend/mod.rs:516-548 `authenticate_with_certificate`）：`[backend] backend_auth="cert"` 时，每次 `connect` **现签一短期用户证书**（principals=`target.user`、lifetime=`[ca].cert_lifetime`、key_id 含审计标识），**不缓存不复用**；内层身份密钥优先用运维配置，否则一次性 ephemeral Ed25519 密钥对（cert 模式可省 `private_key` 的依据，后端信任的是 CA 而非特定网关密钥）；无 CA → fail-fast。`case_cert_dial` 实跑 PASS（cert-only 后端、authorized_keys 明确为空 → 网关会话成功即真证书认证证明，且先经 direct cert login 自证后端信任链）。
-- **影响**：后端配置 `TrustedUserCAKeys` 要求用户证书认证时，网关以短期证书登录可用；`backend_auth` 缺省 `"key"` 走原私钥路径，零回归。
-- **触发条件**（运维说明）：后端安全策略要求用户级 CA 统一签发（网关短期用户证书；后端 `TrustedUserCAKeys` 校验）时；真机 `root@47.109.73.53` 可选加跑（改其后端 sshd_config，需协调维护窗口）。
-- **备注**：cert 模式若提供 `[ca] signing_key` 必须以 `trusted_ca_keys` 同配（互斥校验 config.rs:865-868）；规模化可考虑进程级复用一次性身份密钥（证书仍现签），纯优化项。
+- **状态**：**cert-dial 已在 plan-agent-only D3 中删除**，不再是能力项。原先 `[backend] backend_auth="cert"` 在每次 `connect` 现签短期用户证书的路径（`authenticate_with_certificate`）连同 `[ca] signing_key` / `[ca] cert_lifetime` / `[backend] backend_auth` / `[backend] private_key` / `credential_map` 一并移除；`case_cert_dial` 用例随之下线。
+- **影响**：后端不再支持"只信 `TrustedUserCAKeys`、不放用户公钥"的接入方式。后端要接受网关会话，`authorized_keys` 必须放**终端用户自己的公钥**，由转发来的 ssh-agent 签名（这是唯一的后端认证方式）。
+- **触发条件**（运维说明）：若某后端策略只允许 `TrustedUserCAKeys`，当前版本无法满足——需要 agent 穿透，或等后续批次重新引入"网关签发短期用户证书"作为第二身份。旧配置里残留的 `backend_auth` / `private_key` / `signing_key` 等键按未知键**忽略**，不会报错也不会生效。
+- **备注**：`[ca] trusted_ca_keys` **仍保留且是 verify-only 的**——用于（a）前端用户证书认证、（b）后端 host 证书（`@cert-authority`）校验，见第 1 节。变的只是"网关不再签发"。
 
 ## 3. 半开假死（iptables DROP）与 netem 真机演练未在本机实跑
 
@@ -47,4 +47,4 @@
 - **已试验**：数据路径调度重构（mpsc+sender task）→ 零收益，经 @oracle 裁决回退（提交 `d6c4eb5`）；`max_packet`/`window_size` 扫描影响 <1%。
 - **调研提示的关键机会（未落地，需实测）**：russh 单跳回环可达 400~580 MB/s；同构双会话中继（warpgate）rsync≈直连；**两份被忽视的低成本项第一是双腿 `nodelay=true`（当前 Nagle 开）**，其次是腿 A/B 隔离诊断、cipher A/B（aes-gcm vs chacha20）、写路径流水化（仿 bssh 6.2x 经验）。
 - **影响**：粗略说「经网关 scp 比直连慢 ~6 倍」属预期特性，非故障；容量规划按此基准（连接级 KPI：ControlMaster 复用、每连接建立成本、并发会话容量）而非单连接吞吐。
-- **触发条件 / 处置**：若单连接吞吐成为业务硬需求 → 架构级选项：ProxyJump 直通引导（客户端 `-J`，内层 SSH 密文透传省一跳加密，UX/审计需产品决策）或可信后端裸 TCP 直通（需威胁建模评审）。参照基线见 perf-report 末尾。
+- **触发条件 / 处置**：若单连接吞吐成为业务硬需求 → 架构级选项：ProxyJump 直通引导（客户端 `-J`，内层 SSH 密文透传省一跳加密，UX/审计需产品决策）或可信后端裸 TCP 直通（需威胁建模评审）。注意这两条都依赖 `direct-tcpip`，而它在 agent-only 改造中已是**无条件恒拒绝**——要重开属于产品决策，不是配置项。参照基线见 perf-report 末尾。

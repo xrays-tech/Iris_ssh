@@ -63,7 +63,7 @@
 ```json
 POST /api/v1/resolve  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA256:.."}
 → 200 {"target":{"host":"10.1.2.3","port":22,"user":"root"},
-       "policy":{"agent_forwarding":false,"tcp_forwarding":false,"recording":false,"ttl":60}}
+       "policy":{"agent_forwarding":true,"recording":false,"ttl":60}}
 → 404 / 403 / 429
 ```
 
@@ -95,7 +95,9 @@ POST /api/v1/resolve  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA25
 
 ### 3.3 网关 → 后端认证
 
-与 v1 一致：网关密钥环 `credential_map = {"root" = "/keys/root_ed25519"}`，文件 0600，支持 KMS 加载与热轮换；后端 `authorized_keys` 放网关公钥（长期：网关签发短期用户证书 + `TrustedUserCAKeys`）；后端主机密钥策略 `pinned`（生产）/ `accept-new` + 告警。
+**唯一方式：agent 穿透。** 网关把客户端转发来的 ssh-agent（`ssh -A` / `-o ForwardAgent=yes`）接到后端拨号上，签名由终端用户的 agent 完成，网关自身不持有也不代管任何后端私钥 —— 没有 `credential_map`、没有 `[backend] private_key`、没有 cert-dial（`[ca] signing_key` 已删除）。放行与否由控制面逐 grant 决定：`policy.agent_forwarding = true` 才建立后端会话，否则整体拒绝（无凭据可降级）。身份约束：只提供控制面已授权指纹对应的那个 agent 身份，agent 里其他的 key 不参与（最小签名面）。
+
+后端侧配置相应简化：`authorized_keys` 放**用户公钥**；后端主机密钥策略 `pinned`（生产）/ `accept-new` + 告警。
 
 ### 3.4 Channel 请求转发矩阵（含 want_reply 语义）
 
@@ -306,8 +308,7 @@ Checkout 防护：
 [host_keys]     keys = [ { path = "/etc/ssh-gw/host_ed25519", state = "active" },
                          { path = "/etc/ssh-gw/host_rsa",     state = "active" } ]
 [relay]         window_size = "1MB"   max_packet = "32KB"   outbound_guard = true
-[backend]       private_key = "/etc/ssh-gw/backend_root_ed25519"
-                host_key_policy = "pinned"
+[backend]       host_key_policy = "pinned"
 [pool]          enabled = false        channels_per_conn = 8
                 keepalive_interval = "15s"  keepalive_timeout = "5s"  keepalive_max_miss = 2
 [control_plane] url = "https://cp.internal"  cache_ttl = "30s"  timeout = "2s"

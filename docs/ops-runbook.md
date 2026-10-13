@@ -47,11 +47,12 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 ```
 `[host_keys] keys` 可多算法同时 offer（`state=active` 签名 / `passive` 仅通告学习）。
 
-### 2.4 后端授权（三种模式）
-- **key 模式（默认）**：网关后端私钥 `[backend] private_key`（或 `credential_map`），对应公钥加入后端 `authorized_keys`。
-- **cert 模式（可选）**：后端 sshd 配 `TrustedUserCAKeys <网关CA公钥>`，网关 `[backend] backend_auth="cert"` + `[ca] signing_key`，拨号时现签短期用户证书（后端不再需要网关公钥）。
-- **agent 模式（可选，C2）**：以**终端用户自己的 ssh-agent** 作为后端凭据，即 `ssh -A` 语义的 agent 穿透。后端 `authorized_keys` 放用户公钥；网关既不需要也不使用自己的 key/CA（`private_key` 与 `[ca]` 均可省略）。详见 §5.7。
+### 2.4 后端授权（唯一模式：agent 穿透）
+- 网关 → 后端的凭证**只有一种**：终端用户自己的 ssh-agent，即 `ssh -A` / `-o ForwardAgent=yes` 语义的 agent 穿透。后端 `authorized_keys` 放**用户公钥**；网关不持有、也不代管任何后端私钥（`[backend] private_key` / `credential_map` 已删除，`backend_auth` / `cert` 模式已删除）。详见 §5.7。
+- 是否放行由控制面逐 grant 决定：resolve 返回 `policy.agent_forwarding`，`true` 才建立后端会话；`false` 则拒绝（**不降级**、无凭据可降级）。
+- **客户端必须转发 agent**：`ssh -A` 或 `-o ForwardAgent=yes`。没带 agent 的会话在后端握手阶段失败，网关不会代签任何东西。
 - 后端 host key 信任：生产用 `host_key_policy="pinned"`（首次 await 后固化指纹）；初次联调可 `accept-new` 并尽快 pin。
+- `direct-tcpip` / jump（跳板）已删除：一律拒绝并计数 `sshgw_direct_tcpip_denied_total`，无任何配置可放开。
 
 ---
 
@@ -65,11 +66,9 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `max_packet` | `32KB` | 最大单包（≤65535） |
 | | `outbound_guard` | `true` | per-channel Semaphore 背压保险丝 |
 | | `env_allowlist` | `[]` | 空=env 原样透传；非空=过滤变量名 |
-| `[backend]` | `private_key` / `credential_map` | — | **key 模式必须其一**（该模式无 key 拒绝启动） |
-| | `host_key_policy` | `pinned` | `pinned` / `accept-new` |
-| | `backend_auth` | `key` | `key` / `cert` / `agent`；**cert 模式要求 `[ca] signing_key`**；`signing_key` 又要求至少一个 `trusted_ca_keys`；**agent 模式要求 `allow_agent_backend_auth=true`，且与 `[pool] enabled=true` 互斥** |
-| | `allow_agent_backend_auth` | `false` | agent 模式的**全局 kill-switch**；为 false 时 agent 授权被整体拒绝（不降级为 key） |
-| `[pool]` | `enabled` | `false` | opt-in 池化；**熔断/channel 上限与 enabled 无关（始终生效）**；**与 `backend_auth="agent"` 互斥（启动即报错）** |
+| `[backend]` | `host_key_policy` | `pinned` | `pinned` / `accept-new`；后端主机密钥信任策略 |
+| | `private_key` / `credential_map` / `backend_auth` / `allow_agent_backend_auth` | — | **已删除**（agent-only 改造）。未知键按 TOML 解析为忽略，不会报错；写旧键的配置仍能启动，但**不再有任何效果** |
+| `[pool]` | `enabled` | `false` | **必须为 `false`**：`enabled = true` 是无条件的配置错误（启动即报错）。agent 穿透下每会话一个后端连接，没有可复用的东西；熔断/channel 上限与 `enabled` 无关，始终生效 |
 | | `channels_per_conn` | `8` | 每连接 ≤8（sshd MaxSessions 安全界） |
 | | `keepalive_interval` / `keepalive_max_miss` | `15s` / `2` | 假死检测（`keepalive_timeout` 为保留字段，实际语义见 §5.3） |
 | | `circuit_failure_threshold` / `circuit_reset_timeout` | `5` / `30s` | 拨号熔断 |
@@ -84,7 +83,7 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `max_auth_attempts` | `10` | 防爆破尝试上限（`0`=不限） |
 | `[shutdown]` | `drain_wait` / `disconnect_flush` / `hard_deadline` | `60s` / `3s` / `30s` | 排水阶段各时限 |
 | `[metrics]` | `addr` | `127.0.0.1:9090` | 健康/指标端口 |
-| `[ca]` | `trusted_ca_keys` / `signing_key` / `cert_lifetime` | 注释 | 证书 CA（见 §5.4） |
+| `[ca]` | `trusted_ca_keys` | 注释 | 证书 CA（**verify-only**，见 §5.4）。`signing_key` / `cert_lifetime` 已删除：网关不再签发任何证书 |
 | `[recording]` | `dir` / `max_bytes_per_session` | `/var/lib/ssh-gateway/recordings` / `64MiB` | 会话录制（`0` 关闭） |
 | `[intercept.sftp]` | `enabled` / `deny_commands` / 路径前缀 | `false` | SFTP 命令级拦截 |
 
@@ -93,7 +92,7 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 ## 4. 认证
 
 - **客户端 → 网关**：公钥（`auth_publickey`）或用户证书（`auth_openssh_certificate`，按 CA / 有效期 / principals 校验）。`auth_publickey_offered` 仅为预热/形状预检，**不**在该阶段做最终 accept。恶意签名一律被 russh 库拒。
-- **网关 → 后端**：见 §2.4 三种模式；cert 模式在 `connect` 时现签短期证书（不缓存）；agent 模式以用户 agent 的签名认证，且**只签控制面已授权的那个指纹**（见 §5.7）。
+- **网关 → 后端**：agent 穿透（§2.4 / §5.7）。网关以用户转发来的 ssh-agent 签名认证，且**只签控制面已授权的那个指纹**；网关自身不提供任何 key/cert 凭据。
 
 ---
 
@@ -126,9 +125,9 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
   # 日志：见 5.6
   ```
 
-### 5.4 证书轮换（CA signing_key）
-- **新连接**：换 `signing_key` 后，下一拨号即签发新 CA 证书（现签不缓存）。
-- **在途连接**：SSH 会话内不再认证，**不**受轮换影响；撤销已建会话是运维侧职责。
+### 5.4 证书信任轮换（`[ca] trusted_ca_keys`）
+- **CA 是 verify-only 的**：`[ca]` 只放 CA 公钥，网关不签发任何证书，因此没有 `signing_key` 轮换这一说。用户证书由运维侧工具（如 `ssh-keygen -s <ca> -n <principal> <userkey.pub>`）签发，轮换 CA = 换 `trusted_ca_keys` 指向的新公钥并重启网关。
+- **在途连接**：SSH 会话内不再认证，**不**受影响；撤销已建会话是运维侧职责。
 - **host 证书信任**：后端若出示 host 证书，网关按四步校验（signing key ∈ `[ca] trusted_ca_keys` → 验签 → 有效期 → principals 含目标主机名）；签发参考 `ssh-keygen -s <ca> -h -n <host> <hostkey.pub>` 或仓库 `scripts/cert_topo.sh`。
 
 ### 5.5 指标与告警建议
@@ -167,22 +166,21 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 | `-A` 会话立刻失败 | `agent_backend_auth_fail_total` + 网关日志中的 reason | 见 §5.7 排障表 |
 | `-A` 会话成功但客户端挂住不退出 | 网关未关闭转发的 agent 通道 | 属缺陷；升级到含 C2 修复的版本 |
 
-### 5.7 Agent 穿透（`backend_auth = "agent"`）
+### 5.7 Agent 穿透（后端认证的唯一方式）
 
-以终端用户的 ssh-agent 作为后端凭据。语义等同 `ssh -A`：**网关只做签名中继，不持有也不代管任何私钥**。
+以终端用户的 ssh-agent 作为后端凭据。语义等同 `ssh -A`：**网关只做签名中继，不持有也不代管任何私钥**。这不是可选模式，而是网关到后端的唯一数据通路（plan-agent-only，propose §3.5.1）。
 
-**启用（三道门，缺一不可）**
-1. 配置 `[backend] backend_auth = "agent"`；
-2. 配置 `[backend] allow_agent_backend_auth = true`（全局 kill-switch，默认 `false`）；
-3. 控制面 resolve 返回 `policy.agent_forwarding: true`（按 grant 授权）。
+**启用（两道门，缺一不可）**
+1. 客户端带 agent：`ssh -A` 或 `-o ForwardAgent=yes`；
+2. 控制面 resolve 返回 `policy.agent_forwarding: true`（按 grant 授权）。
 
-`agent` 与 `cert` 一样支持逐 resolve 覆盖（`policy.backend_auth`），但任何 agent 授权都会先过 kill-switch；kill-switch 关闭时**整体拒绝**，绝不回落为 key/cert。
+没有其他开关：`[backend] backend_auth` 与 `[backend] allow_agent_backend_auth`（旧的全局 kill-switch）都已删除。`policy.agent_forwarding: false` 的 grant **整体拒绝**，既没有、也不会回落成 key/cert——网关手里没有第二套凭证。
 
 **约束**
-- 与 `[pool] enabled = true` **互斥**（池化连接无法携带 per-session 的 agent 身份），启动即报错。
-- 每会话只开**一个**后端通道；`direct-tcpip`（跳板）在 agent 会话中一律拒绝并计数 `sshgw_agent_channel_denied_total`。
+- 每会话只开**一个**后端通道；`direct-tcpip`（跳板）一律拒绝并计数 `sshgw_direct_tcpip_denied_total`。
+- `[pool] enabled` 必须为 `false`（否则启动即报错）：池化连接无法携带 per-session 的 agent 身份。
 - 只有**控制面已授权指纹**对应的 agent 身份会被提供给后端；agent 里即便有别的可用 key 也不会用（最小签名面）。
-- 后端 `authorized_keys` 应只放用户公钥，不要放网关 key——这样一旦网关偷偷降级，会话必然失败而不是"悄悄成功"。
+- 后端 `authorized_keys` 应**只放用户公钥**，不要放任何网关 key——没有网关 key 就没有降级路径，一旦转发链断开会话必然失败而不是"悄悄成功"。
 
 **排障**
 | 症状 / 日志关键字 | 含义 | 处置 |

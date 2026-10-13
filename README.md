@@ -14,13 +14,13 @@ ssh alex_host1@gw.example.com
   后端 sshd（目标机器）
 ```
 
-数据是纯转发的，网关不落盘（除非你显式开启会话录制）。认证、审计、访问控制都发生在网关这一侧，后端机器不需要为网关做任何特殊配置（用普通 SSH 账号即可）。
+数据是纯转发的，网关不落盘（除非你显式开启会话录制）。认证、审计、访问控制都发生在网关这一侧；后端机器唯一的配置是把**终端用户的公钥**放进 `authorized_keys`——网关不持有任何后端私钥，它是靠转发用户的 ssh-agent 去拨号的。
 
 ## 功能
 
 - **用户名即路由**：控制面接口 `POST /api/v1/resolve` 根据用户名返回目标后端 `{host, port, user}` 和策略；拒绝返回 403，未知返回 404。
 - **双会话中继**：终结客户端 SSH（server 腿）+ 拨号后端（client 腿），双向转发。上行有窗口熔断（`outbound_guard`）防止缓冲无限增长。
-- **认证**：公钥 / CA 签发的用户证书；后端拨号支持固定私钥或现签短期证书（`backend_auth="cert"`）。
+- **认证**：客户端 → 网关支持公钥 / CA 签发的用户证书；网关 → 后端只有一种方式——转发客户端的 ssh-agent（`ssh -A` 语义）。
 - **防爆破 / 防时序**：每次认证拒绝有恒定时间填充（`auth_rejection_pad`），尝试次数上限（`max_auth_attempts`），每 IP 并发上限。
 - **会话语义完整**：exec / shell / scp / sftp / stderr（extended data）/ exit status / rekey / 信号全部按 SSH 协议原样透传；不伪造成功、不注入协议行为（I4）。
 - **审计与录制**：按通道录制抓包（`.srec`，默认关闭）；字节计数与操作事件写审计。
@@ -59,9 +59,7 @@ systemd 参考单元在 `deploy/ssh-gw.service`（已配好优雅排水和基本
    chmod 600 /etc/ssh-gw/host_ed25519
    ```
    权限不对会拒绝启动（fail-closed）。
-2. **准备后端拨号身份**（二选一）：
-   - **key 模式（默认）**：另生成一对密钥，私钥写进 `[backend] private_key`（或用 `credential_map` 按用户名指定），公钥加进各后端机器的 `authorized_keys`。
-   - **cert 模式**：后端 sshd 配 `TrustedUserCAKeys` 指向你的 CA 公钥，网关配 `[ca] signing_key` + `backend_auth="cert"`，拨号时现签短期用户证书。
+2. **准备后端授权**：把**终端用户自己的公钥**加进各后端机器的 `authorized_keys`。网关没有自己的后端私钥，也不需要——它拿用户转发来的 ssh-agent 去拨号（`ssh -A` / `-o ForwardAgent=yes`）。`ssh-agent -k` 之后重启会话即可轮换。
 3. **配置控制面**：网关自己不存"用户名→目标"映射，必须有一个控制面服务响应 `POST /api/v1/resolve`。请求体示例：
 
    ```json
@@ -71,30 +69,30 @@ systemd 参考单元在 `deploy/ssh-gw.service`（已配好优雅排水和基本
    响应示例：
 
    ```json
-   {"target": {"host": "db.internal", "port": 22, "user": "alex"}, "policy": {"ttl": 60}}
+   {"target": {"host": "db.internal", "port": 22, "user": "alex"}, "policy": {"agent_forwarding": true, "ttl": 60}}
    ```
-   拒绝返回 `{"status":403,...}`，未知 `{"status":404,...}`。不想搭真实服务的话，仓库里有 [scripts/mock_control_plane.py](scripts/mock_control_plane.py)（按一条 JSON 规则表应答，用于本地联调）。
+   拒绝返回 `{"status":403,...}`，未知 `{"status":404,...}`。`policy.agent_forwarding` 为 `true` 才会建立后端会话；缺省或 `false` 一律拒绝（网关没有可回落的凭据）。不想搭真实服务的话，仓库里有 [scripts/mock_control_plane.py](scripts/mock_control_plane.py)（按一条 JSON 规则表应答，用于本地联调）。
 4. **后端 host key 信任**：生产用 `host_key_policy="pinned"`（首次固化指纹）；初次联调可先 `accept-new` 再尽快 pin。
 
 ## 使用
 
-客户端不用装任何东西，普通 OpenSSH 即可。用户名按控制面的规则填。
+客户端不用装任何东西，普通 OpenSSH 即可。**必须转发 ssh-agent**（`-A` 或 `-o ForwardAgent=yes`）——网关没有自己的后端私钥，会拿你 agent 里的 key 去拨号。用户名按控制面的规则填。
 
 ```bash
-# 登录（用户名即路由）
-ssh -p 2222 alex_host1@gw.example.com
+# 登录（用户名即路由；-A 转发 agent，后端认证靠它）
+ssh -A -p 2222 alex_host1@gw.example.com
 
 # 执行单条命令
-ssh -p 2222 alex_host1@gw.example.com 'uptime'
+ssh -A -p 2222 alex_host1@gw.example.com 'uptime'
 
 # 复制文件（scp 走 sftp/exec 语义，按 SSH 协议转发）
-scp -P 2222 build.tar alex_host1@gw.example.com:/tmp/
+scp -o ForwardAgent=yes -P 2222 build.tar alex_host1@gw.example.com:/tmp/
 
 # 交互式 sftp
-sftp -P 2222 alex_host1@gw.example.com
+sftp -o ForwardAgent=yes -P 2222 alex_host1@gw.example.com
 ```
 
-被连载的会话行为和直连后端基本一致；端口转发（`direct-tcpip`）一律拒绝——网关不是出站跳板。
+被连载的会话行为和直连后端基本一致；端口转发（`direct-tcpip`）一律拒绝——网关不是出站跳板，也没有任何配置能放开它。
 
 观察运行状态：
 

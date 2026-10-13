@@ -27,43 +27,30 @@ env_allowlist = []      # empty = pass env through (M1); non-empty filters names
 #                       # empty = russh default (chacha20 first). A/B throughput knob.
 
 # Gateway → backend authentication.
-# `backend_auth` selects the credential presented to the backend:
-#   "key"  (default) — the private key below, whose public key sits in the
-#           backend's authorized_keys. Nothing else is required.
-#   "cert" — a short-lived user certificate issued on the fly at dial time and
-#           accepted by the backend's `TrustedUserCAKeys`. Requires
-#           `[ca] signing_key`; the private key becomes optional (an ephemeral
-#           inner keypair is used when omitted) and is still honoured as a
-#           stable gateway identity when present. Per-resolve override:
-#           `policy.backend_auth` in the control-plane response.
-#   "agent" — the *end user's* ssh-agent, forwarded with `ssh -A` and used as the
-#           backend credential (agent passthrough; propose §3.3 / plan-agent-
-#           passthrough). The identity offered to the backend is the one whose
-#           fingerprint the control plane already authorized for this grant —
-#           never an arbitrary key the agent happens to hold. Requires
-#           `allow_agent_backend_auth = true` below and, per grant,
-#           `policy.agent_forwarding` in the control-plane response. Neither
-#           `private_key` nor `[ca]` is needed: the gateway presents no
-#           credential of its own, and if the agent cannot produce the authorized
-#           identity the session fails instead of falling back to one.
-#           Agent mode is one backend connection for the whole session, so it is
-#           mutually exclusive with `[pool] enabled = true`.
+#
+# The backend leg has exactly one credential: the *end user's* ssh-agent,
+# forwarded from the client (`ssh -A` / `-o ForwardAgent=yes`). The gateway
+# holds no key file of its own for the backend, and `direct-tcpip` / jump is
+# removed, so there is no second path (plan-agent-only, propose §3.5.1).
+#
+# Per grant the control plane returns `policy.agent_forwarding`:
+#   true  — the gateway forwards the agent and dials the backend with the
+#           identity whose fingerprint that grant already authorized (never an
+#           arbitrary key the agent happens to hold).
+#   false — no session: the grant resolves, but the backend handshake is
+#           refused instead of silently falling back to some gateway key.
+#
+# If the client forwarded no agent, or the agent cannot produce the authorized
+# identity, the session fails outright. That is the design: there is no
+# credential to fall back to.
 [backend]
-private_key = "/etc/ssh-gw/backend_root_ed25519"   # default key
-# credential_map maps a backend username to its key path (overrides private_key).
-credential_map = { root = "/etc/ssh-gw/backend_root_ed25519" }
 host_key_policy = "pinned"     # "pinned" (prod) | "accept-new" (onboarding)
-# backend_auth = "key"         # set to "cert" to dial with a CA-issued certificate
-# Instance-wide kill-switch for backend_auth = "agent". Off (absent) by default:
-# turning agent passthrough on is a deliberate two-step act — this flag *and*
-# `backend_auth = "agent"`. When it is false, an agent-mode grant is refused
-# outright rather than silently downgraded to the gateway's own key.
-# allow_agent_backend_auth = false
 
-# Opt-in connection pool (off by default: one backend connection per session).
-# The dial circuit breaker and per-connection channel cap are active regardless
-# of `enabled` (they guard the per-session dial path); `enabled` toggles the
-# cross-session reuse machinery.
+# Opt-in connection pool. `enabled` must stay false: with one backend
+# connection per session (agent passthrough), cross-session reuse has nothing
+# to reuse, and propose §3.8 makes `enabled = true` an unconditionally invalid
+# configuration. The dial circuit breaker and per-connection channel cap below
+# still guard the per-session dial path either way.
 [pool]
 enabled = false
 channels_per_conn = 8          # sshd MaxSessions-safe bound (≤8)
@@ -124,14 +111,12 @@ addr = "127.0.0.1:9090"
 # Trusted CA **public** keys (authorized_keys format). One list serves both
 # user certificates (`auth_openssh_certificate`) and backend host certificates
 # (`@cert-authority`), because both anchor on the certificate's signing key.
-# Omit the whole section to disable certificate authentication entirely.
+# Verify-only: the gateway never signs, so there is no CA private key here —
+# minting short-lived user certificates is the operator's tooling's job, not
+# the gateway's. Omit the whole section to disable certificate authentication
+# entirely.
 # [ca]
 # trusted_ca_keys = ["/etc/ssh-gw/ca_user.pub", "/etc/ssh-gw/ca_host.pub"]
-# cert_lifetime = "300s"
-# Optional: enable short-lived certificate issuance (0600 CA private key).
-# Required for `backend_auth = "cert"`, and what operator tooling uses to mint
-# user certificates. Requires at least one trusted_ca_keys entry.
-# signing_key = "/etc/ssh-gw/ca"
 #
 # With a trusted CA present, the backend leg advertises the certificate
 # algorithms that set can verify — so a backend that presents a `HostCertificate`

@@ -1266,6 +1266,40 @@ impl server::Handler for GatewaySession {
             .await
     }
 
+    /// The window target russh tops its own counter back up to for `channel`
+    /// (it sends `CHANNEL_WINDOW_ADJUST` whenever that counter drops below
+    /// half of it).
+    ///
+    /// While this session's supervisor is still dialing the backend the target
+    /// collapses to two bytes. The supervisor drains the pre-ready queue
+    /// concurrently, but that alone is not enough: because the handler never
+    /// parks the read loop while dialing (C5), the read loop keeps granting
+    /// window, so a fast producer streams at line rate into the dial and lands
+    /// in `QueueFull` — which closes a perfectly good channel. With a two-byte
+    /// target russh stops topping the window up until it is spent, so the
+    /// client trickles instead, and the backlog the supervisor stashes stays
+    /// bounded by `relay.window_size` plus one refill (propose.md §3.5.1).
+    ///
+    /// Only this session's own channels are collapsed: the forwarded agent
+    /// channel carries the handshake that *ends* the dial, so starving it would
+    /// starve the dial itself. The configured window is returned in every other
+    /// case — `target` is session-wide and sticky, so returning `current` would
+    /// leave a collapsed session collapsed forever; instead the first packet
+    /// after the dial flips it back to full speed.
+    fn adjust_window(&mut self, channel: ChannelId, _current: u32) -> u32 {
+        let full = self.ctx.config.relay.window_size;
+        let dialing = self
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.handle.is_dialing())
+            && self.agent_channels.contains(&channel);
+        if dialing && full > 2 {
+            2
+        } else {
+            full
+        }
+    }
+
     /// Uplink channel data (client → backend).
     ///
     /// The supervisor owns this channel's uplink (§3.5.1), so the channel tap

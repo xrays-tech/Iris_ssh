@@ -36,12 +36,19 @@ TARGET="${PRINCIPAL}@${GW_ADDR}"
 
 # Common ssh options to the gateway. LogLevel=ERROR keeps client noise out so
 # assertions can reason about clean stdout/stderr.
+#
+# ForwardAgent=yes is the harness's baseline: the gateway holds no backend
+# credential of its own (plan-agent-only), so a session that does not forward
+# the agent cannot reach the backend at all. It is spelled as an ssh option
+# rather than -A so the same line works for ssh, scp and sftp. Cases that are
+# specifically about *absent* agent forwarding drop it for that one call.
 SSH_OPTS=(
   -p "$GW_PORT"
   -i "$USER_KEY"
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o IdentitiesOnly=yes
+  -o ForwardAgent=yes
   -o ConnectTimeout=10
   -o LogLevel=ERROR
 )
@@ -52,6 +59,7 @@ SFTP_OPTS=(
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o IdentitiesOnly=yes
+  -o ForwardAgent=yes
   -o ConnectTimeout=10
   -o LogLevel=ERROR
 )
@@ -62,6 +70,7 @@ SCP_OPTS=(
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o IdentitiesOnly=yes
+  -o ForwardAgent=yes
   -o ConnectTimeout=10
   -o LogLevel=ERROR
 )

@@ -33,6 +33,9 @@ W="${TMPDIR:-/tmp}/ha.${STAMP}.$$"
 ASSET="${SSH_GW_ASSET_DIR:-$W/assets}"
 mkdir -p "$W"; gen_assets "$ASSET" >/dev/null 2>&1
 KEY="$ASSET/user_ed25519"
+# plan-agent-only: the gateway holds no backend credential, so every session it
+# relays needs this shell's agent signing for it.
+HA_AGENT_STARTED=0
 
 SSHD_P="$(alloc_port)"; CP_P="$(alloc_port)"
 A_LISN="$(alloc_port)"; A_MET="$(alloc_port)"
@@ -41,17 +44,26 @@ mkdir -p "$W/a/rec" "$W/b/rec"
 
 cleanup() {
   trap - EXIT INT TERM
+  if [ "${HA_AGENT_STARTED:-0}" = "1" ]; then
+    HA_AGENT_STARTED=0
+    ssh-agent -k >/dev/null 2>&1 || true
+  fi
   for p in "${A_PID:-0}" "${B_PID:-0}" "${CP_PID:-0}" "${SSHD_PID:-0}"; do [ -n "${p:-}" ] && [ "$p" != 0 ] && kill -9 "$p" 2>/dev/null || true; done
   for p in $(lsof -nP -iTCP:"$SSHD_P" -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1 && $1 ~ /sshd/ {print $2}' | sort -u); do kill -9 "$p" 2>/dev/null || true; done
   rm -rf "$W"
 }
 trap cleanup EXIT INT TERM
 
+eval "$(ssh-agent -s)" >/dev/null 2>&1 || { echo "ssh-agent failed" >&2; exit 1; }
+HA_AGENT_STARTED=1
+export SSH_AUTH_SOCK SSH_AGENT_PID
+ssh-add "$KEY" </dev/null >/dev/null 2>&1 || { echo "ssh-add failed" >&2; exit 1; }
+
 # --- backend sshd + shared mock control plane ---
 printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s/sshd_host_ed25519\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s/authorized_keys\nStrictModes no\nUsePAM no\nMaxSessions 20\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
   "$SSHD_P" "$ASSET" "$ASSET" "$W" > "$W/sshd.cfg"
 /usr/sbin/sshd -D -e -f "$W/sshd.cfg" >"$W/sshd.log" 2>&1 & SSHD_PID=$!
-printf '{"resolve":{"alex_host1":{"status":200,"target":{"host":"127.0.0.1","port":%s,"user":"%s"},"policy":{"ttl":60}}},"default":{"status":404}}\n' \
+printf '{"resolve":{"alex_host1":{"status":200,"target":{"host":"127.0.0.1","port":%s,"user":"%s"},"policy":{"agent_forwarding":true,"ttl":60}}},"default":{"status":404}}\n' \
   "$SSHD_P" "$(id -un)" > "$W/rules.json"
 python3 "$SCRIPT_DIR/mock_control_plane.py" --port "$CP_P" --rules "$W/rules.json" >"$W/cp.log" 2>&1 & CP_PID=$!
 wait_tcp_open 127.0.0.1 "$SSHD_P" 20 >/dev/null || { tail_log "$W/sshd.log" 20; exit 1; }
@@ -64,7 +76,6 @@ addr = "127.0.0.1:$2"
 [host_keys]
 keys = [ { path = "$ASSET/hostkey_ed25519", state = "active" } ]
 [backend]
-private_key = "$ASSET/backend_ed25519"
 host_key_policy = "accept-new"
 [pool]
 enabled = false
@@ -111,7 +122,7 @@ new_session() {  # client-side least-readyz LB: first readyz-200 of A then B
   elif [ "$(readyz "$B_MET")" = "200" ]; then LAST_INST="B"; LAST_PORT="$B_LISN"
   else LAST_INST="FAIL"; return 1; fi
   ssh -p "$LAST_PORT" -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o IdentitiesOnly=yes -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes \
+    -o IdentitiesOnly=yes -o ForwardAgent=yes -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes \
     alex_host1@127.0.0.1 "$@"
 }
 # lb_session <cmd...> — runs new_session in the CURRENT shell (so LAST_INST /
@@ -136,7 +147,7 @@ pass "new session routed to A ($NS_OUT)"
 
 # --- open a long-lived exec session ON A (the session that must drain) ---
 ssh -p "$A_LISN" -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o IdentitiesOnly=yes -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes \
+    -o IdentitiesOnly=yes -o ForwardAgent=yes -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes \
     alex_host1@127.0.0.1 'echo READY; sleep 300' >"$W/a.existing.out" 2>"$W/a.existing.err" &
 EXIST_PID=$!
 for _ in $(seq 1 40); do grep -q READY "$W/a.existing.out" 2>/dev/null && break; sleep 0.2; done

@@ -34,8 +34,6 @@ export SSHGW_AGENT_ENV="sshgw-agent-env-value"
 
 # --- (1) no allowlist: every variable is forwarded, agent path included. ---
 SUBTOP_SSHD_AUTHORIZED_KEYS="$KEYDIR/authorized_keys"
-SUBTOP_BACKEND_AUTH="agent"
-SUBTOP_ALLOW_AGENT_BACKEND_AUTH="true"
 SUBTOP_AGENT_FORWARDING="true"
 SUBTOP_ENV_ALLOWLIST=""
 subtopo_start

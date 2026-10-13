@@ -33,7 +33,11 @@
 //!   injected.
 //! * **handler never blocks while dialing** — while the state is
 //!   [`STATE_DIALING`] the handler uses `try_send`; a full queue fails the
-//!   channel natively instead of awaiting (C5). Once [`STATE_READY`] the
+//!   channel natively instead of awaiting (C5). The supervisor drains that
+//!   queue *during* the dial (into [`DialStash`]) so it cannot fill under a
+//!   fast producer in the first place, and `Handler::adjust_window` collapses
+//!   the client's uplink window for the same reason, which is what keeps the
+//!   stash itself bounded by the relay window. Once [`STATE_READY`] the
 //!   handler's `send().await` is the same backpressure the inline path applies,
 //!   and the queue's slot count bounds the bytes it can hold.
 //! * **failures are protocol-native** — every exit path answers pending
@@ -43,12 +47,12 @@
 //!   moment the single backend signature succeeds, so the oracle window is one
 //!   signature wide (red lines 4/10).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::HashAlg;
 use russh::server::Handle as ClientHandle;
@@ -495,6 +499,15 @@ impl AgentHandle {
     pub fn is_ready(&self) -> bool {
         self.shared.is_ready()
     }
+
+    /// Whether the supervisor is still dialing: neither ready nor torn down.
+    ///
+    /// The handler uses this to collapse the uplink window for the duration of
+    /// the dial (see `server::Handler::adjust_window`), so a flooding client
+    /// trickles instead of streaming straight into the pre-ready backlog.
+    pub fn is_dialing(&self) -> bool {
+        !self.shared.is_ready() && !self.shared.is_closed()
+    }
 }
 
 /// The blocking half of the enqueue contract: report a closed supervisor
@@ -549,12 +562,80 @@ pub struct AgentSupervisorArgs {
 /// payload-free control ops (pty/shell/env) that carry none. The slack also has
 /// to absorb the `OpenChannel` ops a client can pile on before it is ready,
 /// which is capped separately by `channels_per_conn` on the handler side.
+///
+/// Nothing accumulates here for long: during the dial the supervisor pulls the
+/// queue into a [`DialStash`] as fast as the handler fills it, and the client's
+/// uplink window is collapsed for the same period (`Handler::adjust_window`),
+/// so the slot count is a hand-off buffer rather than a backlog.
 fn queue_capacity(window_size: u32, max_packet: u32) -> usize {
     let packets = u64::from(window_size.max(1)).div_ceil(u64::from(max_packet.max(1)));
     // +64 slots of slack for payload-free control ops.
     usize::try_from(packets)
         .unwrap_or(usize::MAX)
         .saturating_add(64)
+}
+
+/// Pre-ready ops the handler handed over while the backend dial is in flight.
+///
+/// The supervisor drains the bounded queue into this during the dial, so a fast
+/// producer is absorbed here instead of filling the queue and getting its
+/// channel closed with `QueueFull` (C5). Two properties make the backlog safe:
+///
+/// * **bounded** — the handler's uplink window is collapsed to a two-byte
+///   trickle while dialing (`Handler::adjust_window`), so the client can push
+///   at most one relay window plus one refill before it has to wait, and
+/// * **ordered** — ops are replayed in exactly the order they were pushed (I1),
+///   with consecutive `Data` ops for one channel merged into a single buffer so
+///   a trickle of tiny packets costs one entry rather than one entry per
+///   packet.
+#[derive(Default)]
+struct DialStash {
+    ops: VecDeque<AgentOp>,
+    /// Trailing run of `Data` ops for one channel, not yet pushed into `ops`.
+    tail: Option<(ChannelId, BytesMut)>,
+}
+
+impl DialStash {
+    /// Park one op, merging it into the tail when it extends the current data
+    /// run and sealing that run first when it does not (order is I1).
+    fn push(&mut self, op: AgentOp) {
+        let AgentOp { client_id, kind } = op;
+        match kind {
+            AgentOpKind::Data { data } => match self.tail.take() {
+                Some((id, mut buf)) if id == client_id => {
+                    buf.extend_from_slice(&data);
+                    self.tail = Some((id, buf));
+                }
+                run => {
+                    if let Some((id, buf)) = run {
+                        let data = buf.freeze();
+                        self.ops
+                            .push_back(AgentOp::new(id, AgentOpKind::Data { data }));
+                    }
+                    self.tail = Some((client_id, BytesMut::from(&data[..])));
+                }
+            },
+            kind => {
+                self.seal();
+                self.ops.push_back(AgentOp::new(client_id, kind));
+            }
+        }
+    }
+
+    /// Push the in-progress data run into `ops`.
+    fn seal(&mut self) {
+        if let Some((client_id, buf)) = self.tail.take() {
+            let data = buf.freeze();
+            self.ops
+                .push_back(AgentOp::new(client_id, AgentOpKind::Data { data }));
+        }
+    }
+
+    /// The whole backlog, sealed and in push order, ready to replay or fail.
+    fn flush(&mut self) -> VecDeque<AgentOp> {
+        self.seal();
+        std::mem::take(&mut self.ops)
+    }
 }
 
 /// Build the handler-side handle and spawn the supervisor task.
@@ -606,9 +687,45 @@ async fn run(
     // `dial_guard` keeps the queue open while we dial (the handler may be
     // enqueueing an OpenChannel plus pty/env/exec right now); it is dropped
     // below, the moment the handler becomes the sole owner of the sender.
-    let established = match establish_backend(&shared, &grant, &up, &dialer).await {
-        Ok(established) => established,
-        Err(reason) => {
+    //
+    // The dial runs *alongside* the queue instead of in front of it. Waiting
+    // here would let a fast producer fill the bounded queue and have its
+    // channel closed with `QueueFull`, so every op that arrives meanwhile is
+    // pulled straight into a `DialStash` and replayed once the backend is up.
+    let mut dial = Box::pin(establish_backend(&shared, &grant, &up, &dialer));
+    let mut stash = DialStash::default();
+    let mut established = None;
+    let mut dial_error = None;
+    loop {
+        tokio::select! {
+            result = &mut dial => {
+                match result {
+                    Ok(live) => established = Some(live),
+                    Err(reason) => dial_error = Some(reason),
+                }
+                break;
+            }
+            op = rx.recv() => match op {
+                Some(op) => stash.push(op),
+                // Unreachable: `dial_guard` is a live sender for the whole
+                // dial, so the queue cannot close under us. Handle it anyway
+                // rather than spinning on a closed queue.
+                None => {
+                    dial_error = Some("the handler dropped the session while the backend was dialing".into());
+                    break;
+                }
+            },
+        }
+    }
+    // Cancels the dial if the branch above ended it early; on the normal path
+    // the future has already produced its value.
+    drop(dial);
+
+    let established = match established {
+        Some(established) => established,
+        None => {
+            let reason =
+                dial_error.unwrap_or_else(|| "the backend dial ended without a session".into());
             shared.mark_closed();
             metrics.agent_backend_auth_fail();
             tracing::warn!(
@@ -621,19 +738,13 @@ async fn run(
             );
             // I4: every client channel the handler already accepted is closed,
             // and every request queued behind one gets a native FAILURE. Never
-            // a key/cert fallback.
-            let mut accepted = Vec::new();
+            // a key/cert fallback. The stashed ops are older than anything
+            // still sitting in the queue, so they fail first.
+            let mut backlog = stash.flush();
             while let Ok(op) = rx.try_recv() {
-                let AgentOp { client_id, kind } = op;
-                if matches!(kind, AgentOpKind::OpenChannel { .. }) {
-                    accepted.push(client_id);
-                } else {
-                    kind.fail_pending(&up, client_id).await;
-                }
+                backlog.push_back(op);
             }
-            for client_id in accepted {
-                let _ = up.close(client_id).await;
-            }
+            fail_backlog(&up, backlog).await;
             return;
         }
     };
@@ -650,11 +761,32 @@ async fn run(
         auditor.note_agent_signature();
     }
 
+    // Drain before the flip, not after: an empty queue at the moment the
+    // handler starts reading `is_ready()` is what rules out the `QueueFull`
+    // it could otherwise race into. Whatever it queued behind that drain is
+    // newer than everything in `backlog`, so it stays behind it in order.
+    let mut backlog = stash.flush();
+    while let Ok(op) = rx.try_recv() {
+        backlog.push_back(op);
+    }
+    let backlog_bytes: usize = backlog
+        .iter()
+        .map(|op| match &op.kind {
+            AgentOpKind::Data { data } | AgentOpKind::ExtendedData { data, .. } => data.len(),
+            _ => 0,
+        })
+        .sum();
+    tracing::debug!(
+        target: "relay",
+        %session_id,
+        ops = backlog.len(),
+        bytes = backlog_bytes,
+        "replaying the pre-ready backlog"
+    );
+    shared.mark_ready();
     // From here on the handler owns the only sender: once it drops its handle,
     // `rx.recv()` returns `None` and this loop ends.
     drop(dial_guard);
-
-    shared.mark_ready();
     tracing::info!(
         target: "relay",
         %session_id,
@@ -668,6 +800,26 @@ async fn run(
     // One relay per client channel, all multiplexed onto `handle`.
     let mut relays: HashMap<ChannelId, Arc<ChannelRelay>> = HashMap::new();
 
+    // Replay what the dial swallowed before serving anything else: the handler
+    // wrote this order, so the backend sees this order (I1). Deliberately NOT
+    // merging `rx` into the backlog here — doing so empties the queue faster
+    // than the backend drains, so the handler stops ever parking and the
+    // backlog becomes an unbounded buffer (RSS tracks volume). Letting the
+    // queue fill and the handler park during the replay is exactly the
+    // backpressure the main loop gives (I4).
+    while let Some(op) = backlog.pop_front() {
+        serve_op(
+            op,
+            &mut relays,
+            &handle,
+            &up,
+            &bytes,
+            &metrics,
+            &pump_done_tx,
+        )
+        .await;
+    }
+
     // Single ordered consumer: ops in enqueue order, per channel (I1).
     // The loop ends when the handler drops its handle — which is what "every
     // channel is closed and the session is over" looks like from here — or when
@@ -677,45 +829,16 @@ async fn run(
             op = rx.recv() => {
                 match op {
                     None => break,
-                    Some(op) => match op.kind {
-                        AgentOpKind::OpenChannel { tap } => {
-                            if relays.contains_key(&op.client_id) {
-                                tracing::debug!(
-                                    target: "relay",
-                                    client_id = %op.client_id,
-                                    "duplicate OpenChannel ignored"
-                                );
-                            } else {
-                                open_backend_channel(
-                                    op.client_id,
-                                    tap,
-                                    &handle,
-                                    &up,
-                                    &bytes,
-                                    &metrics,
-                                    &pump_done_tx,
-                                    &mut relays,
-                                )
-                                .await;
-                            }
-                        }
-                        kind => {
-                            match relays.get(&op.client_id) {
-                                // Cloned so the borrow of `relays` never
-                                // crosses the await below (D11).
-                                Some(relay) => {
-                                    let relay = Arc::clone(relay);
-                                    kind.apply(&relay, &up, op.client_id).await;
-                                }
-                                None => tracing::debug!(
-                                    target: "relay",
-                                    client_id = %op.client_id,
-                                    ?kind,
-                                    "dropping op for a channel that is already gone"
-                                ),
-                            }
-                        }
-                    },
+                    Some(op) => serve_op(
+                        op,
+                        &mut relays,
+                        &handle,
+                        &up,
+                        &bytes,
+                        &metrics,
+                        &pump_done_tx,
+                    )
+                    .await,
                 }
             }
             done = pump_done_rx.recv() => {
@@ -739,6 +862,79 @@ async fn run(
     // (implicitly) so the backend transport task stops with it.
     for (_, relay) in relays {
         let _ = relay.backend.close().await;
+    }
+}
+
+/// Apply one op from the ordered consumer: map `OpenChannel` onto a new session
+/// channel of the backend connection, relay everything else onto the channel it
+/// names.
+///
+/// Split out of the main loop so the dial-time backlog is replayed through
+/// exactly the same code path as live ops — two implementations would be two
+/// chances to drift.
+async fn serve_op(
+    op: AgentOp,
+    relays: &mut HashMap<ChannelId, Arc<ChannelRelay>>,
+    handle: &crate::backend::BackendHandle,
+    up: &ClientHandle,
+    bytes: &Arc<ByteCounters>,
+    metrics: &crate::metrics::Metrics,
+    pump_done_tx: &mpsc::UnboundedSender<ChannelId>,
+) {
+    match op.kind {
+        AgentOpKind::OpenChannel { tap } => {
+            if relays.contains_key(&op.client_id) {
+                tracing::debug!(
+                    target: "relay",
+                    client_id = %op.client_id,
+                    "duplicate OpenChannel ignored"
+                );
+            } else {
+                open_backend_channel(
+                    op.client_id,
+                    tap,
+                    handle,
+                    up,
+                    bytes,
+                    metrics,
+                    pump_done_tx,
+                    relays,
+                )
+                .await;
+            }
+        }
+        kind => match relays.get(&op.client_id) {
+            // Cloned so the borrow of `relays` never crosses the await below
+            // (D11).
+            Some(relay) => {
+                let relay = Arc::clone(relay);
+                kind.apply(&relay, up, op.client_id).await;
+            }
+            None => tracing::debug!(
+                target: "relay",
+                client_id = %op.client_id,
+                ?kind,
+                "dropping op for a channel that is already gone"
+            ),
+        },
+    }
+}
+
+/// Answer a dead session's whole backlog the protocol-native way (I4): every
+/// request that asked for a reply gets a FAILURE, and every client channel the
+/// handler already accepted is closed. Never a key/cert fallback, never a
+/// fabricated SUCCESS.
+async fn fail_backlog(up: &ClientHandle, backlog: VecDeque<AgentOp>) {
+    let mut accepted = Vec::new();
+    for AgentOp { client_id, kind } in backlog {
+        if matches!(kind, AgentOpKind::OpenChannel { .. }) {
+            accepted.push(client_id);
+        } else {
+            kind.fail_pending(up, client_id).await;
+        }
+    }
+    for client_id in accepted {
+        let _ = up.close(client_id).await;
     }
 }
 

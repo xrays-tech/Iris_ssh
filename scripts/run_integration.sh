@@ -7,9 +7,9 @@
 #        |  ssh  user@GW_ADDR:GW_PORT   (principal = username)
 #        v
 #     ssh-gw  (--config GW_CONFIG)      authenticates + resolves + relays
-#        |  russh client leg, backend_ed25519 key
+#        |  russh client leg, signed by the client's forwarded ssh-agent
 #        v
-#     backend sshd  (127.0.0.1:SSHD_PORT)   authorized_keys := backend pubkey
+#     backend sshd  (127.0.0.1:SSHD_PORT)   authorized_keys := user pubkey
 #     mock control plane (127.0.0.1:CP_PORT)  POST /api/v1/resolve
 #
 # Modes:
@@ -28,8 +28,10 @@
 #                         case_backpressure is skipped by default (see below).
 #   SSH_GW_ASSET_DIR      reuse a FIXED key/asset dir instead of a fresh
 #                         per-run $WORK_DIR/assets. Required for REMOTE mode:
-#                         pre-install its backend_ed25519.pub in the remote
-#                         authorized_keys, or the gateway can't authenticate.
+#                         pre-install its user_ed25519.pub in the remote
+#                         authorized_keys, or the gateway can't authenticate
+#                         (the agent signs with the user's key; there is no
+#                         gateway-held credential to fall back to).
 #   SSHGW_SKIP_BACKPRESSURE  non-empty => always skip case_backpressure
 #   KEEP_WORK=1           preserve the temp work dir for post-mortem
 #   BP_BYTES / BP_MAX_RSS_KB   backpressure case overrides (see that case)
@@ -145,8 +147,9 @@ if [ -n "${SSH_GW_BACKEND_TARGET:-}" ]; then
     die "SSH_GW_BACKEND_TARGET must look like user@host:port (got '$RT')"
   fi
   log "REMOTE backend mode: ${BACKEND_USER}@${BACKEND_HOST}:${BACKEND_PORT} (manual run — not used by CI auto-suite)"
-  log "NOTE: ensure the gateway backend pubkey is in the remote authorized_keys:"
-  log "      $(cat "$ASSET_DIR/backend_ed25519.pub")"
+  log "NOTE: the gateway signs with the END USER's forwarded agent, so the remote"
+  log "      authorized_keys must contain user_ed25519.pub:"
+  log "      $(cat "$ASSET_DIR/user_ed25519.pub")"
 else
   SSHD_PORT="$(alloc_port)"
   BACKEND_HOST="127.0.0.1"
@@ -183,7 +186,7 @@ if [ "$REMOTE_MODE" = "1" ]; then
     log "remote tmp dir ready: ${BACKEND_LOGIN}:${REMOTE_TMP_DIR}"
   else
     tail_log "$WORK_DIR/remote_tmp.out" 20
-    die "could not create/write remote tmp dir on ${BACKEND_LOGIN}:${REMOTE_TMP_DIR} (is backend_ed25519.pub in the remote authorized_keys?)"
+    die "could not create/write remote tmp dir on ${BACKEND_LOGIN}:${REMOTE_TMP_DIR} (is backend_ed25519.pub in the remote authorized_keys? management login, not the gateway's)"
   fi
 else
   REMOTE_TMP_DIR="$WORK_DIR"
@@ -234,7 +237,6 @@ max_packet = "32KB"
 outbound_guard = true
 
 [backend]
-private_key = "${ASSET_DIR}/backend_ed25519"
 host_key_policy = "accept-new"
 
 [pool]
@@ -281,10 +283,10 @@ write_cp_rules() {
   cat > "$CP_RULES" <<EOF
 {
   "resolve": {
-    "${PRINCIPAL}": {"status":200,"target":{"host":"${BACKEND_HOST}","port":${BACKEND_PORT},"user":"${BACKEND_USER}"},"policy":{"agent_forwarding":false,"tcp_forwarding":false,"recording":false,"ttl":60}},
+    "${PRINCIPAL}": {"status":200,"target":{"host":"${BACKEND_HOST}","port":${BACKEND_PORT},"user":"${BACKEND_USER}"},"policy":{"agent_forwarding":true,"recording":false,"ttl":60}},
     "bob": {"status":403,"error":"principal not authorized"},
     "ghost": {"status":404,"error":"principal not found"},
-    "slow": {"status":200,"delay_ms":5000,"target":{"host":"${BACKEND_HOST}","port":${BACKEND_PORT},"user":"${BACKEND_USER}"},"policy":{"ttl":60}}
+    "slow": {"status":200,"delay_ms":5000,"target":{"host":"${BACKEND_HOST}","port":${BACKEND_PORT},"user":"${BACKEND_USER}"},"policy":{"agent_forwarding":true,"ttl":60}}
   },
   "default": {"status":404,"error":"principal not found"}
 }
@@ -314,11 +316,37 @@ export NOTFOUND_PRINCIPAL='${NOTFOUND_PRINCIPAL}'
 export BACKEND_HOST='${BACKEND_HOST}'
 export BACKEND_PORT='${BACKEND_PORT}'
 export BACKEND_USER='${BACKEND_USER}'
+export SSH_AUTH_SOCK='${SSH_AUTH_SOCK:-}'
+export SSH_AGENT_PID='${SSH_AGENT_PID:-}'
 EOF
 }
 
 write_cp_rules
 write_gateway_config
+
+# ---------------------------------------------------------------------------
+# Shared ssh-agent (plan-agent-only)
+#
+# The gateway holds no backend credential of its own, so the only way any case
+# can reach the backend is the client's forwarded ssh-agent signing for it. One
+# agent is started here, holding the end user's identity, and exported to every
+# case; cases that must prove the *absence* of an agent opt out locally
+# (subtopo_agent_stop / SUBTOP_SSH_A=0).
+# ---------------------------------------------------------------------------
+SSH_AGENT_STARTED=0
+start_shared_agent() {
+  eval "$(ssh-agent -s)" >/dev/null 2>&1 || die "could not start ssh-agent"
+  SSH_AGENT_STARTED=1
+  export SSH_AUTH_SOCK SSH_AGENT_PID
+  ssh-add "$ASSET_DIR/user_ed25519" </dev/null >/dev/null 2>&1     || die "could not load $ASSET_DIR/user_ed25519 into the shared ssh-agent"
+  log "shared ssh-agent up on $SSH_AUTH_SOCK (pid $SSH_AGENT_PID)"
+}
+stop_shared_agent() {
+  [ "${SSH_AGENT_STARTED:-0}" = "1" ] || return 0
+  SSH_AGENT_STARTED=0
+  ssh-agent -k >/dev/null 2>&1 || true
+  unset SSH_AUTH_SOCK SSH_AGENT_PID || true
+}
 
 # ---------------------------------------------------------------------------
 # Cleanup (registered last-ish; runs on EXIT/INT/TERM)
@@ -330,6 +358,7 @@ SSHD_PID=""
 
 cleanup() {
   trap - EXIT INT TERM
+  stop_shared_agent
   # gateway first so backend channels close and sshd sessions drain naturally
   [ "$GATEWAY_UP" = "1" ] && stop_pid "$GW_PID"
   stop_pid "$CP_PID"
@@ -352,6 +381,10 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
+
+# Armed only now that cleanup() can reap it: every case runs after this point.
+# The infra selftest talks to the backend directly, so it needs no agent.
+[ "$SELFTEST" = "1" ] || start_shared_agent
 
 # ---------------------------------------------------------------------------
 # Start backend sshd (local mode only)
@@ -445,6 +478,7 @@ export GW_ADDR GW_PORT GW_METRICS_PORT="$METRICS_PORT" GW_PID GATEWAY_UP
 export SSHD_ADDR SSHD_PORT SSHD_UP CP_ADDR CP_PORT
 export USER_KEY="$ASSET_DIR/user_ed25519" PRINCIPAL DENIED_PRINCIPAL NOTFOUND_PRINCIPAL
 export BACKEND_HOST BACKEND_PORT BACKEND_USER
+export SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" SSH_AGENT_PID="${SSH_AGENT_PID:-}"
 
 log "topology: principal=${PRINCIPAL} backend=${BACKEND_USER}@${BACKEND_HOST}:${BACKEND_PORT}"
 
@@ -473,7 +507,6 @@ ALL_CASES=(
   case_sftp_intercept
   case_hostkey_rotation
   case_host_cert_authority
-  case_cert_dial
   case_halfopen_lost
   case_netem_slow
   case_graceful_shutdown

@@ -4,10 +4,15 @@
 #
 # Produces, inside $1 (the asset dir):
 #   hostkey_ed25519{,.pub}      gateway -> client host key (server leg)
-#   backend_ed25519{,.pub}      gateway -> backend private key (client leg)
-#   user_ed25519{,.pub}         client (test harness) -> gateway user key
+#   backend_ed25519{,.pub}      harness -> backend management key (selftest,
+#                               remote-mode tmp dir, netem/halfopen injection)
+#   user_ed25519{,.pub}         client (test harness) -> gateway user key, and
+#                               the identity the forwarded agent presents to the
+#                               backend (plan-agent-only: the gateway holds no
+#                               credential of its own)
 #   sshd_host_ed25519{,.pub}    backend sshd host key (distinct from gateway's)
-#   authorized_keys             contains backend_ed25519.pub (gateway may log in)
+#   authorized_keys             user_ed25519.pub (the agent's identity) plus
+#                               backend_ed25519.pub (management login only)
 #
 # All private keys are unencrypted ed25519 in OpenSSH format (mode 0600), which
 # russh-keys can load directly and which satisfies the gateway's own 0600
@@ -29,9 +34,18 @@ gen_assets() {
     chmod 600 "$dir/$name"
   done
 
-  # authorized_keys for the backend login user == the gateway's backend pubkey.
+  # authorized_keys for the backend login user. The gateway authenticates with
+  # the *end user's* forwarded agent, so the user pubkey is what must be listed;
+  # the harness's own management key stays listed so infra_selftest, the
+  # remote-mode tmp-dir bootstrap and the netem/halfopen injectors can still log
+  # in directly. Cases that must prove "no other credential exists" override
+  # this file (agent_topo_backend_keys).
   if [ ! -f "$dir/authorized_keys" ]; then
-    cp "$dir/backend_ed25519.pub" "$dir/authorized_keys"
+    cat "$dir/user_ed25519.pub" "$dir/backend_ed25519.pub" > "$dir/authorized_keys"
+  elif ! grep -qFf "$dir/user_ed25519.pub" "$dir/authorized_keys"; then
+    # Reused asset dir from before the agent-only rework: add, never rewrite
+    # (an operator may have appended extra management keys).
+    cat "$dir/user_ed25519.pub" >> "$dir/authorized_keys"
   fi
   chmod 600 "$dir/authorized_keys"
 }

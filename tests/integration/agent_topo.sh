@@ -3,10 +3,10 @@
 # (plan-agent-passthrough C3). Source-only; sourced AFTER common.sh + subtopo.sh.
 #
 # The topology these cases need is deliberately hostile to a silent downgrade:
-# the backend's authorized_keys contains **only** the end user's agent key, so
-# `backend_auth="key"` (the gateway's own key) cannot log in. If an agent session
-# ever succeeded without the agent, or a failed agent session ever fell back to
-# the gateway key, these cases would catch it.
+# the backend's authorized_keys contains **only** the end user's agent key, and
+# the gateway holds no credential of its own to offer (plan-agent-only D3). If
+# an agent session ever succeeded without the agent, or a failed agent session
+# ever fell back to a second credential, these cases would catch it.
 set -uo pipefail
 
 # agent_topo_backend_keys <file> [pubkey...] — write an authorized_keys holding
@@ -22,13 +22,12 @@ agent_topo_backend_keys() {
   chmod 600 "$out"
 }
 
-# agent_topo_start <authorized_keys-file> — bring up the sub-topology with
-# backend_auth="agent", the instance kill-switch on, and a control-plane grant
-# that allows this principal to forward its agent.
+# agent_topo_start <authorized_keys-file> — bring up the sub-topology with an
+# agent-key-only backend and a control-plane grant that allows this principal to
+# forward its agent. There is nothing else to switch on: agent passthrough is
+# the only backend auth mode there is.
 agent_topo_start() {
   SUBTOP_SSHD_AUTHORIZED_KEYS="$1"
-  SUBTOP_BACKEND_AUTH="agent"
-  SUBTOP_ALLOW_AGENT_BACKEND_AUTH="true"
   SUBTOP_AGENT_FORWARDING="true"
   subtopo_start
 }

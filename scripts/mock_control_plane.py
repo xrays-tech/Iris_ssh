@@ -16,8 +16,7 @@ target in before starting the server:
         "<principal>": {
             "status": 200,
             "target": {"host":"127.0.0.1","port":22222,"user":"alex"},
-            "policy": {"agent_forwarding":false,"tcp_forwarding":false,
-                       "recording":false,"ttl":60},
+            "policy": {"agent_forwarding":true,"recording":false,"ttl":60},
             "delay_ms": 0            # optional: simulate control-plane latency
         },
         "<denied>": {"status":403,"error":"principal not authorized"}
@@ -47,7 +46,11 @@ from typing import Any, Dict, List, Optional
 # gateway's Policy understands today (agent_forwarding, recording, ttl) AND
 # forward-compatible fields the gateway may consume later (e.g.
 # policy.sftp_intercept for B3 command interception). Unknown fields are inert
-# until the gateway reads them, so rules stay backward-compatible. Example rule:
+# until the gateway reads them, so rules stay backward-compatible.
+#
+# `agent_forwarding` is the one switch that decides whether a grant can reach
+# the backend at all: the gateway holds no credential of its own
+# (plan-agent-only), so `false` authorizes no session at all. Example rule:
 #     "<principal>": {"status":200,
 #                     "target":{"host","port","user"},
 #                     "policy":{"ttl":60,"agent_forwarding":true,

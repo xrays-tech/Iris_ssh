@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # case_agent_missing.sh — C3: no agent means no session, and never a fallback.
 #
-# Same agent-key-only backend as case_agent_auth (the gateway's own key is
-# useless there), but the client connects *without* -A, so it never sends
-# auth-agent-req@openssh.com. With no agent there is no signature, and red line 3
-# forbids the gateway from quietly presenting its own key instead — so the
+# Same agent-key-only backend as case_agent_auth, but the client connects
+# *without* -A, so it never sends auth-agent-req@openssh.com. With no agent
+# there is no signature, and red line 3 forbids the gateway from quietly
+# presenting a second credential instead — it does not even have one — so the
 # session must die with a protocol-native failure.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,8 +17,10 @@ KEYDIR="$IT_WORK_DIR/agent-keys"; mkdir -p "$KEYDIR"
 agent_topo_backend_keys "$KEYDIR/authorized_keys" "$IT_ASSET_DIR/user_ed25519.pub"
 agent_topo_start "$KEYDIR/authorized_keys"
 
-# No agent at all: the harness may have one in its environment, so pin the
-# variable to nothing rather than relying on the ambient shell.
+# The client must not ask for forwarding at all: subtopo_ssh passes -A by
+# default now, so opt this one call out. subtopo_agent_stop also drops the
+# variables in this shell, so even an ambient agent is out of reach.
+SUBTOP_SSH_A=0
 subtopo_agent_stop
 
 run_capture subtopo_ssh 'printf SHOULD_NOT_HAPPEN'

@@ -3,16 +3,16 @@
 # session channels all ride the same agent supervisor.
 #
 # Topology: identical to case_agent_auth — the backend's authorized_keys holds
-# ONLY the end user's key, backend_auth="agent" with the instance kill-switch
-# on, and the control-plane grant allows agent forwarding.
+# ONLY the end user's key, the gateway holds no credential of its own, and the
+# control-plane grant allows agent forwarding.
 #
 # The client opens one SSH connection with OpenSSH's ControlMaster (`ssh -M`),
 # whose master runs a long-lived remote command on session channel #1 with -A.
 # Two later `ssh -S <sock> ...` slaves multiplex over that *same* connection,
 # so the gateway sees channel #2 and #3 on a session that has already handed
-# channel #1 to the supervisor. Before D2 the second channel fell back to the
-# inline path, which cannot dial an agent-only backend; after D2 it must be
-# served by the same supervisor.
+# channel #1 to the supervisor. Before D2 the second channel fell back to an
+# inline dial, which cannot authenticate an agent-only backend; after D2 (and
+# with D3 removing that inline path) it must be served by the same supervisor.
 #
 # Asserted: both slave commands return the right output, there is exactly ONE
 # backend dial and ONE agent signature for the whole connection (channels share

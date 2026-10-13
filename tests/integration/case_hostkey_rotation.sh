@@ -34,7 +34,6 @@ addr = "127.0.0.1:${GW_PORT}"
 [host_keys]
 keys = [ { path = "$1", state = "active" } ]
 [backend]
-private_key = "$IT_ASSET_DIR/backend_ed25519"
 host_key_policy = "accept-new"
 [control_plane]
 url = "${CP_URL}"
@@ -51,9 +50,13 @@ EOF
 rot_gw_stop() { [ -n "${ROT_GW_PID:-}" ] && kill -9 "$ROT_GW_PID" 2>/dev/null || true; ROT_GW_PID=""; }
 
 rot_ssh() {  # rot_ssh <strict|accept-new> <known_hosts>
+  # ForwardAgent=yes is mandatory, not cosmetic: the gateway has no backend
+  # credential of its own, so a session without a forwarded agent cannot run a
+  # command at all (plan-agent-only D3).
   ssh -p "$GW_PORT" -i "$USER_KEY" \
     -o StrictHostKeyChecking="$1" -o UserKnownHostsFile="$2" \
-    -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR \
+    -o IdentitiesOnly=yes -o ForwardAgent=yes \
+    -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR \
     "$PRINCIPAL@127.0.0.1" 'printf OK'
 }
 

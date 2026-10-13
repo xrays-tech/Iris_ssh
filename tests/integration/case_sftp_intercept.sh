@@ -22,7 +22,8 @@ sf() {  # sf <batch-file>
   local bf="$1" rc=0
   sftp -P "$ST_GW_PORT" -i "$USER_KEY" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o IdentitiesOnly=yes -o ConnectTimeout=15 -o LogLevel=ERROR \
+    -o IdentitiesOnly=yes -o ForwardAgent=yes \
+    -o ConnectTimeout=15 -o LogLevel=ERROR \
     -b "$bf" "$PRINCIPAL@127.0.0.1" >"$IT_WORK_DIR/si.sftp.log" 2>&1 || rc=$?
   return "$rc"
 }

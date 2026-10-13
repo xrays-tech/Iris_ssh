@@ -16,7 +16,17 @@
 #   SUBTOP_TTL_JITTER  duration string -> control_plane.cache_ttl_jitter (default "3s")
 #   SUBTOP_WINDOW      byte string     -> relay.window_size           (default "1MB")
 #   SUBTOP_RULES       path to a rules JSON. If unset, a default rule resolves
-#                      $PRINCIPAL -> (127.0.0.1:<backend>, $BACKEND_USER).
+#                      $PRINCIPAL -> (127.0.0.1:<backend>, $BACKEND_USER) with
+#                      policy.agent_forwarding=true (see SUBTOP_AGENT_FORWARDING).
+#   SUBTOP_AGENT_FORWARDING  "false" -> the default resolve rule stops allowing
+#                              agent forwarding for this grant. Default "true":
+#                              the gateway reaches the backend ONLY by asking the
+#                              client's forwarded agent to sign, so a grant that
+#                              refuses it grants no session at all.
+#   SUBTOP_SSH_A       "0" -> subtopo_ssh does NOT pass -A (the client never
+#                      requests agent forwarding). Default "1".
+#   SUBTOP_NO_AGENT    "1" -> subtopo_start does not stand up an ssh-agent when
+#                      the environment has none. Default "0".
 #
 # Manually, sub-unique prefer removing remote grep; probe result vars set by
 # subtopo_start: ST_SSHD_PORT ST_CP_PORT ST_GW_PORT ST_MET_PORT ST_GW_PID
@@ -40,25 +50,16 @@ SUBTOP_SFTP_ALLOW_PREFIX="${SUBTOP_SFTP_ALLOW_PREFIX:-}"
 SUBTOP_SFTP_DENY_PREFIX="${SUBTOP_SFTP_DENY_PREFIX:-}"
 # Overridable host key (for rotation rehearsal); defaults to the shared asset key.
 SUBTOP_HOSTKEY="${SUBTOP_HOSTKEY:-$IT_ASSET_DIR/hostkey_ed25519}"
-# M4 backend-cert topology knobs (all default off -> identical to prior behaviour).
+# Backend host-cert topology knobs (all default off -> identical to prior
+# behaviour).
 #   SUBTOP_SSHD_HOST_CERT  path to a host cert: backend sshd presents it (HostCertificate).
-#   SUBTOP_SSHD_USER_CA    path to a user CA .pub: backend sshd trusts it (TrustedUserCAKeys).
-#   SUBTOP_TRUSTED_CA_KEYS space-separated CA .pub: gateway [ca] trusted_ca_keys (host @cert-authority).
-#   SUBTOP_SIGNING_KEY     path to a CA .priv: gateway [ca] signing_key (M4-2 cert-dial).
-#   SUBTOP_BACKEND_AUTH    "cert" -> gateway [backend] backend_auth="cert"
-#                          "agent" -> gateway [backend] backend_auth="agent"
-#                          (omitted = key default).
-#   SUBTOP_ALLOW_AGENT_BACKEND_AUTH  "true" -> [backend] allow_agent_backend_auth
-#                                    (the instance-wide kill-switch; off by default,
-#                                    and a hard requirement for backend_auth="agent").
-#   SUBTOP_AGENT_FORWARDING  "true" -> the default resolve rule carries
-#                              policy.agent_forwarding=true, i.e. the control plane
-#                              allows THIS grant to forward its agent.
-#   SUBTOP_ENV_ALLOWLIST     space-separated names -> [relay] env_allowlist, i.e.
-#                              the gateway filters `env` requests (M1). Empty
-#                              means forward every variable.
+#   SUBTOP_TRUSTED_CA_KEYS space-separated CA .pub: gateway [ca] trusted_ca_keys
+#                          (host @cert-authority). [ca] is verify-only: the
+#                          gateway issues nothing (plan-agent-only D3).
+#   SUBTOP_ENV_ALLOWLIST   space-separated names -> [relay] env_allowlist, i.e.
+#                          the gateway filters `env` requests (M1). Empty means
+#                          forward every variable.
 SUBTOP_SSHD_HOST_CERT="${SUBTOP_SSHD_HOST_CERT:-}"
-SUBTOP_SSHD_USER_CA="${SUBTOP_SSHD_USER_CA:-}"
 # Authorized-keys override (for cert-only backends where the gateway key must NOT
 # be accepted, so only trusted-CA cert auth works). Default = shared asset file.
 SUBTOP_SSHD_AUTHORIZED_KEYS="${SUBTOP_SSHD_AUTHORIZED_KEYS:-$IT_ASSET_DIR/authorized_keys}"
@@ -66,11 +67,14 @@ SUBTOP_SSHD_AUTHORIZED_KEYS="${SUBTOP_SSHD_AUTHORIZED_KEYS:-$IT_ASSET_DIR/author
 # requires <hostkey>-cert.pub). Default = shared asset key.
 SUBTOP_SSHD_HOSTKEY="${SUBTOP_SSHD_HOSTKEY:-$IT_ASSET_DIR/sshd_host_ed25519}"
 SUBTOP_TRUSTED_CA_KEYS="${SUBTOP_TRUSTED_CA_KEYS:-}"
-SUBTOP_SIGNING_KEY="${SUBTOP_SIGNING_KEY:-}"
-SUBTOP_BACKEND_AUTH="${SUBTOP_BACKEND_AUTH:-}"
-SUBTOP_ALLOW_AGENT_BACKEND_AUTH="${SUBTOP_ALLOW_AGENT_BACKEND_AUTH:-false}"
-SUBTOP_AGENT_FORWARDING="${SUBTOP_AGENT_FORWARDING:-false}"
+# Agent forwarding is the only way this gateway can reach the backend, so the
+# default grant allows it; a case can still turn it off to test the deny.
+SUBTOP_AGENT_FORWARDING="${SUBTOP_AGENT_FORWARDING:-true}"
 SUBTOP_ENV_ALLOWLIST="${SUBTOP_ENV_ALLOWLIST:-}"
+# -A by default (see subtopo_ssh); SUBTOP_SSH_A=0 opts one call out.
+SUBTOP_SSH_A="${SUBTOP_SSH_A:-1}"
+# Whether subtopo_start is allowed to stand up an agent for this shell.
+SUBTOP_NO_AGENT="${SUBTOP_NO_AGENT:-0}"
 
 # toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
 toml_arr() {
@@ -96,6 +100,14 @@ fi
 subtopo_start() {
   SUBTOPO_DIR="$IT_WORK_DIR/subtopo"
   mkdir -p "$SUBTOPO_DIR"
+
+  # The gateway holds no backend credential (plan-agent-only D3): without a live
+  # agent holding the end user's key, no session in this topology could ever
+  # reach the backend. Stand one up when the environment did not give us one.
+  if [ "$SUBTOP_NO_AGENT" != "1" ] && [ -z "${SSH_AUTH_SOCK:-}" ]; then
+    subtopo_agent_start "$IT_ASSET_DIR/user_ed25519" || return 1
+  fi
+
   ST_SSHD_PORT="$(alloc_port)"; ST_CP_PORT="$(alloc_port)"
   ST_GW_PORT="$(alloc_port)";   ST_MET_PORT="$(alloc_port)"
 
@@ -106,9 +118,8 @@ subtopo_start() {
   printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s\nStrictModes no\nUsePAM no\nMaxSessions 10\nAcceptEnv LANG LC_* SSHGW_AGENT_ENV\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
     "$ST_SSHD_PORT" "$SUBTOP_SSHD_HOSTKEY" "$SUBTOP_SSHD_AUTHORIZED_KEYS" "$SUBTOPO_DIR" \
     > "$SUBTOPO_DIR/sshd.cfg"
-  # M4: backend presents a host certificate (M4-1) / trusts a user CA (M4-2).
+  # Backend presents a host certificate (M4-1).
   [ -n "$SUBTOP_SSHD_HOST_CERT" ] && printf 'HostCertificate %s\n' "$SUBTOP_SSHD_HOST_CERT" >> "$SUBTOPO_DIR/sshd.cfg"
-  [ -n "$SUBTOP_SSHD_USER_CA" ]   && printf 'TrustedUserCAKeys %s\n' "$SUBTOP_SSHD_USER_CA"   >> "$SUBTOPO_DIR/sshd.cfg"
 
   if [ -n "${SUBTOP_RULES:-}" ]; then
     cp "$SUBTOP_RULES" "$SUBTOPO_DIR/rules.json"
@@ -124,16 +135,12 @@ subtopo_start() {
   local _env_al=""
   [ -n "$SUBTOP_ENV_ALLOWLIST" ] && _env_al="env_allowlist=$(toml_arr "$SUBTOP_ENV_ALLOWLIST")"
 
-  local _ba=""
-  [ "$SUBTOP_BACKEND_AUTH" = "cert" ] && _ba='backend_auth="cert"
-'
-  [ "$SUBTOP_BACKEND_AUTH" = "agent" ] && _ba='backend_auth="agent"
-'
-  [ "$SUBTOP_ALLOW_AGENT_BACKEND_AUTH" = "true" ] && _ba="${_ba}allow_agent_backend_auth=true
-"
-  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nprivate_key="%s"\nhost_key_policy="accept-new"\n%s[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
+  # No [backend] credential: the gateway signs for the backend leg with the
+  # client's forwarded agent (plan-agent-only D3), so [backend] carries only the
+  # host-key policy.
+  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
     "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" "$_env_al" \
-    "$IT_ASSET_DIR/backend_ed25519" "$_ba" "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
+    "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
     "$ST_CP_PORT" "$SUBTOP_CACHE_TTL"     "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
 
   # B3 sftp-intercept section (defaults are inert; older gateways that predate
@@ -146,8 +153,6 @@ subtopo_start() {
     # host CA (gateway @cert-authority trust). Default: harmless non-empty key.
     local _ca_keys="${SUBTOP_TRUSTED_CA_KEYS:-$IT_ASSET_DIR/user_ed25519.pub}"
     printf '[ca]\ntrusted_ca_keys=%s\n' "$(toml_arr "$_ca_keys")"
-    # M4-2: gateway issues the backend user cert from this signing key.
-    [ -n "$SUBTOP_SIGNING_KEY" ] && printf 'signing_key="%s"\n' "$SUBTOP_SIGNING_KEY"
   } >> "$SUBTOPO_DIR/gw.toml"
 
   /usr/sbin/sshd -t -f "$SUBTOPO_DIR/sshd.cfg" 2>>"$SUBTOPO_DIR/sshd.log" \
@@ -203,14 +208,15 @@ PY
 
 # subtopo_ssh <remote-command...> — ssh as $PRINCIPAL into the sub-topology gateway.
 #
-# `SUBTOP_SSH_A=1` (or the subtopo_ssh_A wrapper) adds -A, i.e. it asks the
-# gateway to forward the local agent. The agent is never used for *user* auth
-# here (`IdentitiesOnly=yes` + an explicit -i pin that), which is exactly the
-# separation the passthrough feature needs: the agent is a signing backend, not
-# a credential the client offers for itself.
+# Agent forwarding is requested by DEFAULT (`SUBTOP_SSH_A=1`): it is the only
+# credential the gateway can present to the backend. Set `SUBTOP_SSH_A=0` for a
+# case that is specifically about a client that never asks. The agent is never
+# used for *user* auth here (`IdentitiesOnly=yes` + an explicit -i pin that),
+# which is exactly the separation the passthrough feature needs: the agent is a
+# signing backend, not a credential the client offers for itself.
 subtopo_ssh() {
   local _a=()
-  [ "${SUBTOP_SSH_A:-0}" = "1" ] && _a+=(-A)
+  [ "${SUBTOP_SSH_A:-1}" = "1" ] && _a+=(-A)
   ssh -p "$ST_GW_PORT" -i "$USER_KEY" "${_a[@]}" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o IdentitiesOnly=yes -o ConnectTimeout=15 -o LogLevel=ERROR \
@@ -225,9 +231,16 @@ subtopo_ssh_A() {
 # subtopo_agent_start <key-to-add...> — start a throwaway ssh-agent holding those
 # keys and export SSH_AUTH_SOCK/SSH_AGENT_PID **in the caller's shell** (so run
 # this directly, never inside `$(...)`). Pair with subtopo_agent_stop.
+#
+# Any agent *this shell* started is stopped first, so a restart never leaks one
+# and at most one agent is ever ours. An agent inherited from the orchestrator
+# (the shared suite agent) is simply replaced in this shell, never killed: other
+# cases still depend on it.
 subtopo_agent_start() {
   local key
+  subtopo_agent_stop
   eval "$(ssh-agent -s)" >/dev/null 2>&1 || return 1
+  SUBTOP_AGENT_STARTED=1
   export SSH_AUTH_SOCK SSH_AGENT_PID
   for key in "$@"; do
     ssh-add "$key" </dev/null >/dev/null 2>&1 || return 1
@@ -235,8 +248,14 @@ subtopo_agent_start() {
   log "agent up on $SSH_AUTH_SOCK (agent pid $SSH_AGENT_PID)"
 }
 
+# subtopo_agent_stop — kill the agent this shell started (if any) and drop the
+# variables. Deliberately does NOT touch an agent it did not start: that one
+# belongs to the orchestrator and is shared with every other case.
 subtopo_agent_stop() {
-  ssh-agent -k >/dev/null 2>&1 || true
+  if [ "${SUBTOP_AGENT_STARTED:-0}" = "1" ]; then
+    SUBTOP_AGENT_STARTED=0
+    ssh-agent -k >/dev/null 2>&1 || true
+  fi
   unset SSH_AUTH_SOCK SSH_AGENT_PID || true
 }
 

@@ -41,23 +41,35 @@ W="${TMPDIR:-/tmp}/soak.${STAMP}.$$"
 ASSET="${SSH_GW_ASSET_DIR:-$W/assets}"
 mkdir -p "$W"
 gen_assets "$ASSET" >/dev/null 2>&1
+# plan-agent-only: the gateway holds no backend credential, so every relayed
+# session needs this shell's agent signing for it.
+SOAK_AGENT_STARTED=0
 
 SSHD_P="$(alloc_port)"; CP_P="$(alloc_port)"; GW_P="$(alloc_port)"; MET_P="$(alloc_port)"
 PIDS=()
 cleanup() {
   trap - EXIT INT TERM
+  if [ "${SOAK_AGENT_STARTED:-0}" = "1" ]; then
+    SOAK_AGENT_STARTED=0
+    ssh-agent -k >/dev/null 2>&1 || true
+  fi
   for p in "${SSHD_MON:-}" "${CP_MON:-}" "${GW_MON:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true; done
   for p in $(lsof -nP -iTCP:"$SSHD_P" -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1 && $1 ~ /sshd/ {print $2}' | sort -u); do kill -9 "$p" 2>/dev/null || true; done
   rm -rf "$W"
 }
 trap cleanup EXIT INT TERM
 
+eval "$(ssh-agent -s)" >/dev/null 2>&1 || { echo "ssh-agent failed" >&2; exit 1; }
+SOAK_AGENT_STARTED=1
+export SSH_AUTH_SOCK SSH_AGENT_PID
+ssh-add "$ASSET/user_ed25519" </dev/null >/dev/null 2>&1 || { echo "ssh-add failed" >&2; exit 1; }
+
 printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s/sshd_host_ed25519\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s/authorized_keys\nStrictModes no\nUsePAM no\nMaxSessions 20\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
   "$SSHD_P" "$ASSET" "$ASSET" "$W" > "$W/sshd.cfg"
 /usr/sbin/sshd -D -e -f "$W/sshd.cfg" >"$W/sshd.log" 2>&1 & SSHD_MON=$!
 
 BKUSER="$(id -un)"
-printf '{"resolve":{"alex_host1":{"status":200,"target":{"host":"127.0.0.1","port":%s,"user":"%s"},"policy":{"ttl":60}}},"default":{"status":404}}\n' \
+printf '{"resolve":{"alex_host1":{"status":200,"target":{"host":"127.0.0.1","port":%s,"user":"%s"},"policy":{"agent_forwarding":true,"ttl":60}}},"default":{"status":404}}\n' \
   "$SSHD_P" "$BKUSER" > "$W/rules.json"
 python3 "$SCRIPT_DIR/mock_control_plane.py" --port "$CP_P" --rules "$W/rules.json" >"$W/cp.log" 2>&1 & CP_MON=$!
 
@@ -68,7 +80,6 @@ addr = "127.0.0.1:${GW_P}"
 [host_keys]
 keys = [ { path = "$ASSET/hostkey_ed25519", state = "active" } ]
 [backend]
-private_key = "$ASSET/backend_ed25519"
 host_key_policy = "accept-new"
 [pool]
 enabled = false
@@ -91,7 +102,7 @@ wait_http_ok "http://127.0.0.1:${MET_P}/healthz" 20 >/dev/null || { tail_log "$W
 log "soak: gateway up gw=$GW_P metrics=$MET_P backend=$SSHD_P (duration=${SOAK_DURATION}s loops=${SOAK_LOOPS})"
 
 SSH=(-p "$GW_P" -i "$ASSET/user_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-     -o IdentitiesOnly=yes -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes)
+     -o IdentitiesOnly=yes -o ForwardAgent=yes -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes)
 metric() { python3 -c "import urllib.request as u,sys
 import re
 d=u.urlopen('http://127.0.0.1:${MET_P}/metrics',timeout=4).read().decode()

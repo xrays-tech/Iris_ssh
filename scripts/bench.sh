@@ -9,7 +9,17 @@ set -uo pipefail
 : "${BENCH_FILE_MB:=64}"
 : "${BENCH_ITERS:=5}"
 WORK=$(mktemp -d /tmp/sshgw-bench.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+# The gateway holds no backend credential of its own (plan-agent-only), so the
+# via-gateway legs need a live agent holding the end user's identity.
+BENCH_AGENT_STARTED=0
+bench_cleanup() {
+  rm -rf "$WORK"
+  if [ "$BENCH_AGENT_STARTED" = "1" ]; then
+    BENCH_AGENT_STARTED=0
+    ssh-agent -k >/dev/null 2>&1 || true
+  fi
+}
+trap bench_cleanup EXIT
 
 # --- sockets ---
 S=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
@@ -25,6 +35,12 @@ for n in hostkey_ed25519 backend_ed25519 user_ed25519 sshd_host_ed25519; do
 done
 cat "$WORK/assets/backend_ed25519.pub" "$WORK/assets/user_ed25519.pub" > "$WORK/assets/authorized_keys"
 chmod 600 "$WORK/assets/authorized_keys"
+
+# Shared signing backend for every via-gateway session.
+eval "$(ssh-agent -s)" >/dev/null 2>&1 || { echo "ssh-agent failed" >&2; exit 2; }
+BENCH_AGENT_STARTED=1
+export SSH_AUTH_SOCK SSH_AGENT_PID
+ssh-add "$WORK/assets/user_ed25519" </dev/null >/dev/null 2>&1   || { echo "ssh-add failed" >&2; exit 2; }
 
 # --- backend sshd ---
 cat > "$WORK/sshd.cfg" <<EOF
@@ -47,7 +63,7 @@ kill -0 "$SSHD" 2>/dev/null || { echo "sshd failed to start" >&2; tail -10 "$WOR
 
 # --- gateway topology ---
 cat > "$WORK/rules.json" <<EOF
-{"resolve":{"bench":{"status":200,"target":{"host":"127.0.0.1","port":$S,"user":"$(id -un)"},"policy":{"ttl":60}}},"default":{"status":404,"error":"nf"}}
+{"resolve":{"bench":{"status":200,"target":{"host":"127.0.0.1","port":$S,"user":"$(id -un)"},"policy":{"agent_forwarding":true,"ttl":60}}},"default":{"status":404,"error":"nf"}}
 EOF
 python3 "$PWD/scripts/mock_control_plane.py" --port "$CP" --rules "$WORK/rules.json" --access-log "$WORK/cp.log" >"$WORK/cp.out" 2>&1 & CPID=$!
 sleep 1
@@ -73,7 +89,6 @@ outbound_guard = ${GW_GUARD:-true}
 nodelay = ${GW_NODELAY:-false}
 ${GW_CIPHERS_LINE}
 [backend]
-private_key = "$WORK/assets/backend_ed25519"
 host_key_policy = "accept-new"
 [pool]
 enabled = false
@@ -103,10 +118,10 @@ ok=0; for i in $(seq 1 40); do curl -sf "http://127.0.0.1:$M/healthz" >/dev/null
 
 # --- common ssh option arrays (bash arrays: correct word splitting) ---
 DIRECT=(-p "$S" -i "$WORK/assets/user_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=5 -o LogLevel=ERROR)
-VIA=(-p "$G" -i "$WORK/assets/user_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=5 -o LogLevel=ERROR)
+VIA=(-p "$G" -i "$WORK/assets/user_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ForwardAgent=yes -o ConnectTimeout=5 -o LogLevel=ERROR)
 # scp: port is -P (lowercase -p means "preserve") — separate arrays
 SCP_DIRECT=(-P "$S" -i "$WORK/assets/user_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=5 -o LogLevel=ERROR)
-SCP_VIA=(-P "$G" -i "$WORK/assets/user_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=5 -o LogLevel=ERROR)
+SCP_VIA=(-P "$G" -i "$WORK/assets/user_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ForwardAgent=yes -o ConnectTimeout=5 -o LogLevel=ERROR)
 NOW() { python3 -c 'import time; print(time.time())'; }
 
 ms() { python3 -c "print(round(($2 - $1) * 1000, 1))"; }
