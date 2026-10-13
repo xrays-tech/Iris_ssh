@@ -17,7 +17,7 @@
 
 pub mod health;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -668,6 +668,7 @@ impl server::Server for GatewayServer {
             relays: HashMap::new(),
             taps: HashMap::new(),
             agent: None,
+            agent_channels: HashSet::new(),
             entry: None,
             limiter_reject,
             audited: false,
@@ -697,18 +698,21 @@ pub struct GatewaySession {
     /// backend with the user's forwarded agent. `None` in the key/cert path,
     /// which therefore stays byte-for-byte unchanged.
     agent: Option<AgentSession>,
+    /// Every client channel this session has handed to the supervisor, used
+    /// for the per-connection channel cap and to tell an agent channel from a
+    /// stale one. The relay state itself lives in the supervisor.
+    agent_channels: HashSet<ChannelId>,
     entry: Option<Arc<SessionEntry>>,
     limiter_reject: bool,
     audited: bool,
 }
 
-/// The agent-mode channel of one session (C2).
+/// The agent-mode state of one session (C2/D2).
 ///
-/// Agent mode owns exactly one client channel and one supervisor task: a second
-/// concurrent channel would need a second agent leg, and there is exactly one
-/// forwarded agent per session (see [`relay::agent`]).
+/// A session owns exactly one supervisor task and one authenticated backend
+/// connection; every client channel on it is multiplexed onto that connection
+/// by the supervisor (see [`relay::agent`]).
 struct AgentSession {
-    client_id: ChannelId,
     handle: relay::agent::AgentHandle,
 }
 
@@ -895,31 +899,40 @@ impl GatewaySession {
         )
     }
 
-    /// Agent mode (C2): while this session's channel belongs to the supervisor,
-    /// hand the op to its single ordered consumer instead of acting on it here
-    /// (propose.md §3.5.1).
+    /// Agent mode (C2/D2): while this session's channel belongs to the
+    /// supervisor, hand the op to its single ordered consumer instead of acting
+    /// on it here (propose.md §3.5.1).
     ///
-    /// Returns `true` when the caller must stop: either the op was queued, or
-    /// the supervisor has already closed the channel natively (I4).
+    /// Returns `true` when the caller must stop: either the op was queued, the
+    /// channel is already gone, or the supervisor has closed it natively (I4).
     async fn take_over_by_agent(
         &mut self,
         channel: ChannelId,
-        op: relay::agent::AgentOp,
+        kind: relay::agent::AgentOpKind,
         session: &mut Session,
     ) -> bool {
-        let Some(agent) = &self.agent else {
-            return false;
-        };
-        if agent.client_id != channel {
+        if self.agent.is_none() {
             return false;
         }
+        if !self.agent_channels.contains(&channel) {
+            // Already closed (or never ours): swallow it rather than letting
+            // the caller fall through to the inline path, which has no relay
+            // for an agent session either.
+            return true;
+        }
+        let op = relay::agent::AgentOp::new(channel, kind);
         // While dialing this must never park the serial event loop (C5); once
         // the backend is up, `send().await` is the same backpressure the inline
-        // path applies today.
-        let outcome = if agent.handle.is_ready() {
-            agent.handle.enqueue(op).await
-        } else {
-            agent.handle.try_enqueue(op)
+        // path applies.
+        let outcome = match &self.agent {
+            Some(agent) => {
+                if agent.handle.is_ready() {
+                    agent.handle.enqueue(op).await
+                } else {
+                    agent.handle.try_enqueue(op)
+                }
+            }
+            None => relay::agent::Enqueued::Closed,
         };
         match outcome {
             relay::agent::Enqueued::Accepted => true,
@@ -932,14 +945,30 @@ impl GatewaySession {
                 );
                 // The op is dropped with its reply slot, so the client learns
                 // about it from the close rather than a fabricated SUCCESS.
+                // Only *this* channel goes; the session and its other channels
+                // carry on.
+                self.agent_channels.remove(&channel);
+                if let Some(tap) = self.taps.remove(&channel) {
+                    tap.flush();
+                }
+                if let Some(entry) = &self.entry {
+                    entry.forget_channel(channel);
+                }
                 let _ = session.close(channel);
-                self.agent = None;
                 true
             }
             relay::agent::Enqueued::Closed => {
-                // The supervisor already answered the queue with protocol-native
-                // failures and closed the channel; nothing left to do here.
-                self.agent = None;
+                // The supervisor has already answered the queue with
+                // protocol-native failures and closed the channels it accepted.
+                // Forget this one too; the handle stays in place so later
+                // opens are refused instead of resurrecting a dead supervisor.
+                self.agent_channels.remove(&channel);
+                if let Some(tap) = self.taps.remove(&channel) {
+                    tap.flush();
+                }
+                if let Some(entry) = &self.entry {
+                    entry.forget_channel(channel);
+                }
                 true
             }
         }
@@ -981,14 +1010,21 @@ impl GatewaySession {
         Ok(true)
     }
 
-    /// Agent mode (C2): open this session's single channel to a new supervisor
-    /// task rather than dialing inline.
+    /// Agent mode (C2/D2): hand this session's channel to the supervisor rather
+    /// than dialing inline.
     ///
     /// The channel is accepted *immediately* (the client needs its confirmation
-    /// before it can request agent forwarding at all), and every later request
-    /// is queued by [`take_over_by_agent`](Self::take_over_by_agent) until the
-    /// backend is up. Failure to reach the backend closes the channel
-    /// natively — it never falls back to the gateway's own key (red line 3).
+    /// before it can request agent forwarding at all), and an
+    /// [`AgentOpKind::OpenChannel`] op asks the supervisor to map it onto a new
+    /// session channel of the one authenticated backend connection. Failure to
+    /// reach the backend closes the channel natively — it never falls back to
+    /// the gateway's own key (red line 3).
+    ///
+    /// Channels #2..n that arrive **while the backend is still dialing** are
+    /// accepted and queued exactly like the first one — the supervisor has no
+    /// connection to open them on yet, so the op simply waits, and the dial's
+    /// failure path closes every channel it accepted (I4). Only the
+    /// `channels_per_conn` cap can refuse one up front.
     async fn open_agent_channel(
         &mut self,
         channel: Channel<server::Msg>,
@@ -996,29 +1032,30 @@ impl GatewaySession {
         session: &mut Session,
         grant: &Grant,
     ) -> Result<()> {
-        if self.agent.is_some() {
-            // MVP (red line 12 scope): one channel per agent session. A second
-            // would need a second agent leg, and there is one forwarded agent
-            // per session.
+        let client_id = channel.id();
+        let first = self.agent.is_none();
+
+        // Per-connection channel cap (§3.8 / sshd MaxSessions): every channel
+        // is multiplexed onto this session's single backend connection, so the
+        // configured (hard-capped) limit applies exactly as it does inline.
+        if !crate::pool::can_open_channel(
+            self.agent_channels.len(),
+            self.ctx.config.pool.channels_per_conn,
+        ) {
             self.ctx.metrics.agent_channel_denied();
             tracing::warn!(
                 target: "server",
-                channel = %channel.id(),
-                "agent mode allows one session channel; refusing the second"
+                channels = self.agent_channels.len(),
+                limit = self.ctx.config.pool.channels_per_conn,
+                "per-connection channel limit reached; refusing agent channel"
             );
             reply.reject(ChannelOpenFailure::ResourceShortage).await;
             return Ok(());
         }
 
-        let client_id = channel.id();
         if let Some(entry) = &self.entry {
             entry.set_channel_class(client_id, crate::audit::CommandClass::Interactive);
         }
-        let bytes = self
-            .auditor
-            .as_ref()
-            .map(|a| a.byte_counters())
-            .unwrap_or_default();
         let tap_ctx = relay::ChannelCtx {
             session_id: self.session_id.to_string(),
             channel_id: client_id,
@@ -1036,28 +1073,60 @@ impl GatewaySession {
             auditor.set_auth_kind("agent");
         }
 
-        let handle = relay::agent::spawn(
-            relay::agent::AgentSupervisorArgs {
-                grant: grant.clone(),
-                client_id,
-                up: session.handle(),
-                dialer: Arc::clone(&self.ctx.dialer),
-                metrics: self.ctx.metrics.clone(),
-                tap,
-                bytes,
-                auditor: self.auditor.clone(),
-                session_id: self.session_id.to_string(),
-            },
-            self.ctx.config.relay.window_size,
-            self.ctx.config.relay.max_packet,
-        );
-        // Register the handle *before* confirming the open, so the client's
-        // first request can never outrun it. The supervisor cannot reply to or
-        // close this channel before then either: its first act is to wait for
-        // the client's `auth-agent-req@openssh.com`, which the client only sends
-        // once it has this confirmation.
-        self.agent = Some(AgentSession { client_id, handle });
-        reply.accept().await;
+        if first {
+            let bytes = self
+                .auditor
+                .as_ref()
+                .map(|a| a.byte_counters())
+                .unwrap_or_default();
+            let handle = relay::agent::spawn(
+                relay::agent::AgentSupervisorArgs {
+                    grant: grant.clone(),
+                    up: session.handle(),
+                    dialer: Arc::clone(&self.ctx.dialer),
+                    metrics: self.ctx.metrics.clone(),
+                    bytes,
+                    auditor: self.auditor.clone(),
+                    session_id: self.session_id.to_string(),
+                },
+                self.ctx.config.relay.window_size,
+                self.ctx.config.relay.max_packet,
+            );
+            // Register the handle *before* confirming the open, so the client's
+            // first request can never outrun it. The supervisor cannot reply to
+            // or close this channel before then either: its first act is to wait
+            // for the client's `auth-agent-req@openssh.com`, which the client
+            // only sends once it has this confirmation.
+            self.agent = Some(AgentSession { handle });
+        }
+
+        let op =
+            relay::agent::AgentOp::new(client_id, relay::agent::AgentOpKind::OpenChannel { tap });
+        let outcome = match &self.agent {
+            Some(agent) => {
+                if agent.handle.is_ready() {
+                    agent.handle.enqueue(op).await
+                } else {
+                    agent.handle.try_enqueue(op)
+                }
+            }
+            None => relay::agent::Enqueued::Closed,
+        };
+        match outcome {
+            relay::agent::Enqueued::Accepted => {
+                self.agent_channels.insert(client_id);
+                reply.accept().await;
+            }
+            relay::agent::Enqueued::QueueFull | relay::agent::Enqueued::Closed => {
+                // Nothing to relay it with: refuse the channel natively (I4)
+                // rather than accepting a channel that would never move.
+                self.taps.remove(&client_id);
+                if let Some(entry) = &self.entry {
+                    entry.forget_channel(client_id);
+                }
+                reply.reject(ChannelOpenFailure::ResourceShortage).await;
+            }
+        }
         Ok(())
     }
 }
@@ -1381,7 +1450,7 @@ impl server::Handler for GatewaySession {
             }
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::Data {
+                relay::agent::AgentOpKind::Data {
                     data: Bytes::from(payload),
                 },
                 session,
@@ -1471,7 +1540,7 @@ impl server::Handler for GatewaySession {
         if self.agent.is_some() {
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::ExtendedData {
+                relay::agent::AgentOpKind::ExtendedData {
                     ext,
                     data: Bytes::copy_from_slice(data),
                 },
@@ -1507,7 +1576,7 @@ impl server::Handler for GatewaySession {
         if self.agent.is_some() {
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::Pty {
+                relay::agent::AgentOpKind::Pty {
                     term: term.to_owned(),
                     col_width,
                     row_height,
@@ -1549,7 +1618,7 @@ impl server::Handler for GatewaySession {
         if self.agent.is_some() {
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::Shell { want_reply: true },
+                relay::agent::AgentOpKind::Shell { want_reply: true },
                 session,
             )
             .await;
@@ -1582,7 +1651,7 @@ impl server::Handler for GatewaySession {
         if self.agent.is_some() {
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::Exec {
+                relay::agent::AgentOpKind::Exec {
                     command: data.to_vec(),
                     want_reply: true,
                 },
@@ -1619,7 +1688,7 @@ impl server::Handler for GatewaySession {
             }
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::Subsystem {
+                relay::agent::AgentOpKind::Subsystem {
                     name: name.to_owned(),
                     want_reply: true,
                 },
@@ -1670,7 +1739,7 @@ impl server::Handler for GatewaySession {
             }
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::Env {
+                relay::agent::AgentOpKind::Env {
                     name: variable_name.to_owned(),
                     value: variable_value.to_owned(),
                     want_reply: true,
@@ -1715,7 +1784,7 @@ impl server::Handler for GatewaySession {
         if self.agent.is_some() {
             self.take_over_by_agent(
                 channel,
-                relay::agent::AgentOp::WindowChange {
+                relay::agent::AgentOpKind::WindowChange {
                     col_width,
                     row_height,
                     pix_width,
@@ -1742,8 +1811,12 @@ impl server::Handler for GatewaySession {
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         if self.agent.is_some() {
-            self.take_over_by_agent(channel, relay::agent::AgentOp::Signal { signal }, _session)
-                .await;
+            self.take_over_by_agent(
+                channel,
+                relay::agent::AgentOpKind::Signal { signal },
+                _session,
+            )
+            .await;
             return Ok(());
         }
         if let Some(relay) = self.relays.get(&channel) {
@@ -1836,7 +1909,7 @@ impl server::Handler for GatewaySession {
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         if self.agent.is_some() {
-            self.take_over_by_agent(channel, relay::agent::AgentOp::Eof, _session)
+            self.take_over_by_agent(channel, relay::agent::AgentOpKind::Eof, _session)
                 .await;
             return Ok(());
         }
@@ -1851,29 +1924,33 @@ impl server::Handler for GatewaySession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        if let Some(agent) = self.agent.take() {
-            if agent.client_id == channel {
-                // Best-effort only (red line 8): this callback runs on the
-                // serial event loop, and `enqueue().await` would park it for as
-                // long as the bounded queue stayed full while the backend was
-                // still dialing — the same deadlock shape §3.5.1 exists to
-                // avoid. `try_enqueue` either hands the op over or tells us not
-                // to bother; either way the handle is dropped right here, which
-                // closes the queue and lets the supervisor finish (its dial
-                // guard and the down-pump's completion signal both end it), and
-                // the supervisor closes the backend channel on the way out.
-                let _ = agent.handle.try_enqueue(relay::agent::AgentOp::Close);
-                if let Some(tap) = self.taps.remove(&channel) {
-                    tap.flush();
-                }
-                if let Some(entry) = &self.entry {
-                    entry.forget_channel(channel);
-                }
-                return Ok(());
+        // `agent_channels` is only ever populated for an agent session, so the
+        // membership test alone identifies one of this session's supervisor
+        // channels; the `agent` guard just keeps the two in step.
+        if self.agent.is_some() && self.agent_channels.remove(&channel) {
+            // Best-effort only (red line 8): this callback runs on the
+            // serial event loop, and `enqueue().await` would park it for as
+            // long as the bounded queue stayed full while the backend was
+            // still dialing — the same deadlock shape §3.5.1 exists to
+            // avoid. `try_enqueue` either hands the op over or tells us not
+            // to bother; either way the supervisor drops this channel's
+            // write half, which closes the backend channel for good.
+            if let Some(agent) = &self.agent {
+                let _ = agent.handle.try_enqueue(relay::agent::AgentOp::new(
+                    channel,
+                    relay::agent::AgentOpKind::Close,
+                ));
             }
-            // Not this session's channel: put the handle back untouched.
-            self.agent = Some(agent);
+            if let Some(tap) = self.taps.remove(&channel) {
+                tap.flush();
+            }
+            if let Some(entry) = &self.entry {
+                entry.forget_channel(channel);
+            }
+            return Ok(());
         }
+        // Not one of this session's agent channels (already closed, or a
+        // channel belonging to the inline path): fall through.
         if let Some(relay) = self.relays.remove(&channel) {
             relay.backend.close().await?;
         }

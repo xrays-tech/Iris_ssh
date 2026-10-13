@@ -482,6 +482,7 @@ ALL_CASES=(
   case_agent_no_key
   case_agent_target_scope
   case_agent_env
+  case_agent_multichannel
 )
 
 resolve_case_path() {

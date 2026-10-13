@@ -15,25 +15,35 @@
 //! **per-session supervisor task** (propose.md §3.5.1), and the handler only
 //! enqueues.
 //!
+//! # One connection, many channels
+//!
+//! The supervisor owns exactly **one** authenticated backend `Handle` and a
+//! `HashMap<ChannelId, Arc<ChannelRelay>>` describing every client channel that
+//! has been mapped onto it. A new client channel is an [`AgentOpKind::OpenChannel`]
+//! that opens a *further* session channel on the same backend connection; each
+//! gets its own relay, its own uplink window and its own down-pump. I1 is
+//! therefore **per-channel FIFO**: ops for one channel are applied in enqueue
+//! order, cross-channel order is not an invariant.
+//!
 //! The four qualifiers of §3.5.1 are enforced structurally here:
 //!
-//! * **agent mode only** — a supervisor is only ever spawned after
-//!   [`ensure_agent_backend_auth`](crate::backend::ensure_agent_backend_auth)
-//!   passed, i.e. the kill-switch is on *and* the grant resolved to `agent`.
-//!   The key/cert path never constructs one.
 //! * **one FIFO consumer** — a session owns exactly one
 //!   [`mpsc::Sender<AgentOp>`] and one supervisor; ops are applied strictly in
-//!   enqueue order, so I1 (channel ↔ backend 1:1) holds and no request is ever
-//!   reordered or injected.
+//!   enqueue order, so I1 holds per channel and no request is ever reordered or
+//!   injected.
 //! * **handler never blocks while dialing** — while the state is
 //!   [`STATE_DIALING`] the handler uses `try_send`; a full queue fails the
 //!   channel natively instead of awaiting (C5). Once [`STATE_READY`] the
-//!   handler's `send().await` is the same backpressure it applies inline today,
+//!   handler's `send().await` is the same backpressure the inline path applies,
 //!   and the queue's slot count bounds the bytes it can hold.
 //! * **failures are protocol-native** — every exit path answers pending
-//!   requests with `channel_failure` and then closes the channel; it never
-//!   falls back to the gateway's own key or certificate (red line 3).
+//!   requests with `channel_failure` and closes the client channels it accepted;
+//!   it never falls back to the gateway's own key or certificate (red line 3).
+//! * **minimal signing surface** — the forwarded agent channel is dropped the
+//!   moment the single backend signature succeeds, so the oracle window is one
+//!   signature wide (red lines 4/10).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +52,7 @@ use bytes::Bytes;
 use russh::keys::agent::AgentIdentity;
 use russh::keys::HashAlg;
 use russh::server::Handle as ClientHandle;
-use russh::{Pty, Sig};
+use russh::{ChannelId, Pty, Sig};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::audit::ByteCounters;
@@ -71,14 +81,37 @@ const STATE_READY: u8 = 1;
 /// The supervisor gave up; nothing more will be relayed.
 const STATE_CLOSED: u8 = 2;
 
-/// What the serial handler hands to the supervisor instead of acting on it
-/// itself (propose.md §3.5.1).
+/// One request the serial handler hands to the supervisor instead of acting on
+/// it itself (propose.md §3.5.1), tagged with the client channel it belongs to.
 ///
-/// Exhaustive for the requests a client can send on a session channel:
-/// whichever arrive before the backend is up are replayed, in order, the moment
-/// it is.
+/// The channel tag is what makes the single ordered consumer safe for a
+/// multi-channel session: every op names its channel, so the supervisor routes
+/// each one to the right relay without the handler ever sharing a lock.
 #[derive(Debug)]
-pub enum AgentOp {
+pub struct AgentOp {
+    pub client_id: ChannelId,
+    pub kind: AgentOpKind,
+}
+
+impl AgentOp {
+    pub fn new(client_id: ChannelId, kind: AgentOpKind) -> Self {
+        AgentOp { client_id, kind }
+    }
+}
+
+/// The payload of an [`AgentOp`]: every request a client can send on a session
+/// channel, plus the channel-mapping op itself.
+///
+/// Exhaustive for the session-channel surface: whichever arrive before the
+/// backend is up are replayed, in order, the moment it is.
+pub enum AgentOpKind {
+    /// Map this client channel onto a new session channel of the already
+    /// authenticated backend connection, and start its down-pump.
+    OpenChannel {
+        /// Per-channel data tap (recording / SFTP inspection), created by the
+        /// handler so `taps`/`apply_uplink_tap` stay where §3.5.1 puts them.
+        tap: Option<Arc<dyn relay::ChannelTap>>,
+    },
     Pty {
         term: String,
         col_width: u32,
@@ -124,24 +157,102 @@ pub enum AgentOp {
     Close,
 }
 
-impl AgentOp {
+impl std::fmt::Debug for AgentOpKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ChannelTap` is an object-safe trait object, not a data type: show
+        // its presence rather than pretending to print it.
+        match self {
+            AgentOpKind::OpenChannel { tap } => f
+                .debug_struct("OpenChannel")
+                .field("tap", &tap.as_ref().map(|_| "<tap>"))
+                .finish(),
+            AgentOpKind::Pty {
+                term,
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+                modes,
+                want_reply,
+            } => f
+                .debug_struct("Pty")
+                .field("term", term)
+                .field("want_reply", want_reply)
+                .field("size", &(col_width, row_height, pix_width, pix_height))
+                .field("modes", &modes.len())
+                .finish(),
+            AgentOpKind::Shell { want_reply } => f
+                .debug_struct("Shell")
+                .field("want_reply", want_reply)
+                .finish(),
+            AgentOpKind::Exec {
+                command,
+                want_reply,
+            } => f
+                .debug_struct("Exec")
+                .field("command", &String::from_utf8_lossy(command))
+                .field("want_reply", want_reply)
+                .finish(),
+            AgentOpKind::Subsystem { name, want_reply } => f
+                .debug_struct("Subsystem")
+                .field("name", name)
+                .field("want_reply", want_reply)
+                .finish(),
+            AgentOpKind::Env {
+                name,
+                value,
+                want_reply,
+            } => f
+                .debug_struct("Env")
+                .field("name", name)
+                .field("value", value)
+                .field("want_reply", want_reply)
+                .finish(),
+            AgentOpKind::WindowChange {
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            } => f
+                .debug_struct("WindowChange")
+                .field("size", &(col_width, row_height, pix_width, pix_height))
+                .finish(),
+            AgentOpKind::Signal { signal } => f.debug_tuple("Signal").field(signal).finish(),
+            AgentOpKind::Data { data } => f.debug_tuple("Data").field(&data.len()).finish(),
+            AgentOpKind::ExtendedData { ext, data } => f
+                .debug_struct("ExtendedData")
+                .field("ext", ext)
+                .field("len", &data.len())
+                .finish(),
+            AgentOpKind::Eof => f.write_str("Eof"),
+            AgentOpKind::Close => f.write_str("Close"),
+        }
+    }
+}
+
+impl AgentOpKind {
     /// Whether the client asked for a reply, and therefore deserves one.
     fn wants_reply(&self) -> bool {
         match self {
-            AgentOp::Pty { want_reply, .. }
-            | AgentOp::Shell { want_reply }
-            | AgentOp::Exec { want_reply, .. }
-            | AgentOp::Subsystem { want_reply, .. }
-            | AgentOp::Env { want_reply, .. } => *want_reply,
+            AgentOpKind::Pty { want_reply, .. }
+            | AgentOpKind::Shell { want_reply }
+            | AgentOpKind::Exec { want_reply, .. }
+            | AgentOpKind::Subsystem { want_reply, .. }
+            | AgentOpKind::Env { want_reply, .. } => *want_reply,
             _ => false,
         }
     }
 
     /// Replay the op against the now-live backend channel, answering the client
     /// with the protocol-native SUCCESS/FAILURE when it asked for a reply.
-    async fn apply(self, relay: &ChannelRelay, up: &ClientHandle, client_id: russh::ChannelId) {
+    async fn apply(self, relay: &ChannelRelay, up: &ClientHandle, client_id: ChannelId) {
         match self {
-            AgentOp::Pty {
+            // OpenChannel is routed by the supervisor itself: it mutates the
+            // relay map, so it cannot be applied against an existing relay.
+            AgentOpKind::OpenChannel { .. } => {
+                debug_assert!(false, "OpenChannel must never reach apply()");
+            }
+            AgentOpKind::Pty {
                 term,
                 col_width,
                 row_height,
@@ -162,14 +273,14 @@ impl AgentOp {
                 }
                 deliver(up, client_id, want_reply, &mut rx).await;
             }
-            AgentOp::Shell { want_reply } => {
+            AgentOpKind::Shell { want_reply } => {
                 let mut rx = relay.router.push(want_reply);
                 if let Err(e) = relay.backend.request_shell(want_reply).await {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode shell request failed");
                 }
                 deliver(up, client_id, want_reply, &mut rx).await;
             }
-            AgentOp::Exec {
+            AgentOpKind::Exec {
                 command,
                 want_reply,
             } => {
@@ -179,14 +290,14 @@ impl AgentOp {
                 }
                 deliver(up, client_id, want_reply, &mut rx).await;
             }
-            AgentOp::Subsystem { name, want_reply } => {
+            AgentOpKind::Subsystem { name, want_reply } => {
                 let mut rx = relay.router.push(want_reply);
                 if let Err(e) = relay.backend.request_subsystem(want_reply, name).await {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode subsystem request failed");
                 }
                 deliver(up, client_id, want_reply, &mut rx).await;
             }
-            AgentOp::Env {
+            AgentOpKind::Env {
                 name,
                 value,
                 want_reply,
@@ -197,7 +308,7 @@ impl AgentOp {
                 }
                 deliver(up, client_id, want_reply, &mut rx).await;
             }
-            AgentOp::WindowChange {
+            AgentOpKind::WindowChange {
                 col_width,
                 row_height,
                 pix_width,
@@ -211,12 +322,12 @@ impl AgentOp {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode window-change failed");
                 }
             }
-            AgentOp::Signal { signal } => {
+            AgentOpKind::Signal { signal } => {
                 if let Err(e) = relay.backend.signal(signal).await {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode signal failed");
                 }
             }
-            AgentOp::Data { data } => {
+            AgentOpKind::Data { data } => {
                 relay.note_would_exhaust(data.len());
                 // Same fuse as the inline path: the down-pump closes it the
                 // instant the backend dies, so it cannot park this task (P0-2).
@@ -228,18 +339,18 @@ impl AgentOp {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode uplink forward failed");
                 }
             }
-            AgentOp::ExtendedData { ext, data } => {
+            AgentOpKind::ExtendedData { ext, data } => {
                 relay.bytes.add_up(data.len());
                 if let Err(e) = relay.backend.extended_data_bytes(ext, data).await {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode uplink ext-data forward failed");
                 }
             }
-            AgentOp::Eof => {
+            AgentOpKind::Eof => {
                 if let Err(e) = relay.backend.eof().await {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode eof failed");
                 }
             }
-            AgentOp::Close => {
+            AgentOpKind::Close => {
                 if let Err(e) = relay.backend.close().await {
                     tracing::debug!(target: "relay", %client_id, ?e, "agent-mode channel close failed");
                 }
@@ -248,7 +359,7 @@ impl AgentOp {
     }
 
     /// Answer a still-pending request with a protocol-native FAILURE (I4).
-    async fn fail_pending(self, up: &ClientHandle, client_id: russh::ChannelId) {
+    async fn fail_pending(self, up: &ClientHandle, client_id: ChannelId) {
         if self.wants_reply() {
             let _ = up.channel_failure(client_id).await;
         }
@@ -260,7 +371,7 @@ impl AgentOp {
 /// session's inline helper.
 async fn deliver(
     up: &ClientHandle,
-    client_id: russh::ChannelId,
+    client_id: ChannelId,
     want_reply: bool,
     rx: &mut Option<oneshot::Receiver<bool>>,
 ) {
@@ -295,9 +406,8 @@ pub enum Enqueued {
 /// Deliberately **does not own the op sender**: if it did, the supervisor's own
 /// strong reference would keep the queue open forever, `rx.recv()` would never
 /// return `None`, and the supervisor would never exit — which in turn would
-/// leave the agent-forwarding channel open and pin the client's connection
-/// alive after the session ended. The sender lives in [`AgentHandle`], which
-/// only the handler holds.
+/// leave the supervisor holding the backend connection alive after the session
+/// ended. The sender lives in [`AgentHandle`], which only the handler holds.
 pub struct AgentShared {
     state: AtomicU8,
     /// Set by [`AgentShared::grant_decision`] from `agent_request`; a permit is
@@ -340,8 +450,8 @@ impl AgentShared {
 /// sender.
 ///
 /// Dropping it is the supervisor's stop signal: the drain loop ends, the
-/// supervisor drops the forwarded agent channel, and the client's connection is
-/// free to close.
+/// supervisor closes every backend channel it still owns and drops the backend
+/// connection.
 pub struct AgentHandle {
     shared: Arc<AgentShared>,
     tx: mpsc::Sender<AgentOp>,
@@ -359,29 +469,15 @@ impl AgentHandle {
     ///
     /// While dialing the caller is expected to use [`try_enqueue`](Self::try_enqueue)
     /// instead (C5). Once ready this awaits — exactly the backpressure the
-    /// inline `data()` path applies today — and holds no lock while it does
-    /// (D11).
+    /// inline `data()` path applies — and holds no lock while it does (D11).
     pub async fn enqueue(&self, op: AgentOp) -> Enqueued {
-        if self.shared.is_closed() {
-            return Enqueued::Closed;
-        }
-        match self.tx.send(op).await {
-            Ok(()) => Enqueued::Accepted,
-            Err(_) => Enqueued::Closed,
-        }
+        push(&self.tx, self.shared.is_closed(), op).await
     }
 
     /// Non-blocking enqueue, used by the handler while the backend is still
     /// dialing so the serial event loop is never parked on a full queue (C5).
     pub fn try_enqueue(&self, op: AgentOp) -> Enqueued {
-        if self.shared.is_closed() {
-            return Enqueued::Closed;
-        }
-        match self.tx.try_send(op) {
-            Ok(()) => Enqueued::Accepted,
-            Err(mpsc::error::TrySendError::Full(_)) => Enqueued::QueueFull,
-            Err(mpsc::error::TrySendError::Closed(_)) => Enqueued::Closed,
-        }
+        try_push(&self.tx, self.shared.is_closed(), op)
     }
 
     /// Report the agent-forwarding decision so the supervisor can stop waiting.
@@ -401,17 +497,44 @@ impl AgentHandle {
     }
 }
 
+/// The blocking half of the enqueue contract: report a closed supervisor
+/// *before* touching the queue, otherwise await the slot (D11: the caller
+/// holds no lock here).
+async fn push<T>(tx: &mpsc::Sender<T>, closed: bool, item: T) -> Enqueued {
+    if closed {
+        return Enqueued::Closed;
+    }
+    match tx.send(item).await {
+        Ok(()) => Enqueued::Accepted,
+        Err(_) => Enqueued::Closed,
+    }
+}
+
+/// The non-blocking half (C5), generic over the queue item so the rules can be
+/// unit-tested: russh keeps [`ChannelId`]'s constructor private, so a test
+/// cannot build a real [`AgentOp`] from scratch.
+fn try_push<T>(tx: &mpsc::Sender<T>, closed: bool, item: T) -> Enqueued {
+    if closed {
+        return Enqueued::Closed;
+    }
+    match tx.try_send(item) {
+        Ok(()) => Enqueued::Accepted,
+        Err(mpsc::error::TrySendError::Full(_)) => Enqueued::QueueFull,
+        Err(mpsc::error::TrySendError::Closed(_)) => Enqueued::Closed,
+    }
+}
+
 /// Everything the supervisor needs, bundled once so the spawned task owns its
 /// whole world and borrows nothing from the session.
+///
+/// No channel identity lives here: a supervisor is per *session* and serves
+/// every channel on it, so each op carries its own `client_id`.
 pub struct AgentSupervisorArgs {
     pub grant: Grant,
-    pub client_id: russh::ChannelId,
     pub up: ClientHandle,
     pub dialer: Arc<BackendDialer>,
     pub metrics: crate::metrics::Metrics,
-    /// Per-channel data tap (recording / SFTP inspection), already created by
-    /// the handler so the fast path stays allocation-free.
-    pub tap: Option<Arc<dyn relay::ChannelTap>>,
+    /// Shared up/down byte counters (the audit record's session-wide tally).
     pub bytes: Arc<ByteCounters>,
     /// Session auditor, so the agent identity actually used lands in the audit
     /// record (red line 10).
@@ -423,7 +546,9 @@ pub struct AgentSupervisorArgs {
 ///
 /// Bounded so the bytes parked here can never exceed the relay window (I2/I3):
 /// each `Data` op holds at most one max-sized packet, and the slack covers the
-/// payload-free control ops (pty/shell/env) that carry none.
+/// payload-free control ops (pty/shell/env) that carry none. The slack also has
+/// to absorb the `OpenChannel` ops a client can pile on before it is ready,
+/// which is capped separately by `channels_per_conn` on the handler side.
 fn queue_capacity(window_size: u32, max_packet: u32) -> usize {
     let packets = u64::from(window_size.max(1)).div_ceil(u64::from(max_packet.max(1)));
     // +64 slots of slack for payload-free control ops.
@@ -436,39 +561,51 @@ fn queue_capacity(window_size: u32, max_packet: u32) -> usize {
 pub fn spawn(args: AgentSupervisorArgs, window_size: u32, max_packet: u32) -> AgentHandle {
     let (tx, rx) = mpsc::channel(queue_capacity(window_size, max_packet));
     let handle = AgentHandle::new(tx.clone());
+    // Every down-pump reports its channel back here so the supervisor can drop
+    // the relay (and with it the backend channel's write half) the moment the
+    // backend side goes away.
+    let (pump_done_tx, pump_done_rx) = mpsc::unbounded_channel();
     // Detached: the task ends when the handler drops its handle, and a panic
     // inside it is already reported by tokio and surfaced by the channel close
     // the handler observes. `tx` is handed to the supervisor as a *dial guard*
     // so the queue stays open while the backend is still coming up; it is
     // dropped the moment the handler becomes the sole owner of the sender.
-    tokio::spawn(run(args, Arc::clone(&handle.shared), tx, rx));
+    tokio::spawn(run(
+        args,
+        Arc::clone(&handle.shared),
+        tx,
+        rx,
+        pump_done_tx,
+        pump_done_rx,
+    ));
     handle
 }
 
 /// The supervisor task: wait for the grant, authenticate with the user's agent,
-/// dial the backend, then replay the queue and keep draining it until the
-/// handler drops its handle.
+/// dial the backend, then apply queued ops — opening a backend session channel
+/// for every `OpenChannel` and relaying the rest onto it — until the handler
+/// drops its handle.
 async fn run(
     args: AgentSupervisorArgs,
     shared: Arc<AgentShared>,
     dial_guard: mpsc::Sender<AgentOp>,
     mut rx: mpsc::Receiver<AgentOp>,
+    pump_done_tx: mpsc::UnboundedSender<ChannelId>,
+    mut pump_done_rx: mpsc::UnboundedReceiver<ChannelId>,
 ) {
     let AgentSupervisorArgs {
         grant,
-        client_id,
         up,
         dialer,
         metrics,
-        tap,
         bytes,
         auditor,
         session_id,
     } = args;
 
     // `dial_guard` keeps the queue open while we dial (the handler may be
-    // enqueueing pty/env/exec right now); it is dropped below, the moment the
-    // handler becomes the sole owner of the sender.
+    // enqueueing an OpenChannel plus pty/env/exec right now); it is dropped
+    // below, the moment the handler becomes the sole owner of the sender.
     let established = match establish_backend(&shared, &grant, &up, &dialer).await {
         Ok(established) => established,
         Err(reason) => {
@@ -477,76 +614,41 @@ async fn run(
             tracing::warn!(
                 target: "relay",
                 %session_id,
-                %client_id,
                 target_host = %grant.target.host,
                 target_port = grant.target.port,
                 %reason,
                 "agent-mode backend authentication failed"
             );
-            // I4: every request the client already queued gets a native
-            // FAILURE, then the channel closes. Never a key/cert fallback.
+            // I4: every client channel the handler already accepted is closed,
+            // and every request queued behind one gets a native FAILURE. Never
+            // a key/cert fallback.
+            let mut accepted = Vec::new();
             while let Ok(op) = rx.try_recv() {
-                op.fail_pending(&up, client_id).await;
+                let AgentOp { client_id, kind } = op;
+                if matches!(kind, AgentOpKind::OpenChannel { .. }) {
+                    accepted.push(client_id);
+                } else {
+                    kind.fail_pending(&up, client_id).await;
+                }
             }
-            let _ = up.close(client_id).await;
+            for client_id in accepted {
+                let _ = up.close(client_id).await;
+            }
             return;
         }
     };
 
-    // Keep the agent channel open for as long as the session lives: closing it
-    // would tell the client its forwarding channel is gone.
-    let _agent = established.agent;
-    // ...and keep the backend transport task alive for the same reason (see
-    // `Established`). Both are deliberately bound to underscore names so they
-    // live until `run` returns.
-    let _handle = established.handle;
-    let backend_channel = established.backend_channel;
+    // The forwarded agent channel exists for exactly one signature and is
+    // dropped inside `establish_backend` the moment that signature succeeds
+    // (red lines 4/10). What stays alive is the backend transport task, whose
+    // lifecycle is bound to `Handle` — see `Established`.
+    let handle = established.handle;
     metrics.agent_backend_auth_ok();
     metrics.agent_signature();
     if let Some(auditor) = &auditor {
         auditor.set_agent_identity(established.fingerprint.as_str());
         auditor.note_agent_signature();
     }
-
-    let (backend_read, backend_write) = backend_channel.split();
-    let router = ReplyRouter::default();
-    let window = Arc::new(relay::OutboundWindow::uncalibrated());
-    let relay = Arc::new(ChannelRelay::new(
-        client_id,
-        backend_write,
-        router,
-        Arc::clone(&window),
-        Arc::clone(&bytes),
-        metrics.clone(),
-    ));
-
-    // The down-pump is the only reader of the backend channel and the authority
-    // on its liveness (P0-2): it closes the window the instant the backend dies.
-    // Its completion is also what ends this supervisor, so the forwarded agent
-    // channel can never outlive the session it authenticates — a channel left
-    // open would keep the client's connection (and its agent) alive forever.
-    let (relay_done_tx, relay_done_rx) = oneshot::channel::<()>();
-    // Everything the pump needs is taken *before* the task is built: capturing
-    // `relay` or `up` itself would move them out from under the drain loop.
-    let pump_up = up.clone();
-    let pump_router = relay.router.clone();
-    let pump_window = Arc::clone(&window);
-    let pump_bytes = Arc::clone(&bytes);
-    let pump_metrics = metrics.clone();
-    tokio::spawn(async move {
-        relay::pump_backend_to_client(
-            backend_read,
-            pump_up,
-            client_id,
-            pump_router,
-            pump_window,
-            pump_bytes,
-            pump_metrics,
-            tap,
-        )
-        .await;
-        let _ = relay_done_tx.send(());
-    });
 
     // From here on the handler owns the only sender: once it drops its handle,
     // `rx.recv()` returns `None` and this loop ends.
@@ -556,7 +658,6 @@ async fn run(
     tracing::info!(
         target: "relay",
         %session_id,
-        %client_id,
         agent_identity = %established.fingerprint,
         backend_user = %grant.target.user,
         backend_host = %grant.target.host,
@@ -564,39 +665,161 @@ async fn run(
         "agent-mode backend session established"
     );
 
-    // Drain whatever the client queued while we were dialing, then keep draining
-    // until either the handler drops its handle (which closes the sender) or the
-    // relayed session ends. Single consumer, FIFO — the ordering guarantee
-    // §3.5.1 qualifier 2 asks for.
-    let mut relay_done = relay_done_rx;
+    // One relay per client channel, all multiplexed onto `handle`.
+    let mut relays: HashMap<ChannelId, Arc<ChannelRelay>> = HashMap::new();
+
+    // Single ordered consumer: ops in enqueue order, per channel (I1).
+    // The loop ends when the handler drops its handle — which is what "every
+    // channel is closed and the session is over" looks like from here — or when
+    // the last down-pump has reported in and there is nothing left to serve.
     loop {
-        let op = tokio::select! {
-            op = rx.recv() => op,
-            _ = &mut relay_done => break,
-        };
-        let Some(op) = op else { break };
-        if relay.window.is_closed() {
-            // The backend is gone; the down-pump has already closed the client
-            // channel, so replaying further ops would only write into a void.
-            break;
+        tokio::select! {
+            op = rx.recv() => {
+                match op {
+                    None => break,
+                    Some(op) => match op.kind {
+                        AgentOpKind::OpenChannel { tap } => {
+                            if relays.contains_key(&op.client_id) {
+                                tracing::debug!(
+                                    target: "relay",
+                                    client_id = %op.client_id,
+                                    "duplicate OpenChannel ignored"
+                                );
+                            } else {
+                                open_backend_channel(
+                                    op.client_id,
+                                    tap,
+                                    &handle,
+                                    &up,
+                                    &bytes,
+                                    &metrics,
+                                    &pump_done_tx,
+                                    &mut relays,
+                                )
+                                .await;
+                            }
+                        }
+                        kind => {
+                            match relays.get(&op.client_id) {
+                                // Cloned so the borrow of `relays` never
+                                // crosses the await below (D11).
+                                Some(relay) => {
+                                    let relay = Arc::clone(relay);
+                                    kind.apply(&relay, &up, op.client_id).await;
+                                }
+                                None => tracing::debug!(
+                                    target: "relay",
+                                    client_id = %op.client_id,
+                                    ?kind,
+                                    "dropping op for a channel that is already gone"
+                                ),
+                            }
+                        }
+                    },
+                }
+            }
+            done = pump_done_rx.recv() => {
+                // The down-pump is the authority on this channel's liveness
+                // (P0-2): it finished, so the backend half is spent. Drop the
+                // relay — that closes the write half and, with it, the backend
+                // channel — and forget the mapping.
+                match done {
+                    None => break,
+                    Some(client_id) => {
+                        if let Some(relay) = relays.remove(&client_id) {
+                            let _ = relay.backend.close().await;
+                        }
+                    }
+                }
+            }
         }
-        op.apply(&relay, &up, client_id).await;
     }
 
-    let _ = relay.backend.close().await;
+    // Session over: close every backend channel still mapped, then drop `handle`
+    // (implicitly) so the backend transport task stops with it.
+    for (_, relay) in relays {
+        let _ = relay.backend.close().await;
+    }
 }
 
-/// A live agent leg plus the backend channel it authenticated.
+/// Open one more session channel on the authenticated backend connection and
+/// start its down-pump, wiring the new relay into the supervisor's map.
+#[allow(clippy::too_many_arguments)]
+async fn open_backend_channel(
+    client_id: ChannelId,
+    tap: Option<Arc<dyn relay::ChannelTap>>,
+    handle: &crate::backend::BackendHandle,
+    up: &ClientHandle,
+    bytes: &Arc<ByteCounters>,
+    metrics: &crate::metrics::Metrics,
+    pump_done_tx: &mpsc::UnboundedSender<ChannelId>,
+    relays: &mut HashMap<ChannelId, Arc<ChannelRelay>>,
+) {
+    let opened = match handle.channel_open_session().await {
+        Ok(channel) => channel,
+        Err(e) => {
+            // I4: the client channel was already accepted, so the only honest
+            // answer left is to close it. No fabricated exec, no fallback.
+            tracing::warn!(
+                target: "relay",
+                %client_id,
+                ?e,
+                "backend refused a session channel for an accepted client channel"
+            );
+            let _ = up.close(client_id).await;
+            return;
+        }
+    };
+
+    let (backend_read, backend_write) = opened.split();
+    let router = ReplyRouter::default();
+    let window = Arc::new(relay::OutboundWindow::uncalibrated());
+    let relay = Arc::new(ChannelRelay::new(
+        client_id,
+        backend_write,
+        router.clone(),
+        Arc::clone(&window),
+        Arc::clone(bytes),
+        metrics.clone(),
+    ));
+
+    // Everything the pump needs is taken *before* the task is built; the
+    // completion signal is what lets the supervisor retire this channel.
+    let done = pump_done_tx.clone();
+    let pump_up = up.clone();
+    let pump_bytes = Arc::clone(bytes);
+    let pump_metrics = metrics.clone();
+    tokio::spawn(async move {
+        relay::pump_backend_to_client(
+            backend_read,
+            pump_up,
+            client_id,
+            router,
+            window,
+            pump_bytes,
+            pump_metrics,
+            tap,
+        )
+        .await;
+        let _ = done.send(client_id);
+    });
+
+    // No await between the spawn above and this insert: the map is always
+    // populated before the supervisor can observe the pump's completion signal.
+    relays.insert(client_id, relay);
+}
+
+/// A live agent leg, reduced to the authenticated backend transport.
 ///
 /// `handle` is not decoration: russh's client driver task is spawned by
 /// `client::connect_stream` and its lifecycle is bound to the `Handle`, which
 /// owns the reply stream and the command sender the run loop ends on. Dropping
-/// it would stop the transport while leaving the channel object — and every
-/// later request would hang forever with no error. The inline relay path keeps
-/// its handle in the session registry for exactly the same reason.
+/// it would stop the transport while leaving the channel objects — and every
+/// later request would hang forever with no error.
+///
+/// The forwarded agent channel is deliberately **absent**: it is dropped the
+/// instant the one signature succeeds, before this struct is ever built.
 struct Established {
-    backend_channel: russh::Channel<russh::client::Msg>,
-    agent: SessionAgentClient,
     handle: crate::backend::BackendHandle,
     fingerprint: Fingerprint,
 }
@@ -619,8 +842,15 @@ async fn wait_for_grant(shared: &AgentShared, deadline: Duration) -> bool {
     }
 }
 
-/// Open the agent channel, list identities, and dial + authenticate the backend
-/// with the one identity whose fingerprint matches the grant.
+/// Open the agent channel, list identities, dial + authenticate the backend
+/// with the one identity whose fingerprint matches the grant — and then close
+/// the agent channel again.
+///
+/// The close is the whole point: the forwarded agent is a signing oracle, and
+/// this session only ever needs the one signature that gets it through the
+/// backend handshake. Keeping the channel open for the session's lifetime would
+/// widen that window for no benefit (the user's local agent is untouched
+/// either way — red lines 4/10).
 async fn establish_backend(
     shared: &AgentShared,
     grant: &Grant,
@@ -673,14 +903,13 @@ async fn establish_backend(
         .await
         .map_err(|e| format!("backend rejected the agent signature: {e}"))?;
 
-    let backend_channel = backend
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("backend refused a session channel: {e}"))?;
+    // Red lines 4/10: the oracle has served its one purpose. Dropping the
+    // agent client drops its `ChannelStream`, whose reader half carries
+    // russh's `ChannelCloseOnDrop` — so the forwarded agent channel really is
+    // closed on the wire, not merely forgotten locally.
+    drop(agent);
 
     Ok(Established {
-        backend_channel,
-        agent,
         handle: backend,
         fingerprint,
     })
@@ -754,58 +983,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_enqueue_never_blocks_and_reports_the_bounded_queue() {
+    async fn try_push_never_blocks_and_reports_the_bounded_queue() {
+        // C5 is a red line: a full queue must be *reported*, never awaited,
+        // because the caller is the session's serial event loop.
         let (tx, mut rx) = mpsc::channel(2);
-        let handle = AgentHandle::new(tx);
-        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
-        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
-        // Full: C5 says fail the channel, never await.
-        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::QueueFull);
-        rx.recv().await.expect("one op must drain");
-        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Accepted);
+        assert_eq!(try_push(&tx, false, ()), Enqueued::Accepted);
+        assert_eq!(try_push(&tx, false, ()), Enqueued::Accepted);
+        assert_eq!(try_push(&tx, false, ()), Enqueued::QueueFull);
+        rx.recv().await.expect("one item must drain");
+        assert_eq!(try_push(&tx, false, ()), Enqueued::Accepted);
     }
 
     #[tokio::test]
-    async fn a_closed_supervisor_rejects_further_ops_instead_of_buffering_them() {
-        let (tx, _rx) = mpsc::channel(4);
-        let handle = AgentHandle::new(tx);
-        handle.shared.mark_closed();
-        assert_eq!(handle.try_enqueue(AgentOp::Eof), Enqueued::Closed);
-        assert_eq!(handle.enqueue(AgentOp::Eof).await, Enqueued::Closed);
+    async fn a_closed_supervisor_is_reported_before_the_queue_is_touched() {
+        // `Closed` must win over `QueueFull`: once the supervisor is gone the
+        // caller has to tear the channel down, not retry the send.
+        let (tx, _rx) = mpsc::channel(1);
+        assert_eq!(try_push(&tx, true, ()), Enqueued::Closed);
+        assert_eq!(push(&tx, true, ()).await, Enqueued::Closed);
     }
 
     #[tokio::test]
-    async fn ready_state_delivers_ops_to_the_supervisor_in_order() {
+    async fn push_preserves_fifo_order() {
+        // I1: the supervisor applies ops in enqueue order. Nothing here may
+        // reorder them.
         let (tx, mut rx) = mpsc::channel(8);
-        let handle = AgentHandle::new(tx);
-        handle.shared.mark_ready();
-        assert_eq!(handle.enqueue(AgentOp::Eof).await, Enqueued::Accepted);
-        assert_eq!(
-            handle.enqueue(AgentOp::Shell { want_reply: false }).await,
-            Enqueued::Accepted
-        );
-        assert!(matches!(rx.recv().await, Some(AgentOp::Eof)));
-        assert!(matches!(
-            rx.recv().await,
-            Some(AgentOp::Shell { want_reply: false })
-        ));
+        for i in 0..4u8 {
+            assert_eq!(push(&tx, false, i).await, Enqueued::Accepted);
+        }
+        for i in 0..4u8 {
+            assert_eq!(rx.recv().await, Some(i), "items must come back in order");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_receiver_is_reported_as_closed_not_as_a_full_queue() {
+        let (tx, _rx) = mpsc::channel::<()>(4);
+        drop(_rx);
+        assert_eq!(try_push(&tx, false, ()), Enqueued::Closed);
+        assert_eq!(push(&tx, false, ()).await, Enqueued::Closed);
     }
 
     #[test]
     fn only_requests_that_asked_for_a_reply_get_one() {
         // An unsolicited CHANNEL_FAILURE would desynchronise the client, so the
         // failure path must key off the client's own want_reply flag.
-        assert!(AgentOp::Shell { want_reply: true }.wants_reply());
-        assert!(!AgentOp::Shell { want_reply: false }.wants_reply());
-        assert!(AgentOp::Exec {
+        assert!(AgentOpKind::Shell { want_reply: true }.wants_reply());
+        assert!(!AgentOpKind::Shell { want_reply: false }.wants_reply());
+        assert!(AgentOpKind::Exec {
             command: b"true".to_vec(),
             want_reply: true
         }
         .wants_reply());
-        assert!(!AgentOp::Data {
+        assert!(!AgentOpKind::Data {
             data: Bytes::from_static(b"x")
         }
         .wants_reply());
-        assert!(!AgentOp::Close.wants_reply());
+        assert!(!AgentOpKind::Close.wants_reply());
+        assert!(!AgentOpKind::OpenChannel { tap: None }.wants_reply());
     }
 }
