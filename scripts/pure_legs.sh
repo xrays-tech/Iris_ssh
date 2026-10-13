@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # scripts/pure_legs.sh — pure-leg (single-direction) throughput probe.
 #
-# Complements scripts/bench.sh (which measures scp end-to-end = both legs + sftp
-# framing). This measures ONE direction at a time through the gateway, with a
-# pure pipe on both ends (no disk), byte-verified separately (untimed pass).
+# A/B *knob* diagnostic: use it to see which gateway setting moves the data
+# plane, not to judge whether a change regressed it. Every connection here pays
+# the ~1 s per-connection auth backoff, so its numbers are not comparable with
+# each other across topologies and are not a gate — the throughput regression
+# gate is scripts/bench.sh Tier B (reused connection, +-20% of baseline).
+#
+# One direction at a time through the gateway, with a pure pipe on both ends
+# (no disk), byte-verified separately (untimed pass).
 #
 #   up   : client -> gateway -> backend   (ssh GW 'cat >/dev/null' < f)
 #   down : backend -> gateway -> client   (ssh GW 'cat f' > /dev/null)

@@ -1,8 +1,10 @@
 # SSH 网关性能基准报告
 
 > 来源：`scripts/bench.sh`（自包含本地拓扑：自举 sshd + mock 控制面 + 网关，随机端口）
-> 目的：plan M1-T11「网关 vs 直连」基线；吞吐损耗 ≤15% 为目标，**超过 15% 为记录项而非门禁失败**（供 M2-U6/调优排队）。
-> 环境：macOS（darwin arm64），OpenSSH 10.3 客户端，`/usr/sbin/sshd` 本地后端，release 构建（LTO）。
+> **基准定义已升级为 v2（2026-10-13，见文末《基准定义 v2》）**：三档分离（每连接固定成本 / 复用连接数据面 / 新建连接有效速率），唯一吞吐回归门是 Tier B 复用连接 ±20%。
+> ⚠️ 本文 2026-10-11/12 的「scp 损耗 ≤15%（超则记录）」门禁与 `~26 MB/s`、`~45 MB/s` 的 scp 数字**已废弃为基线**——它们把每新建连接固定的 ~1s 认证 backoff 摊到几十 MB 上，是方法学伪影，既不可比也检不出数据面回归（更正过程见 §「scp 吞吐损耗 ~88% 的归因」与 `docs/perf-investigation.md` §16/§18）。
+> 目的：plan M1-T11「网关 vs 直连」基线（v1，历史）。
+> 环境：v1 数据为 macOS（darwin arm64）、OpenSSH 10.3 客户端、`/usr/sbin/sshd` 本地后端、release 构建（LTO）；**v2 基线为 Fedora 44 本机（x86_64）**，其余同。
 
 ## 测量方法
 - 拓扑：客户端 → (直连 | 经网关) → 本地 sshd 后端（127.0.0.1 随机端口）。
@@ -177,3 +179,60 @@ PASS（RSS ≤150MB 上界内，无回退）；两方法学的握手延迟均与
 | **L2** russh client→OpenSSH sshd | 301.1 | 368.4 | 218.8 |
 
 → 单腿 ≥ ~219 MB/s ≫ 网关 50 MB/s：crypto 不是瓶颈，去一跳加密无法解释 ~6x 差距；天花板属双链窗口/补窗调度。完整裁决见 `docs/perf-investigation.md` Phase 2。
+
+## 基准定义 v2（2026-10-13）
+
+v1 用一个数字（64 MB scp over **新建**连接）同时回答两个问题：数据面有多快、每新建连接要花多少钱。答案被后者主导——固定 ~1 s 摊到 64 MB 上就是 ~45 MB/s，而同一配置在**复用**连接上是 386–602 MB/s（`docs/perf-investigation.md` §16/§18）。两个后果：这个数字不可与他机/他次比较（方法学伪影），以及基准对数据面变化**欠功效**（±30% 的数据面变化淹没在 1 s 里检不出来）。v2 把它们拆成三档。
+
+### 三档定义（`scripts/bench.sh`）
+
+| 档 | 测什么 | 方法 | 判定 |
+|---|---|---|---|
+| **Tier A** 每连接固定成本 | 新建连接「握手→退出」延迟 | `ssh true` / `ssh 'echo ok'`，取中位数（`BENCH_ITERS`=5），direct vs via | 诊断项：via 中位数落出基线 `[0.9×, 1.3×]` 打 **ALERT**，**不阻断**；C 档移动时先看这里 |
+| **Tier B** 复用连接数据面 | **唯一吞吐回归门** | OpenSSH `ControlMaster` 单连接、多轮纯流上/下行（`BENCH_ROUNDS`=5/方向），取中位数 MB/s：上行 `ssh -S <ctl> … 'cat >/dev/null' < f`，下行 `'cat f'` | 门（`BENCH_STRICT`=1，默认）：via 上/下行中位数各自落出 `[0.8×, 1.2×]` → **非零退出** |
+| **Tier C** 新建连接有效速率 | 记录项 | v1 的 64 MB scp（新建连接，best-of-5） | **不参与判定**，标签 `newconn` |
+
+- **复用是断言出来的，不是假设的**：`sshgw_agent_backend_auth_ok_total` 在 via master 生命周期内的**增量必须 == 1**（网关只为 master 那条会话拨一次后端），direct 档增量必须 == 0（直连不碰网关）。增量不对 ⇒ 这一轮数字其实是「新建连接」数字 ⇒ **exit 2、数字作废**。
+- **字节校验**：计时前先做一次不计时的落盘 + `wc -c` + `cmp` 全量比对，计时轮次才是纯流（`rc` 与字节数任一不符即失败）。
+- 旋钮：`BENCH_FILE_MB`（64）`BENCH_ITERS`（5，A/C 轮次）`BENCH_ROUNDS`（5，B 轮次）`BENCH_STRICT`（1）`BENCH_BASELINE_*`；网关 A/B 旋钮 `GW_WINDOW`/`GW_MAXPACKET`/`GW_NODELAY`/`GW_CIPHERS`/`GW_GUARD`；`BENCH_KEEP=1` 保留现场目录。
+
+### 解读规则（把这三行贴在显示器上）
+
+- **B 无回归 + C 变差** ⇒ 每连接成本变了（去看 Tier A）。
+- **B 变差 + C 不变** ⇒ 数据面回归（**唯一需要行动的一种**）。
+- **只有 C 动了** ⇒ 什么都不用做，C 不是门。
+
+严禁用 C 判数据面回归。
+
+### 基线（2026-10-13，Fedora 44 本机，release，64 MiB）
+
+| 档 | direct | via 网关 |
+|---|---|---|
+| A 握手中位数 | 100.9 ms | 1168.0 ms |
+| A exec 中位数 | 101.4 ms | 1168.2 ms |
+| B 上行中位数 | 809.1 MB/s | **423.3 MB/s** |
+| B 下行中位数 | 961.0 MB/s | **528.9 MB/s** |
+| C newconn scp | 310.7 MB/s | **41.4 MB/s**（= v1 的 ~45 MB/s，现知为伪影） |
+
+- Tier A 的 via−direct 差（~1.07 s）就是每连接固定成本，主体是 russh 对首个 none probe 前的 ~1 s 抗爆破 backoff（`min(auth_timeout, auth_rejection_pad)`，见上文「经网关延迟 ~1.09s 的构成」）。
+- **via/direct 在 Tier B 的比值：上行 ~52%、下行 ~55%** —— 这才是网关数据面成本的真实读数，v1 永远看不到它。
+- 波动：连续两次运行 via 上行 416.0→423.3、下行 556.0→528.9（±5% 量级），±20% 带宽足以吸收噪声而不误报。
+
+### 门的有效性自检（人为回归必须被拦住）
+
+| 配置 | via 上行 | via 下行 | 退出码 |
+|---|---|---|---|
+| 默认（`window=1MB` / `max_packet=32KB`） | 416.0 → 423.3 | 556.0 → 528.9 | **0** |
+| `GW_WINDOW=512KB` | 411.8 | 564.4 | 0（无效果） |
+| `GW_WINDOW=256KB`（配置下限） | 537.4 | 506.3 | **1**（上行 >1.2×，UPSIDE） |
+| `GW_MAXPACKET=1KB` | **137.9 / 83.8** | **168.8** | **1**（REGRESSION） |
+
+- **门能拦住真回归**：`max_packet` 32 KB→1 KB 让包数涨 32 倍，via 上/下行掉到基线的 20–33%，判定 REGRESSION 并非零退出；同一轮 **direct 腿纹丝不动**（963–990 MB/s），正好演示「via 动、direct 不动 = 网关数据面」。
+- **`window_size` 在回环上不是 Tier B 杠杆**：512 KB 与 1 MB 无差异，256 KB（下限）反而上行更高——回环 RTT≈0.05 ms，连 256 KB 窗口都能撑住 GB/s 量级，窗口根本不约束吞吐。**因此回归自检用 `GW_MAXPACKET` 而非 window**；这也解释了 2026-10-12 那批 window A/B「影响 <1%」的观测（见上文「纯腿尺度 nodelay×window A/B」）。
+- 注：`make bench` 把任何非零退出折叠成 2；要区分退出码（1=门失败、2=复用断言失败）请直接跑 `scripts/bench.sh`。`BENCH_STRICT=0` 时门只告警不阻断。
+
+### 与其他工具的关系
+
+- `scripts/pure_legs.sh`：**旋钮 A/B 诊断**（nodelay/window/cipher 哪个动了数据面），每连接仍付 ~1 s，**不是门槛**。
+- `benches/downlink.rs`：**每包拷贝微基准**（微秒级），看不到连接建立/窗口/系统调用，**不是门槛**。
+- 唯一吞吐回归门：`make bench`（= `scripts/bench.sh`）的 Tier B ±20%。

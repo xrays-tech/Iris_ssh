@@ -149,7 +149,9 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 | `sshgw_cert_auth_accept_total` / `reject_total` | 证书认证 | reject 突增=证书问题 |
 | `sshgw_agent_backend_auth_ok_total` / `fail_total` | agent 模式后端认证结果 | fail>0 且 ok 不动=用户 agent 未转发/缺 key |
 | `sshgw_agent_signatures_total` | 经网关中继的 agent 签名次数 | 与 `ok_total` 长期偏离=会话复用异常 |
-| `sshgw_agent_channel_denied_total` | agent 会话中被拒的额外通道（如 direct-tcpip） | 突增=客户端在尝试跳板 |
+| `sshgw_agent_channel_denied_total` | 因**并发**通道数达到 `channels_per_conn`（≤8，等价 sshd `MaxSessions`）而被拒的通道 | 持续出现=同一连接并发开太多通道（如 ControlMaster 大量复用）；它是并发上限，不是连接一生的配额 |
+
+吞吐回归门：`make bench`（= `scripts/bench.sh`）的 **Tier B** —— 复用连接上的数据面中位数相对基线 **±20%** 越界即非零退出；Tier A（每连接 ~1s 固定成本）只告警、Tier C（新建连接 scp）只记录，两者都不判定回归（定义与基线见 `docs/perf-report.md`「基准定义 v2」）。
 
 动态采样脚本参考：`scripts/run_soak.sh`（RSS/drift 模式）、`scripts/ha_drain.sh`（排水断言模式）。
 

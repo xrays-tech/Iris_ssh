@@ -1,5 +1,10 @@
 //! Per-packet micro-bench for the downlink (backend → client) data path.
 //!
+//! Micro-bench, not a benchmark: it measures one in-process copy in
+//! microseconds and cannot see connection setup, windowing, or syscalls, so it
+//! is not a regression gate. The gate is `scripts/bench.sh` Tier B (data-plane
+//! throughput on a reused connection, +-20% of baseline).
+//!
 //! Complements `docs/perf-report.md`: the gateway's throughput ceiling sits on
 //! the per-packet relay path, and this bench isolates the *copy* cost of that
 //! path's tap step so the zero-copy downlink change is measurable in

@@ -49,4 +49,5 @@ ha-drain:
 	scripts/ha_drain.sh
 
 bench:
-	BENCH_FILE_MB=$${BENCH_FILE_MB:-64} BENCH_ITERS=$${BENCH_ITERS:-5} scripts/bench.sh
+	BENCH_FILE_MB=$${BENCH_FILE_MB:-64} BENCH_ITERS=$${BENCH_ITERS:-5} \
+	BENCH_ROUNDS=$${BENCH_ROUNDS:-5} BENCH_STRICT=$${BENCH_STRICT:-1} scripts/bench.sh

@@ -495,3 +495,59 @@ Independent review of §12–§17. **Agrees with the reversal**; **corrects** th
 - **Future measurement rule**: any data-plane A/B must use connection reuse
   (ControlMaster / multi-channel), `auth_timeout="0s"`, or trace transfer-phase;
   otherwise the fixed 1 s/connection makes the experiment underpowered.
+
+## 19. Benchmark v2: the ~50 MB/s figure is retired (2026-10-13)
+
+§16/§18 diagnosed the artifact; v2 removes it from the measurement contract.
+`scripts/bench.sh` was rewritten as three tiers with separated duties —
+full definition, baselines and the gate self-check live in
+`docs/perf-report.md` ("基准定义 v2"):
+
+| Tier | Measures | Duty |
+|---|---|---|
+| A | new-connection handshake→exit median (`ssh true`) | diagnostic; ALERT only |
+| B | **data-plane throughput on one reused ControlMaster** (median MB/s up/down, byte-verified) | **the only throughput regression gate, +-20% of baseline** |
+| C | new-connection 64 MB scp (the old v1 number, relabelled `newconn`) | record only; never gates |
+
+The retired rule was "scp loss <= 15% or record" (v1 tail verdict), which
+could not see a +-30% data-plane change under the ~1 s per-connection
+back-off, and whose headline number (~45 MB/s via) was dominated by it.
+
+Measured on this host (64 MiB, release, Fedora 44): via **423.3 / 528.9
+MB/s** up/down against a direct control leg of 809.1 / 961.0 MB/s, i.e. the
+gateway's data plane costs ~48% up / ~45% down — the number the old
+benchmark could never report. Tier C came out at 41.4 MB/s, matching the old
+"~45 MB/s" headline, which is the artifact reproduced end to end.
+
+Reuse is *asserted*: `sshgw_agent_backend_auth_ok_total` must move by exactly
+1 across the via master's lifetime (and 0 on the direct leg); anything else
+means the rounds silently opened fresh connections and the run is invalid
+(exit 2), not slow.
+
+### Defect found by Tier B (fixed in the same change)
+
+The very first Tier B run refused channel #9 of a reused connection with
+`ResourceShortage` after ~1 s of bulk transfer. `channels_per_conn` (8) is
+specified as an sshd-`MaxSessions`-style **concurrent** cap, but the handler
+counted `agent_channels` — a set only `Handler::channel_close` shrinks, and a
+close the *server* initiates is never echoed back as a handler callback. The
+result was a **cumulative** cap: any long-lived connection died after 8
+channels in total, which the multichannel case never reached (it opened 3).
+
+Fix: live-channel accounting shared between the two tasks
+(`relay::agent::ChannelSlots`), retired idempotently by whichever side
+observes a channel's end first — the supervisor, whose down-pump completion
+signal is the authority on liveness, and the handler, on a client-initiated
+close or an op it could not hand over. `case_agent_multichannel.sh` now opens
+12 further sequential channels on the same connection and asserts none is
+denied; `scripts/bench.sh` Tier B exercises it in bulk.
+
+### Gate self-check (a regression must be caught, not just allowed)
+
+`GW_MAXPACKET=1KB` (32x more packets) drops via to 137.9 / 168.8 MB/s while
+the direct leg stays at ~963–990 MB/s -> `REGRESSION`, `scripts/bench.sh`
+exits 1. `GW_WINDOW=512KB` changes nothing and `256KB` (the config floor)
+even *raises* uplink: on loopback (RTT ~0.05 ms) the window does not bind
+throughput, which is also why the 2026-10-12 window A/B showed <1%. The gate
+is therefore self-checked with `GW_MAXPACKET`, and window is documented as
+not a Tier B lever.
