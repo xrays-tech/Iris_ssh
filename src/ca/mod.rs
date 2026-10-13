@@ -121,6 +121,14 @@ pub fn certificate_ca_fingerprint(cert: &russh::keys::Certificate) -> String {
     sha256_fingerprint(&PublicKey::from(cert.signature_key().clone()))
 }
 
+/// Canonical `SHA256:` fingerprint of a certificate's **subject key** — i.e. the
+/// public key contained in the certificate, which identifies the certificate
+/// holder (user or host). This is the key whose private half signs the SSH
+/// authentication or host key proof.
+pub fn certificate_subject_fingerprint(cert: &russh::keys::Certificate) -> String {
+    sha256_fingerprint(&PublicKey::from(cert.public_key().clone()))
+}
+
 /// Minting is test-only: the gateway holds no signing key, so these exist purely
 /// to build the fixtures `validate_*` is asserted against.
 #[cfg(test)]
@@ -412,17 +420,20 @@ mod tests {
         principals: &[&str],
         key_id: &str,
         lifetime: Duration,
-    ) -> russh::keys::Certificate {
+    ) -> (russh::keys::Certificate, PublicKey) {
+        let subject = subject_key();
         let principals: Vec<String> = principals.iter().map(|s| (*s).to_owned()).collect();
-        issuing::issue_user_certificate_with(ca, &subject_key(), &principals, key_id, lifetime)
-            .unwrap()
+        let cert =
+            issuing::issue_user_certificate_with(ca, &subject, &principals, key_id, lifetime)
+                .unwrap();
+        (cert, subject)
     }
 
     #[test]
     fn issued_certificate_carries_principals_lifetime_and_key_id() {
         let ca = ca_key();
         let before = now_unix_secs().unwrap();
-        let cert = issue(&ca, &["alex_host1"], "alex@dev", Duration::from_secs(300));
+        let (cert, _subject) = issue(&ca, &["alex_host1"], "alex@dev", Duration::from_secs(300));
 
         assert_eq!(cert.valid_principals(), ["alex_host1".to_string()]);
         assert_eq!(cert.key_id(), "alex@dev");
@@ -449,7 +460,7 @@ mod tests {
     fn certificate_trusted_by_the_issuing_ca_only() {
         let ca = ca_key();
         let other_ca = ca_key();
-        let cert = issue(&ca, &["alex_host1"], "k", Duration::from_secs(300));
+        let (cert, _subject) = issue(&ca, &["alex_host1"], "k", Duration::from_secs(300));
         let trusted = [sha256_fingerprint(ca.public_key())];
 
         assert_eq!(
@@ -471,7 +482,7 @@ mod tests {
     #[test]
     fn tampered_certificate_is_rejected() {
         let ca = ca_key();
-        let cert = issue(&ca, &["alex_host1"], "k", Duration::from_secs(300));
+        let (cert, _subject) = issue(&ca, &["alex_host1"], "k", Duration::from_secs(300));
         // Corrupt the certificate's *signature* at the wire level (the comment
         // field is deliberately outside the signed blob in SSH certificates, so
         // mutating that would not be a tamper at all).
@@ -496,7 +507,7 @@ mod tests {
     #[test]
     fn expired_certificate_is_rejected() {
         let ca = ca_key();
-        let cert = issue(&ca, &["alex_host1"], "k", Duration::from_secs(300));
+        let (cert, _subject) = issue(&ca, &["alex_host1"], "k", Duration::from_secs(300));
         let trusted = [sha256_fingerprint(ca.public_key())];
         // A clock far in the future must fail the validity window.
         let far_future = cert.valid_before().saturating_add(60);
@@ -515,7 +526,7 @@ mod tests {
     #[test]
     fn principal_mismatch_is_rejected() {
         let ca = ca_key();
-        let cert = issue(&ca, &["bob"], "k", Duration::from_secs(300));
+        let (cert, _subject) = issue(&ca, &["bob"], "k", Duration::from_secs(300));
         let trusted = [sha256_fingerprint(ca.public_key())];
         assert_eq!(
             validate_user_certificate_at(&cert, &trusted, "alex_host1", now_unix_secs().unwrap()),
@@ -659,6 +670,30 @@ mod tests {
                 expected: "evil-db.example.com".to_owned()
             },
             "leniency must not turn into a suffix match"
+        );
+    }
+
+    #[test]
+    fn certificate_subject_fingerprint_returns_subject_key_fingerprint() {
+        // The subject fingerprint must be the fingerprint of the certificate's
+        // subject public key, not the CA's signing key.
+        let ca = ca_key();
+        let (cert, subject) = issue(&ca, &["alex_host1"], "test-key", Duration::from_secs(300));
+
+        let subject_fp = certificate_subject_fingerprint(&cert);
+        let ca_fp = certificate_ca_fingerprint(&cert);
+
+        // The subject fingerprint should match the subject key's fingerprint
+        let expected_subject_fp = sha256_fingerprint(&subject);
+        assert_eq!(
+            subject_fp, expected_subject_fp,
+            "certificate_subject_fingerprint must equal the subject key's SHA256 fingerprint"
+        );
+
+        // The subject fingerprint must differ from the CA fingerprint
+        assert_ne!(
+            subject_fp, ca_fp,
+            "subject fingerprint must differ from CA fingerprint"
         );
     }
 }

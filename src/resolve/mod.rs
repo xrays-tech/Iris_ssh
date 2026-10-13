@@ -413,6 +413,7 @@ impl Resolver {
                 let grant = Grant {
                     principal: key.principal.clone(),
                     fingerprint: key.fingerprint.clone(),
+                    agent_fingerprint: key.fingerprint.clone(),
                     target: resp.target,
                     policy: resp.policy,
                 };
@@ -488,6 +489,7 @@ mod tests {
         Grant {
             principal: p.clone(),
             fingerprint: Fingerprint::new(fingerprint()),
+            agent_fingerprint: Fingerprint::new(fingerprint()),
             target: Target {
                 host: "10.1.2.3".into(),
                 port: 22,

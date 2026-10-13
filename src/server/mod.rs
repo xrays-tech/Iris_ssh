@@ -787,7 +787,8 @@ impl GatewaySession {
     /// user key: that is the trust anchor an operator actually provisions. The
     /// certificate's principal list is checked against the requested username
     /// here, and `Grant::fingerprint` carries the CA fingerprint so the resolver
-    /// can key on it.
+    /// can key on it. `Grant::agent_fingerprint` is set to the certificate's
+    /// subject key fingerprint for backend agent-identity matching.
     async fn authorize_certificate(
         &mut self,
         principal: &Principal,
@@ -818,7 +819,14 @@ impl GatewaySession {
         }
         // 3. Resolve the destination from the control plane, keyed on the CA.
         match self.resolve_grant(principal, &ca_fingerprint).await {
-            Ok(grant) => {
+            Ok(mut grant) => {
+                // For certificate auth, the agent_fingerprint must be the
+                // certificate's subject key (the user's actual key), not the CA.
+                // The resolver returns a fresh owned Grant each call, so mutating
+                // here does not affect any cached copy.
+                grant.agent_fingerprint = crate::types::Fingerprint::new(
+                    crate::ca::certificate_subject_fingerprint(certificate),
+                );
                 self.ctx.metrics.cert_auth_accept();
                 self.ctx.metrics.session_started();
                 self.ctx
@@ -2628,6 +2636,20 @@ mod tests {
         assert_eq!(
             granted_fp, ca_fp,
             "the grant must key on the CA fingerprint"
+        );
+
+        // The agent_fingerprint must be the certificate's subject key fingerprint
+        // (the user's actual key), not the CA fingerprint.
+        let granted_agent_fp = session
+            .grant
+            .as_ref()
+            .unwrap()
+            .agent_fingerprint
+            .as_str()
+            .to_owned();
+        assert_eq!(
+            granted_agent_fp, inner_fp,
+            "agent_fingerprint must be the certificate's subject key fingerprint"
         );
     }
 

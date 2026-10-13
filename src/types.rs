@@ -135,6 +135,12 @@ pub struct Policy {
 pub struct Grant {
     pub principal: Principal,
     pub fingerprint: Fingerprint,
+    /// The fingerprint used to match a forwarded agent identity when dialing the
+    /// backend. For raw public-key auth this equals `fingerprint`; for
+    /// certificate auth this is the certificate's subject key fingerprint (the
+    /// user's actual key), while `fingerprint` remains the CA fingerprint for
+    /// control-plane authorization.
+    pub agent_fingerprint: Fingerprint,
     pub target: Target,
     pub policy: Policy,
 }

@@ -1155,10 +1155,8 @@ async fn establish_backend(
     // Red line 4: only the identity whose fingerprint the control plane already
     // authorized is ever offered to the backend. A missing match is an error,
     // never an invitation to try another credential.
-    let wanted = grant.fingerprint.as_str();
-    let matched = identities
-        .iter()
-        .position(|identity| agent_identity_fingerprint(identity).as_str() == wanted);
+    let wanted = grant.agent_fingerprint.as_str();
+    let matched = match_agent_identity(&identities, wanted);
     let Some(index) = matched else {
         let offered: Vec<String> = identities
             .iter()
@@ -1191,6 +1189,15 @@ async fn establish_backend(
     })
 }
 
+/// Match an agent identity against the wanted fingerprint.
+///
+/// Returns the index of the matching identity, or `None` if no match.
+fn match_agent_identity(identities: &[AgentIdentity], wanted: &str) -> Option<usize> {
+    identities
+        .iter()
+        .position(|identity| agent_identity_fingerprint(identity).as_str() == wanted)
+}
+
 /// The canonical `SHA256:` fingerprint of an agent identity.
 fn agent_identity_fingerprint(identity: &AgentIdentity) -> Fingerprint {
     Fingerprint::new(
@@ -1204,6 +1211,8 @@ fn agent_identity_fingerprint(identity: &AgentIdentity) -> Fingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rng;
+    use russh::keys::PrivateKey;
 
     #[test]
     fn queue_capacity_scales_with_the_relay_window_and_never_hits_zero() {
@@ -1438,5 +1447,42 @@ mod tests {
         assert!(matches!(ops[3].kind, AgentOpKind::Eof));
         assert_eq!(ops[4].client_id, b);
         assert_eq!(data_payload(&ops[4]), b"z");
+    }
+
+    #[test]
+    fn match_agent_identity_uses_agent_fingerprint_not_ca_fingerprint() {
+        // The identity matching logic must use the agent_fingerprint (the user's
+        // actual key), not the CA fingerprint (which is used for control-plane
+        // authorization). This test verifies the pure helper directly.
+        let ca_fp = "SHA256:ca-fake-fingerprint";
+        let subject_key = PrivateKey::random(&mut rng(), russh::keys::Algorithm::Ed25519)
+            .unwrap()
+            .public_key()
+            .clone();
+        let subject_fp = subject_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+
+        // Create an agent identity with the subject key
+        let identity = AgentIdentity::PublicKey {
+            key: subject_key,
+            comment: "test-key".to_string(),
+        };
+        let identities = vec![identity];
+
+        // Matching against the subject fingerprint (agent_fingerprint) must succeed
+        let matched = match_agent_identity(&identities, &subject_fp);
+        assert_eq!(
+            matched,
+            Some(0),
+            "must match when using the subject key fingerprint (agent_fingerprint)"
+        );
+
+        // Matching against the CA fingerprint must fail (this is the bug we fixed)
+        let matched_ca = match_agent_identity(&identities, ca_fp);
+        assert_eq!(
+            matched_ca, None,
+            "must NOT match when using the CA fingerprint (fingerprint)"
+        );
     }
 }

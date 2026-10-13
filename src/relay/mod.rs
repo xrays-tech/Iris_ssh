@@ -853,6 +853,7 @@ mod tests {
         let grant = crate::types::Grant {
             principal: crate::types::Principal::parse("alex_host1").unwrap(),
             fingerprint: crate::types::Fingerprint::new("SHA256:fp"),
+            agent_fingerprint: crate::types::Fingerprint::new("SHA256:fp"),
             target: crate::types::Target {
                 host: "h".into(),
                 port: 22,

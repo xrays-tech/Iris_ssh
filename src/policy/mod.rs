@@ -226,6 +226,7 @@ mod tests {
         Grant {
             principal: Principal::parse("alex_host1").unwrap(),
             fingerprint: Fingerprint::new("SHA256:fp"),
+            agent_fingerprint: Fingerprint::new("SHA256:fp"),
             target: Target {
                 host: "10.0.0.1".into(),
                 port: 22,

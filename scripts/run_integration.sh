@@ -516,6 +516,7 @@ ALL_CASES=(
   case_agent_target_scope
   case_agent_env
   case_agent_multichannel
+  case_agent_cert_front
 )
 
 resolve_case_path() {

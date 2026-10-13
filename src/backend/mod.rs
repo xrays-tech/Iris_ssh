@@ -577,6 +577,7 @@ mod tests {
         Grant {
             principal: crate::types::Principal::parse("alex_host1").unwrap(),
             fingerprint: crate::types::Fingerprint::new("SHA256:fp"),
+            agent_fingerprint: crate::types::Fingerprint::new("SHA256:fp"),
             target: crate::types::Target {
                 host: host.to_owned(),
                 port: 22,
