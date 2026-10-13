@@ -7,7 +7,6 @@
 //! Validation is a set of small pure functions so each rule is unit-testable and
 //! reports the offending field name (fail fast, fail loud).
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -78,35 +77,16 @@ pub struct RelayConfig {
     pub ciphers: Vec<String>,
 }
 
+/// Backend-leg settings.
+///
+/// There is no credential here any more: the gateway authenticates to the
+/// backend with the end user's forwarded ssh-agent and holds no key material of
+/// its own (plan-agent-only). `private_key`, `credential_map`, `backend_auth`
+/// and `allow_agent_backend_auth` were removed with it; a config file that
+/// still sets them is simply ignored (the config parser is permissive).
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
-    /// Default backend key used when the target user has no `credential_map`
-    /// entry.
-    pub private_key: Option<PathBuf>,
-    /// Maps a backend username to the key file the gateway authenticates with.
-    pub credential_map: BTreeMap<String, PathBuf>,
     pub host_key_policy: HostKeyPolicy,
-    /// Which credential the gateway presents: a private key (the default, and the
-    /// only mode that works without a configured CA), a short-lived user
-    /// certificate issued on the fly (propose §3.3, M4-T3), or the end user's
-    /// forwarded ssh-agent identity (`"agent"`, plan-agent-passthrough).
-    pub backend_auth: crate::backend::BackendAuthMethod,
-    /// Global kill-switch for agent-mode backend auth (default **off**).
-    ///
-    /// A one-vote *veto*: `backend_auth = "agent"` (instance default or a
-    /// per-grant `policy.backend_auth` override) is refused unless this is true.
-    /// Enabling it is an explicit statement that the gateway may authenticate to
-    /// backends as whatever identity the end user's agent holds.
-    pub allow_agent_backend_auth: bool,
-}
-
-impl BackendConfig {
-    /// Resolve which private key file to use for a given backend user.
-    ///
-    /// `credential_map` takes precedence over the single `private_key`.
-    pub fn key_for_user(&self, user: &str) -> Option<&PathBuf> {
-        self.credential_map.get(user).or(self.private_key.as_ref())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,12 +163,10 @@ pub struct MetricsConfig {
 pub struct CaConfig {
     /// Paths to trusted CA public keys (OpenSSH format). Empty disables
     /// certificate authentication entirely.
+    ///
+    /// Verify-only: `signing_key` / `cert_lifetime` are gone with the key/cert
+    /// backend credential (plan-agent-only D3).
     pub trusted_ca_keys: Vec<std::path::PathBuf>,
-    /// Optional CA private key. When present the gateway can *issue* short-lived
-    /// user certificates; absent means verify-only.
-    pub signing_key: Option<std::path::PathBuf>,
-    /// Lifetime of issued certificates (seconds).
-    pub cert_lifetime: Duration,
 }
 
 /// Session recording configuration (B2).
@@ -249,31 +227,10 @@ struct RawConfig {
     recording: RawRecording,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct RawCa {
     #[serde(default)]
     trusted_ca_keys: Vec<String>,
-    #[serde(default)]
-    signing_key: Option<String>,
-    #[serde(default = "default_cert_lifetime")]
-    cert_lifetime: String,
-}
-
-impl Default for RawCa {
-    fn default() -> Self {
-        RawCa {
-            trusted_ca_keys: Vec::new(),
-            signing_key: None,
-            // Must match `default_cert_lifetime`: a derived `Default` would give
-            // an empty string and then fail duration parsing for an absent
-            // `[ca]` section.
-            cert_lifetime: default_cert_lifetime(),
-        }
-    }
-}
-
-fn default_cert_lifetime() -> String {
-    "300s".to_owned()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -364,22 +321,7 @@ struct RawRelay {
 
 #[derive(Debug, Deserialize)]
 struct RawBackend {
-    #[serde(default)]
-    private_key: Option<String>,
-    #[serde(default)]
-    credential_map: BTreeMap<String, String>,
     host_key_policy: String,
-    /// `"key"` (default), `"cert"` or `"agent"`.
-    #[serde(default = "default_backend_auth")]
-    backend_auth: String,
-    /// Global kill-switch for `backend_auth = "agent"` (default off; a veto —
-    /// see [`crate::backend::ensure_agent_backend_auth`]).
-    #[serde(default)]
-    allow_agent_backend_auth: bool,
-}
-
-fn default_backend_auth() -> String {
-    "key".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -710,74 +652,22 @@ impl GatewayConfig {
         };
 
         let host_key_policy = HostKeyPolicy::parse(raw.backend.host_key_policy.trim())?;
-        // Credential rules per selected backend auth mode (M4-T3):
-        // * `key`  — a private key is mandatory (the backend's authorized_keys
-        //   carries its public key), so the existing error stands.
-        // * `cert` — the inner key is optional: the backend trusts the issuing CA
-        //   (`TrustedUserCAKeys`), so the gateway may present an ephemeral
-        //   keypair. A configured key is still honoured as a stable identity.
-        let backend_auth = crate::backend::BackendAuthMethod::parse(
-            "backend.backend_auth",
-            &raw.backend.backend_auth,
-        )?;
-        let has_key_material =
-            raw.backend.private_key.is_some() || !raw.backend.credential_map.is_empty();
-        if matches!(backend_auth, crate::backend::BackendAuthMethod::Key) && !has_key_material {
-            return Err(ConfigError::Invalid {
-                field: "backend".into(),
-                reason:
-                    "either private_key or credential_map must be provided (backend_auth = \"key\")"
-                        .into(),
-            });
-        }
-        if matches!(backend_auth, crate::backend::BackendAuthMethod::Cert)
-            && raw.ca.signing_key.is_none()
-        {
-            return Err(ConfigError::Invalid {
-                field: "backend.backend_auth".into(),
-                reason: "backend_auth = \"cert\" requires [ca] signing_key (the gateway must be able to issue)".into(),
-            });
-        }
-        // Agent-mode rules (plan-agent-passthrough C1). No key and no CA is
-        // required — the credential is the end user's, reached through the
-        // forwarded agent — but two hard gates apply:
-        //  * the kill-switch is a veto: `backend_auth = "agent"` while it is off
-        //    is a boot error, never a silent downgrade to `key`/`cert`;
-        //  * pooling and agent mode are mutually exclusive (propose §3.8): a
-        //    shared pooled connection cannot carry a per-session agent identity.
-        crate::backend::ensure_agent_backend_auth(
-            backend_auth,
-            raw.backend.allow_agent_backend_auth,
-        )?;
-        if matches!(backend_auth, crate::backend::BackendAuthMethod::Agent) && raw.pool.enabled {
+        let backend = BackendConfig { host_key_policy };
+
+        // The gateway never shares a backend connection across sessions: its
+        // identity is per-session (the end user's own forwarded agent), so a
+        // pooled connection cannot carry "which user does the next channel
+        // belong to" (propose §3.8). Now that agent auth is the *only* backend
+        // auth, this fires unconditionally — `[pool] enabled = true` is simply
+        // a configuration error, surfaced at boot rather than mid-session.
+        if raw.pool.enabled {
             return Err(ConfigError::Invalid {
                 field: "pool.enabled".into(),
-                reason: "must be false while [backend] backend_auth = \"agent\" \
-                         (agent forwarding needs a per-session connection; propose §3.8)"
+                reason: "must be false: backend authentication is agent-forwarding based \
+                         and needs a per-session connection (propose §3.8)"
                     .into(),
             });
         }
-        for (user, path) in &raw.backend.credential_map {
-            if path.trim().is_empty() {
-                return Err(ConfigError::Invalid {
-                    field: format!("backend.credential_map.{user}"),
-                    reason: "key path must not be empty".into(),
-                });
-            }
-        }
-        let backend = BackendConfig {
-            private_key: raw.backend.private_key.map(PathBuf::from),
-            credential_map: raw
-                .backend
-                .credential_map
-                .into_iter()
-                .map(|(u, p)| (u, PathBuf::from(p)))
-                .collect(),
-            host_key_policy,
-            backend_auth,
-            allow_agent_backend_auth: raw.backend.allow_agent_backend_auth,
-        };
-
         if raw.pool.channels_per_conn == 0 || raw.pool.channels_per_conn > 8 {
             return Err(ConfigError::Invalid {
                 field: "pool.channels_per_conn".into(),
@@ -864,16 +754,10 @@ impl GatewayConfig {
             })?;
 
         // --- M3: certificate authority (B1) ---------------------------------
-        // An absent `[ca]` section (hence no CAs and no signing key) is a valid,
-        // fully-opt-in "CA disabled" configuration: nothing must require it.
-        // A signing key alone, however, would mint certificates the gateway
-        // trusts for nobody, so refuse that half-configured state.
-        if raw.ca.signing_key.is_some() && raw.ca.trusted_ca_keys.is_empty() {
-            return Err(ConfigError::Invalid {
-                field: "ca".into(),
-                reason: "a signing_key requires at least one trusted_ca_keys entry".into(),
-            });
-        }
+        // An absent `[ca]` section is a valid, fully-opt-in "CA disabled"
+        // configuration: nothing must require it. The CA is verify-only — it
+        // gates front-leg user certificates and backend host certificates, and
+        // no longer issues anything (plan-agent-only D3).
         let ca = CaConfig {
             trusted_ca_keys: raw
                 .ca
@@ -881,8 +765,6 @@ impl GatewayConfig {
                 .iter()
                 .map(|p| PathBuf::from(p.trim()))
                 .collect(),
-            signing_key: raw.ca.signing_key.as_ref().map(|p| PathBuf::from(p.trim())),
-            cert_lifetime: parse_duration("ca.cert_lifetime", &raw.ca.cert_lifetime)?,
         };
 
         // --- M3: SFTP interception (B3) -------------------------------------
@@ -952,7 +834,6 @@ mod tests {
             outbound_guard = true
 
             [backend]
-            private_key = "/etc/ssh-gw/backend_root_ed25519"
             host_key_policy = "pinned"
 
             [control_plane]
@@ -1042,183 +923,68 @@ mod tests {
     }
 
     #[test]
-    fn backend_auth_defaults_to_key_which_changes_nothing() {
+    fn the_gateway_holds_no_backend_credential_of_its_own() {
+        // plan-agent-only D3: the credential is the end user's forwarded agent,
+        // so `BackendConfig` carries nothing key-shaped at all.
         let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
-        assert_eq!(
-            cfg.backend.backend_auth,
-            crate::backend::BackendAuthMethod::Key,
-            "the default credential must be the existing private-key path"
-        );
-    }
-
-    #[test]
-    fn backend_auth_cert_requires_a_signing_key() {
-        // A gateway told to present certificates it cannot mint must refuse to
-        // boot: silently falling back to keys would look like a working cert
-        // deployment while authenticating with something else.
-        let bad = minimal_toml().replace(
-            "host_key_policy = \"pinned\"",
-            "host_key_policy = \"pinned\"\n            backend_auth = \"cert\"",
-        );
-        let err = GatewayConfig::parse(&bad).unwrap_err();
-        assert!(
-            err.to_string().contains("signing_key"),
-            "expected a signing_key requirement, got: {err}"
-        );
-    }
-
-    #[test]
-    fn backend_auth_cert_allows_omitting_the_private_key() {
-        // With a CA able to issue, the backend trusts the CA rather than a
-        // specific gateway key, so an ephemeral inner keypair is acceptable.
-        let assets = std::env::temp_dir().join(format!(
-            "sshgw-cfg-ca-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir_all(&assets).unwrap();
-        let host = assets.join("host");
-        let ca_priv = assets.join("ca");
-        let ca_pub = assets.join("ca.pub");
-        {
-            for p in [&host, &ca_priv] {
-                let mut rng = rand::rng();
-                let body =
-                    russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
-                        .unwrap()
-                        .to_openssh(russh::keys::ssh_key::LineEnding::LF)
-                        .unwrap();
-                let f = std::fs::File::create(p).unwrap();
-                let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
-                std::fs::write(p, body).unwrap();
-            }
+        assert_eq!(cfg.backend.host_key_policy, HostKeyPolicy::Pinned);
+        let rendered = format!("{:?}", cfg.backend);
+        for removed in [
+            "private_key",
+            "credential_map",
+            "backend_auth",
+            "allow_agent_backend_auth",
+        ] {
+            assert!(
+                !rendered.contains(removed),
+                "BackendConfig must not mention {removed}: {rendered}"
+            );
         }
-        std::fs::write(
-            &ca_pub,
-            russh::keys::load_secret_key(&ca_priv, None)
-                .unwrap()
-                .public_key()
-                .to_openssh()
-                .unwrap(),
-        )
-        .unwrap();
-
-        let toml = format!(
-            r#"
-            [listen]
-            addr = "127.0.0.1:0"
-            [host_keys]
-            keys = [ {{ path = "{}", state = "active" }} ]
-            [backend]
-            host_key_policy = "accept-new"
-            backend_auth = "cert"
-            [control_plane]
-            url = "http://127.0.0.1:1"
-            [ca]
-            trusted_ca_keys = ["{}"]
-            signing_key = "{}"
-        "#,
-            host.to_string_lossy(),
-            ca_pub.to_string_lossy(),
-            ca_priv.to_string_lossy(),
-        );
-        drop(std::fs::remove_dir_all(&assets));
-
-        let cfg = GatewayConfig::parse(&toml).expect("cert mode without a private key is valid");
-        assert_eq!(
-            cfg.backend.backend_auth,
-            crate::backend::BackendAuthMethod::Cert
-        );
-        assert!(cfg.backend.private_key.is_none());
-        assert!(cfg.backend.credential_map.is_empty());
-        assert_eq!(cfg.ca.trusted_ca_keys.len(), 1);
-        assert!(cfg.ca.signing_key.is_some());
     }
 
     #[test]
-    fn backend_auth_rejects_an_unknown_value() {
-        let bad = minimal_toml().replace(
-            "host_key_policy = \"pinned\"",
-            "host_key_policy = \"pinned\"\n            backend_auth = \"token\"",
-        );
-        let err = GatewayConfig::parse(&bad).unwrap_err();
-        assert!(err.to_string().contains("backend_auth"), "{err}");
-    }
-
-    // ---- plan-agent-passthrough C1: agent mode + kill-switch ----
-
-    /// `minimal_toml` with the backend private key stripped and `[backend]`
-    /// overrides appended — agent mode must not require key material.
-    fn agent_toml(extra: &str) -> String {
-        minimal_toml()
-            .replace("private_key = \"/etc/ssh-gw/backend_root_ed25519\"\n", "")
-            .replace("[backend]", &format!("[backend]\n{extra}"))
-    }
-
-    #[test]
-    fn allow_agent_backend_auth_defaults_to_false() {
-        let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
-        assert!(
-            !cfg.backend.allow_agent_backend_auth,
-            "the kill-switch must default OFF so an upgrade changes nothing"
-        );
+    fn stale_key_cert_and_jump_style_settings_are_ignored_not_acted_on() {
+        // A config file written before agent-only still carries these keys.
+        // The parser is permissive, so they parse — but nothing is derived from
+        // them: there is no credential to select and no issuing CA to load.
+        let toml = minimal_toml()
+            .replace(
+                "host_key_policy = \"pinned\"",
+                "host_key_policy = \"pinned\"\n            backend_auth = \"cert\"\n            credential_map = { root = \"/keys/root_ed\" }\n            allow_agent_backend_auth = true",
+            )
+            .replace(
+                "[control_plane]",
+                "[ca]\n            signing_key = \"/keys/ca\"\n            cert_lifetime = \"99s\"\n            [control_plane]",
+            );
+        let cfg = GatewayConfig::parse(&toml).expect("stale keys must not break the boot");
+        assert_eq!(cfg.backend.host_key_policy, HostKeyPolicy::Pinned);
+        assert!(cfg.ca.trusted_ca_keys.is_empty());
     }
 
     #[test]
-    fn agent_backend_auth_requires_the_kill_switch() {
-        // backend_auth="agent" with the switch off: boot error, never a silent
-        // downgrade to `key`/`cert`.
-        let bad = agent_toml("backend_auth = \"agent\"\n");
-        let err = GatewayConfig::parse(&bad).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("allow_agent_backend_auth"), "{msg}");
-        assert!(msg.contains("downgrad"), "{msg}");
-    }
-
-    #[test]
-    fn agent_mode_needs_neither_a_private_key_nor_a_ca() {
-        // The credential is the end user's, reached through the forwarded agent.
-        let good = agent_toml("backend_auth = \"agent\"\nallow_agent_backend_auth = true\n");
-        let cfg = GatewayConfig::parse(&good).expect("agent mode without key/CA is valid");
-        assert_eq!(
-            cfg.backend.backend_auth,
-            crate::backend::BackendAuthMethod::Agent
-        );
-        assert!(cfg.backend.allow_agent_backend_auth);
-        assert!(cfg.backend.private_key.is_none());
-        assert!(cfg.backend.credential_map.is_empty());
-        assert!(
-            cfg.ca.signing_key.is_none(),
-            "agent mode must not need a CA"
-        );
-    }
-
-    #[test]
-    fn agent_backend_auth_is_incompatible_with_pooling() {
-        // propose §3.8: a pooled connection cannot carry a per-session agent
-        // identity — config-time error, not a runtime surprise.
-        let bad = agent_toml("backend_auth = \"agent\"\nallow_agent_backend_auth = true\n")
-            .replace("enabled = false", "enabled = true");
+    fn pool_enabled_is_always_a_config_error() {
+        // propose §3.8 tightened to an unconditional rule: the gateway's
+        // backend identity is per-session, so there is nothing a shared pooled
+        // connection could ever carry.
+        let bad = minimal_toml().replace("enabled = false", "enabled = true");
         assert!(bad.contains("enabled = true"), "precondition of the test");
         let err = GatewayConfig::parse(&bad).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("pool.enabled"), "{msg}");
-        assert!(msg.contains("agent"), "{msg}");
+        match err {
+            Error::Config(ConfigError::Invalid { field, .. }) => {
+                assert_eq!(field, "pool.enabled")
+            }
+            _ => panic!("expected pool.enabled error, got {err:?}"),
+        }
     }
 
     #[test]
-    fn the_agent_kill_switch_alone_changes_nothing_for_key_auth() {
-        // It is a veto, not an enabler: turning it on with the default `key`
-        // credential (and its required key material) is a no-op.
-        let toml =
-            minimal_toml().replace("[backend]", "[backend]\nallow_agent_backend_auth = true");
-        let cfg = GatewayConfig::parse(&toml).expect("switch on + key auth is valid");
-        assert_eq!(
-            cfg.backend.backend_auth,
-            crate::backend::BackendAuthMethod::Key
+    fn trusted_ca_keys_still_load_verify_only() {
+        let toml = minimal_toml().replace(
+            "[control_plane]",
+            "[ca]\n            trusted_ca_keys = [\"/keys/ca.pub\"]\n            [control_plane]",
         );
-        assert!(cfg.backend.allow_agent_backend_auth);
-        assert!(cfg.backend.private_key.is_some());
+        let cfg = GatewayConfig::parse(&toml).expect("verify-only CA is valid");
+        assert_eq!(cfg.ca.trusted_ca_keys, vec![PathBuf::from("/keys/ca.pub")]);
     }
 
     #[test]
@@ -1274,7 +1040,6 @@ mod tests {
             [host_keys]
             keys = [{ path = "/x" }]
             [backend]
-            private_key = "/k"
             host_key_policy = "pinned"
             [control_plane]
             url = "https://cp.internal"
@@ -1294,7 +1059,6 @@ mod tests {
             [host_keys]
             keys = []
             [backend]
-            private_key = "/k"
             host_key_policy = "pinned"
             [control_plane]
             url = "https://cp.internal"
@@ -1327,30 +1091,5 @@ mod tests {
     fn channels_per_conn_over_eight_rejected() {
         let bad = minimal_toml().replace("channels_per_conn = 8", "channels_per_conn = 16");
         assert!(GatewayConfig::parse(&bad).is_err());
-    }
-
-    #[test]
-    fn credential_map_resolves_key_for_user() {
-        let toml = r#"
-            [listen]
-            addr = "127.0.0.1:2222"
-            [host_keys]
-            keys = [{ path = "/h" }]
-            [backend]
-            credential_map = { root = "/keys/root_ed", deploy = "/keys/deploy_ed" }
-            host_key_policy = "accept-new"
-            [control_plane]
-            url = "https://cp"
-        "#;
-        let cfg = GatewayConfig::parse(toml).expect("valid");
-        assert_eq!(
-            cfg.backend.key_for_user("root"),
-            Some(&PathBuf::from("/keys/root_ed"))
-        );
-        assert_eq!(
-            cfg.backend.key_for_user("deploy"),
-            Some(&PathBuf::from("/keys/deploy_ed"))
-        );
-        assert_eq!(cfg.backend.key_for_user("other"), None);
     }
 }

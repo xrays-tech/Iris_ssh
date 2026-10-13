@@ -62,27 +62,14 @@ pub enum ResolveError {
     CircuitOpen { principal: String },
 }
 
-/// Backend credential / host-key loading and dialing failures.
+/// Backend host-key loading, host-key verification and dialing failures.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
-    #[error("failed to load backend private key {path:?}: {source}")]
-    LoadKey {
-        path: std::path::PathBuf,
-        #[source]
-        source: russh::keys::Error,
-    },
-
     #[error("failed to load host private key {path:?}: {source}")]
     LoadHostKey {
         path: std::path::PathBuf,
         #[source]
         source: russh::keys::Error,
-    },
-
-    #[error("backend private key file {path:?} has unsafe permissions {perms:#o}; expected 0o600")]
-    UnsafeKeyPermissions {
-        path: std::path::PathBuf,
-        perms: u32,
     },
 
     #[error("host private key file {path:?} has unsafe permissions {perms:#o}; expected 0o600")]
@@ -105,10 +92,6 @@ pub enum BackendError {
     /// target failed, so requests fail fast instead of piling onto a dead backend.
     #[error("backend dial circuit open for {target}: repeated recent failures")]
     CircuitOpen { target: String },
-
-    /// A short-lived backend certificate could not be issued (cert-mode dial).
-    #[error("could not issue a backend certificate for {user}: {reason}")]
-    IssueCert { user: String, reason: String },
 
     #[error("backend authentication as {user:?} failed")]
     Auth { user: String },

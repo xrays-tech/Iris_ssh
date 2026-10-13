@@ -8,8 +8,9 @@
 //! via `Arc`/`Mutex` without serialising channel opens behind a lock held across
 //! an `await` (forbidden by D11). The default mode is therefore **one backend
 //! connection per client session, reused across that session's channels** — which
-//! is exactly what `server`'s `ensure_backend` does and covers the ControlMaster
-//! (scp/rsync) reuse case.
+//! is exactly what the supervisor's single `BackendDialer::connect` does, with
+//! every channel of the session multiplexed onto it, so it also covers the
+//! ControlMaster (scp/rsync) reuse case.
 //!
 //! What is **wired into production paths** today:
 //!

@@ -1,9 +1,9 @@
 //! Agent-passthrough supervisor (plan-agent-passthrough C2, propose.md §3.5.1).
 //!
-//! With `backend_auth = "agent"`, the gateway authenticates to the backend as
-//! the **user**, by asking the user's own ssh-agent to sign — the `ssh -A`
-//! semantic. The private key never leaves the client; the gateway only relays
-//! agent messages.
+//! This is the only backend data path left: the gateway authenticates to the
+//! backend as the **user**, by asking the user's own ssh-agent to sign — the
+//! `ssh -A` semantic. The private key never leaves the client; the gateway only
+//! relays agent messages.
 //!
 //! # Why this is a separate task
 //!
@@ -69,8 +69,8 @@ use crate::types::{Fingerprint, Grant};
 /// milliseconds. The generous bound exists only so the *negative* case
 /// (a client that never asks) still ends in a protocol-native channel close
 /// instead of hanging: without a request there is no agent to authenticate
-/// with, and silently dialing with the gateway's own key would be exactly the
-/// credential downgrade red line 3 forbids.
+/// with, and there is no other credential the gateway could dial with either,
+/// so a protocol-native close is the only honest outcome (red line 3).
 pub const AGENT_GRANT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Supervisor is waiting for the client's agent-forwarding request, or for the
@@ -899,7 +899,7 @@ async fn establish_backend(
 
     let public_key = identities[index].public_key().into_owned();
     let backend = dialer
-        .connect_agent(grant, public_key, &mut agent)
+        .connect(grant, public_key, &mut agent)
         .await
         .map_err(|e| format!("backend rejected the agent signature: {e}"))?;
 

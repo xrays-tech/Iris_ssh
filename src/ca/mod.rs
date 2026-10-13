@@ -16,17 +16,20 @@
 //! no lock, no I/O and no clock — which is what keeps these rules unit-testable
 //! (plan §6.4: internal logic is pure, boundaries are mockable).
 //!
-//! ## Issuance entrypoint
+//! ## Verification only
 //!
-//! `CA_ISSUE_CONFIG` is the documented entrypoint for operators (and for the
-//! control plane to call out-of-band): a tiny binary path that loads the CA
-//! private key and signs a short-lived certificate. It lives here rather than in
-//! the serving path because the gateway never issues certificates while
-//! relaying — issuance is an administrative action.
+//! The gateway never issues certificates any more: `signing_key`,
+//! `cert_lifetime` and the `CertificateAuthority` issuing surface went away with
+//! the key/cert backend credential (plan-agent-only D3). What remains is the
+//! trust set that gates front-leg user certificates and backend host
+//! certificates. The `issue_*_with` builders survive only under `#[cfg(test)]`,
+//! where they mint the fixtures the validation tests verify against.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use russh::keys::{PrivateKey, PublicKey};
+#[cfg(test)]
+use russh::keys::PrivateKey;
+use russh::keys::PublicKey;
 
 use crate::error::Result;
 
@@ -41,20 +44,13 @@ pub struct CertificateAuthority {
     /// a client leg that advertises no host-certificate algorithms will never be
     /// offered one, however many CAs it trusts.
     trusted_ca_keys: Vec<PublicKey>,
-    /// The CA private key, when configured (verify-only otherwise).
-    signing_key: Option<std::sync::Arc<PrivateKey>>,
-    /// Default lifetime for issued certificates.
-    cert_lifetime: Duration,
 }
 
 impl CertificateAuthority {
-    /// Build a CA set from config, loading and 0600-checking every private key
-    /// involved. An empty set — no trusted CA keys and no signing key — is a
-    /// valid "certificate auth disabled" configuration (the config layer accepts
-    /// it); only the contradictory combination of a signing key without any
-    /// trusted CA key is rejected at the config layer.
-    /// In the empty case this yields a CA that trusts nothing and can never
-    /// issue, so certificate authentication is effectively disabled loudly.
+    /// Build a CA set from config: load every trusted CA **public** key.
+    /// An empty set is a valid "certificate auth disabled" configuration (the
+    /// config layer accepts it); in that case this yields a CA that trusts
+    /// nothing, so certificate authentication is disabled loudly.
     pub fn load(config: &crate::config::CaConfig) -> Result<Self> {
         let mut trusted_ca = Vec::with_capacity(config.trusted_ca_keys.len());
         let mut trusted_ca_keys = Vec::with_capacity(config.trusted_ca_keys.len());
@@ -70,17 +66,9 @@ impl CertificateAuthority {
             trusted_ca.push(sha256_fingerprint(&key));
             trusted_ca_keys.push(key);
         }
-        let signing_key = match &config.signing_key {
-            Some(path) => Some(std::sync::Arc::new(
-                crate::backend::load_private_key_checked(path, false)?,
-            )),
-            None => None,
-        };
         Ok(CertificateAuthority {
             trusted_ca,
             trusted_ca_keys,
-            signing_key,
-            cert_lifetime: config.cert_lifetime,
         })
     }
 
@@ -92,11 +80,6 @@ impl CertificateAuthority {
     /// Whether `fingerprint` names a trusted CA signing key.
     pub fn is_trusted_ca(&self, fingerprint: &str) -> bool {
         self.trusted_ca.iter().any(|fp| fp == fingerprint)
-    }
-
-    /// Whether this CA can issue certificates (a signing key is configured).
-    pub fn can_issue(&self) -> bool {
-        self.signing_key.is_some()
     }
 
     /// The key algorithms of the trusted CAs, de-duplicated — exactly the
@@ -116,36 +99,6 @@ impl CertificateAuthority {
             }
         }
         algos
-    }
-
-    /// The configured certificate lifetime for issued certificates.
-    pub fn cert_lifetime(&self) -> Duration {
-        self.cert_lifetime
-    }
-
-    /// Issue a short-lived user certificate for `subject_key`.
-    ///
-    /// `principals` are the usernames the certificate is valid for (OpenSSH's
-    /// `valid principals`); `key_id` is the human-readable label sshd shows in
-    /// logs. Validity starts now and ends after [`Self::cert_lifetime`].
-    pub fn issue_user_certificate(
-        &self,
-        subject_key: &PublicKey,
-        principals: &[String],
-        key_id: &str,
-    ) -> Result<russh::keys::Certificate> {
-        let signing_key = self.signing_key.as_ref().ok_or_else(|| {
-            crate::error::Error::Invariant(
-                "CA has no signing key configured; cannot issue certificates".into(),
-            )
-        })?;
-        issue_user_certificate_with(
-            signing_key,
-            subject_key,
-            principals,
-            key_id,
-            self.cert_lifetime,
-        )
     }
 }
 
@@ -168,100 +121,111 @@ pub fn certificate_ca_fingerprint(cert: &russh::keys::Certificate) -> String {
     sha256_fingerprint(&PublicKey::from(cert.signature_key().clone()))
 }
 
-/// Issue a short-lived **user** certificate (the pure core of
-/// [`CertificateAuthority::issue_user_certificate`], split out so it can be
-/// exercised with a generated key and no config plumbing).
-pub fn issue_user_certificate_with(
-    signing_key: &PrivateKey,
-    subject_key: &PublicKey,
-    principals: &[String],
-    key_id: &str,
-    lifetime: Duration,
-) -> Result<russh::keys::Certificate> {
-    issue_certificate_with(
-        signing_key,
-        subject_key,
-        ssh_key::certificate::CertType::User,
-        principals,
-        key_id,
-        lifetime,
-    )
-}
+/// Minting is test-only: the gateway holds no signing key, so these exist purely
+/// to build the fixtures `validate_*` is asserted against.
+#[cfg(test)]
+pub(crate) mod issuing {
+    use std::time::Duration;
 
-/// Issue a short-lived **host** certificate (M4-T1's counterpart on the backend
-/// side: a backend `sshd` presents this during KEX, and the gateway's
-/// `@cert-authority` chain verifies it).
-pub fn issue_host_certificate_with(
-    signing_key: &PrivateKey,
-    subject_key: &PublicKey,
-    principals: &[String],
-    key_id: &str,
-    lifetime: Duration,
-) -> Result<russh::keys::Certificate> {
-    issue_certificate_with(
-        signing_key,
-        subject_key,
-        ssh_key::certificate::CertType::Host,
-        principals,
-        key_id,
-        lifetime,
-    )
-}
+    use super::*;
 
-/// Issue a short-lived certificate of an explicit [`CertType`](ssh_key::certificate::CertType).
-///
-/// The type is part of the signed body, so a user certificate can never be
-/// replayed as a host certificate (or vice versa) — which is what the
-/// verification chain asserts on the accepting side.
-pub fn issue_certificate_with(
-    signing_key: &PrivateKey,
-    subject_key: &PublicKey,
-    cert_type: ssh_key::certificate::CertType,
-    principals: &[String],
-    key_id: &str,
-    lifetime: Duration,
-) -> Result<russh::keys::Certificate> {
-    let now = duration_since_epoch("reading system clock for certificate validity")?;
-    let valid_after = now.saturating_sub(1); // tolerate small clock skew
-    let valid_before = now
-        .checked_add(lifetime.as_secs())
-        .ok_or_else(|| crate::error::Error::Invariant("certificate lifetime overflowed".into()))?;
-
-    // A certificate with no principals is a "golden ticket" in OpenSSH, so refuse
-    // to mint one without an explicit operator-supplied principal list.
-    if principals.is_empty() {
-        return Err(crate::error::Error::Invariant(
-            "refusing to issue a certificate with no principals".into(),
-        ));
+    /// Issue a short-lived **user** certificate (the pure core of what the CA used
+    /// to mint, split out so it can be exercised with a generated key and no config
+    /// plumbing).
+    pub fn issue_user_certificate_with(
+        signing_key: &PrivateKey,
+        subject_key: &PublicKey,
+        principals: &[String],
+        key_id: &str,
+        lifetime: Duration,
+    ) -> Result<russh::keys::Certificate> {
+        issue_certificate_with(
+            signing_key,
+            subject_key,
+            ssh_key::certificate::CertType::User,
+            principals,
+            key_id,
+            lifetime,
+        )
     }
 
-    // 32 random bytes of nonce, as OpenSSH does.
-    let nonce = { rand::random::<[u8; 32]>().to_vec() };
+    /// Issue a short-lived **host** certificate (M4-T1's counterpart on the backend
+    /// side: a backend `sshd` presents this during KEX, and the gateway's
+    /// `@cert-authority` chain verifies it).
+    pub fn issue_host_certificate_with(
+        signing_key: &PrivateKey,
+        subject_key: &PublicKey,
+        principals: &[String],
+        key_id: &str,
+        lifetime: Duration,
+    ) -> Result<russh::keys::Certificate> {
+        issue_certificate_with(
+            signing_key,
+            subject_key,
+            ssh_key::certificate::CertType::Host,
+            principals,
+            key_id,
+            lifetime,
+        )
+    }
 
-    let mut builder = ssh_key::certificate::Builder::new(
-        nonce,
-        subject_key.key_data().clone(),
-        valid_after,
-        valid_before,
-    )
-    .map_err(|e| crate::error::Error::Invariant(format!("building certificate envelope: {e}")))?;
-    builder
-        .cert_type(cert_type)
-        .map_err(|e| crate::error::Error::Invariant(format!("setting cert type: {e}")))?;
-    builder
-        .key_id(key_id)
-        .map_err(|e| crate::error::Error::Invariant(format!("setting key id: {e}")))?;
-    for principal in principals {
-        builder.valid_principal(principal).map_err(|e| {
-            crate::error::Error::Invariant(format!("adding principal {principal:?}: {e}"))
+    /// Issue a short-lived certificate of an explicit [`CertType`](ssh_key::certificate::CertType).
+    ///
+    /// The type is part of the signed body, so a user certificate can never be
+    /// replayed as a host certificate (or vice versa) — which is what the
+    /// verification chain asserts on the accepting side.
+    pub fn issue_certificate_with(
+        signing_key: &PrivateKey,
+        subject_key: &PublicKey,
+        cert_type: ssh_key::certificate::CertType,
+        principals: &[String],
+        key_id: &str,
+        lifetime: Duration,
+    ) -> Result<russh::keys::Certificate> {
+        let now = duration_since_epoch("reading system clock for certificate validity")?;
+        let valid_after = now.saturating_sub(1); // tolerate small clock skew
+        let valid_before = now.checked_add(lifetime.as_secs()).ok_or_else(|| {
+            crate::error::Error::Invariant("certificate lifetime overflowed".into())
         })?;
-    }
 
-    builder.sign(signing_key).map_err(|e| {
-        // ssh-key's error surface is its own enum; wrap with context so operators
-        // see the CA signing failure rather than a bare "signature error".
-        crate::error::Error::Invariant(format!("signing user certificate: {e}"))
-    })
+        // A certificate with no principals is a "golden ticket" in OpenSSH, so refuse
+        // to mint one without an explicit operator-supplied principal list.
+        if principals.is_empty() {
+            return Err(crate::error::Error::Invariant(
+                "refusing to issue a certificate with no principals".into(),
+            ));
+        }
+
+        // 32 random bytes of nonce, as OpenSSH does.
+        let nonce = { rand::random::<[u8; 32]>().to_vec() };
+
+        let mut builder = ssh_key::certificate::Builder::new(
+            nonce,
+            subject_key.key_data().clone(),
+            valid_after,
+            valid_before,
+        )
+        .map_err(|e| {
+            crate::error::Error::Invariant(format!("building certificate envelope: {e}"))
+        })?;
+        builder
+            .cert_type(cert_type)
+            .map_err(|e| crate::error::Error::Invariant(format!("setting cert type: {e}")))?;
+        builder
+            .key_id(key_id)
+            .map_err(|e| crate::error::Error::Invariant(format!("setting key id: {e}")))?;
+        for principal in principals {
+            builder.valid_principal(principal).map_err(|e| {
+                crate::error::Error::Invariant(format!("adding principal {principal:?}: {e}"))
+            })?;
+        }
+
+        builder.sign(signing_key).map_err(|e| {
+            // ssh-key's error surface is its own enum; wrap with context so operators
+            // see the CA signing failure rather than a bare "signature error".
+            crate::error::Error::Invariant(format!("signing user certificate: {e}"))
+        })
+    }
 }
 
 /// Outcome of validating a certificate against a CA set at time `now`.
@@ -429,7 +393,10 @@ pub fn now_unix_secs() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use issuing::{issue_host_certificate_with, issue_user_certificate_with};
 
     fn ca_key() -> PrivateKey {
         let mut rng = rand::rng();
@@ -447,7 +414,8 @@ mod tests {
         lifetime: Duration,
     ) -> russh::keys::Certificate {
         let principals: Vec<String> = principals.iter().map(|s| (*s).to_owned()).collect();
-        issue_user_certificate_with(ca, &subject_key(), &principals, key_id, lifetime).unwrap()
+        issuing::issue_user_certificate_with(ca, &subject_key(), &principals, key_id, lifetime)
+            .unwrap()
     }
 
     #[test]
@@ -692,21 +660,5 @@ mod tests {
             },
             "leniency must not turn into a suffix match"
         );
-    }
-
-    #[test]
-    fn issuing_without_a_signing_key_is_refused() {
-        // A verify-only CA must not silently produce certificates.
-        let ca = CertificateAuthority {
-            trusted_ca: Vec::new(),
-            trusted_ca_keys: Vec::new(),
-            signing_key: None,
-            cert_lifetime: Duration::from_secs(60),
-        };
-        assert!(!ca.can_issue());
-        let principals = vec!["alex_host1".to_owned()];
-        assert!(ca
-            .issue_user_certificate(&subject_key(), &principals, "k")
-            .is_err());
     }
 }

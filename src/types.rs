@@ -7,8 +7,6 @@
 //! that fails the opaque-token regex, so the resolver and auditor never have to
 //! defensively re-validate it.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 /// A validated SSH username, treated as an opaque routing token.
@@ -124,57 +122,9 @@ pub struct Policy {
     #[serde(default)]
     pub agent_forwarding: bool,
     #[serde(default)]
-    pub tcp_forwarding: bool,
-    /// Jump-mode target allow-list: `host`, `host:port`, or `*:port` entries.
-    ///
-    /// Compatible with the older boolean `tcp_forwarding` field: an absent list
-    /// deserializes to empty, and an empty list means "no targets allowed", so a
-    /// control plane that predates this field keeps the default-deny behaviour.
-    #[serde(default)]
-    pub tcp_forwarding_targets: Vec<String>,
-    /// Per-resolve override of the backend credential: `"key"`, `"cert"` or
-    /// `"agent"`.
-    ///
-    /// Absent means "use the gateway's `[backend] backend_auth` default", so a
-    /// control plane that predates this field changes nothing (propose §3.3).
-    /// `"agent"` additionally requires the instance kill-switch
-    /// `[backend] allow_agent_backend_auth` to be on; otherwise resolution
-    /// fails loudly instead of downgrading (plan-agent-passthrough C1).
-    #[serde(default)]
-    pub backend_auth: Option<String>,
-    #[serde(default)]
     pub recording: bool,
     #[serde(default)]
     pub ttl: u32,
-}
-
-impl Policy {
-    /// The credential the gateway should present to this backend, or `None` when
-    /// the grant has no opinion and the instance default applies.
-    ///
-    /// A malformed value is reported as a [`crate::error::ResolveError`] rather
-    /// than silently falling back to `key` — a policy we cannot read must not
-    /// quietly downgrade authentication.
-    pub fn backend_auth_method(
-        &self,
-    ) -> Option<std::result::Result<crate::backend::BackendAuthMethod, crate::error::ResolveError>>
-    {
-        let raw = self.backend_auth.as_deref()?;
-        Some(
-            crate::backend::BackendAuthMethod::parse("policy.backend_auth", raw).map_err(|e| {
-                crate::error::ResolveError::InvalidPrincipal {
-                    principal: self.principal_for_error(),
-                    reason: e.to_string(),
-                }
-            }),
-        )
-    }
-
-    /// Principal echo for error messages (a `Policy` alone does not carry one, so
-    /// this reports the field rather than inventing an identity).
-    fn principal_for_error(&self) -> String {
-        "<policy>".to_owned()
-    }
 }
 
 /// A resolved + authorized destination for one client session.
@@ -206,14 +156,6 @@ pub struct ResolveResponse {
     pub target: Target,
     #[serde(default)]
     pub policy: Policy,
-}
-
-/// A backend credential: the SSH private key the gateway authenticates with,
-/// paired with the backend username it is valid for (`credential_map`).
-#[derive(Debug, Clone)]
-pub struct Credential {
-    pub user: String,
-    pub key_path: PathBuf,
 }
 
 /// How the gateway treats the backend's host key (propose.md §3.3, D8).

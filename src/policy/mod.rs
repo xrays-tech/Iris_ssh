@@ -191,13 +191,15 @@ pub fn env_allowed(variable_name: &str, allowlist: &[String]) -> ForwardDecision
     }
 }
 
-/// Whether agent forwarding may be enabled for this grant.
+/// The gate for an incoming `auth-agent-req@openssh.com`.
 ///
-/// Default-deny unless the control-plane policy explicitly allows it (D6). Note
-/// propose.md §3.8 additionally forbids agent forwarding on *pooled* connections
-/// because of channel-routing ambiguity — that restriction is enforced in the
-/// pool, not here.
-pub fn agent_forwarding_allowed(grant: &Grant) -> ForwardDecision {
+/// Default-deny unless the control-plane policy explicitly allows agent
+/// forwarding (D6). This is the **only** admission rule left: the instance
+/// kill-switch `[backend] allow_agent_backend_auth` went away with the key/cert
+/// credential (plan-agent-only D3), so the grant is the whole answer. Denying it
+/// means the supervisor never dials at all — there is no other credential it
+/// could fall back to (red line 3).
+pub fn agent_passthrough_allowed(grant: &Grant) -> ForwardDecision {
     if grant.policy.agent_forwarding {
         ForwardDecision::Forward
     } else {
@@ -207,42 +209,11 @@ pub fn agent_forwarding_allowed(grant: &Grant) -> ForwardDecision {
     }
 }
 
-/// The full gate for an incoming `auth-agent-req@openssh.com`
-/// (plan-agent-passthrough C1): the **instance kill-switch**
-/// `[backend] allow_agent_backend_auth` is a veto, and the grant must also
-/// allow agent forwarding.
-///
-/// `false` on the switch short-circuits before the grant is even consulted, so
-/// an instance with the switch off denies every agent request regardless of what
-/// the control plane says — identical to the historical unconditional deny.
-pub fn agent_passthrough_allowed(allow_agent_backend_auth: bool, grant: &Grant) -> ForwardDecision {
-    if !allow_agent_backend_auth {
-        return ForwardDecision::DenyLocally {
-            reason: "[backend] allow_agent_backend_auth is off".into(),
-        };
-    }
-    agent_forwarding_allowed(grant)
-}
-
 /// X11 forwarding is unsupported by the gateway (M1); it is always denied
 /// locally. Jump/X11 becomes a policy option only in M3.
 pub fn x11_allowed() -> ForwardDecision {
     ForwardDecision::DenyLocally {
         reason: "X11 forwarding is not supported".into(),
-    }
-}
-
-/// Whether a direct/forwarded TCP channel may be opened.
-///
-/// Default-deny unless the grant's policy allows TCP forwarding (jump mode is
-/// M3; when opened up there, the target must additionally be validated).
-pub fn tcp_forwarding_allowed(grant: &Grant) -> ForwardDecision {
-    if grant.policy.tcp_forwarding {
-        ForwardDecision::Forward
-    } else {
-        ForwardDecision::DenyLocally {
-            reason: "TCP forwarding is not permitted".into(),
-        }
     }
 }
 
@@ -303,62 +274,33 @@ mod tests {
     fn agent_forwarding_is_default_deny() {
         let g = grant_with(Policy::default());
         assert!(matches!(
-            agent_forwarding_allowed(&g),
+            agent_passthrough_allowed(&g),
             ForwardDecision::DenyLocally { .. }
         ));
         let g = grant_with(Policy {
             agent_forwarding: true,
             ..Default::default()
         });
-        assert_eq!(agent_forwarding_allowed(&g), ForwardDecision::Forward);
+        assert_eq!(agent_passthrough_allowed(&g), ForwardDecision::Forward);
     }
 
     #[test]
-    fn agent_passthrough_needs_both_the_kill_switch_and_the_grant() {
-        // C1: the instance kill-switch is a veto layered on top of the grant.
-        let off_switch = grant_with(Policy {
-            agent_forwarding: true,
-            ..Default::default()
-        });
-        assert!(matches!(
-            agent_passthrough_allowed(false, &off_switch),
-            ForwardDecision::DenyLocally { .. }
-        ));
-        // Switch off beats a grant that would otherwise allow it.
-        assert!(
-            agent_passthrough_allowed(false, &off_switch) != ForwardDecision::Forward,
-            "the kill-switch must veto even an agent_forwarding=true grant"
-        );
-
-        // Switch on but the grant says no => still denied.
+    fn agent_passthrough_is_decided_by_the_grant_alone() {
+        // No kill-switch any more: the control-plane grant is the whole rule.
         let no_grant = grant_with(Policy::default());
         assert!(matches!(
-            agent_passthrough_allowed(true, &no_grant),
+            agent_passthrough_allowed(&no_grant),
             ForwardDecision::DenyLocally { .. }
         ));
 
-        // Both on => forwarded.
         let allowed = grant_with(Policy {
             agent_forwarding: true,
             ..Default::default()
         });
         assert_eq!(
-            agent_passthrough_allowed(true, &allowed),
+            agent_passthrough_allowed(&allowed),
             ForwardDecision::Forward
         );
-    }
-
-    #[test]
-    fn tcp_forwarding_follows_grant_policy() {
-        assert!(matches!(
-            tcp_forwarding_allowed(&grant_with(Policy::default())),
-            ForwardDecision::DenyLocally { .. }
-        ));
-        let g = grant_with(Policy {
-            tcp_forwarding: true,
-            ..Default::default()
-        });
-        assert_eq!(tcp_forwarding_allowed(&g), ForwardDecision::Forward);
     }
 
     // ---- M4-T1: host-certificate `@cert-authority` chain ----
@@ -379,7 +321,7 @@ mod tests {
     /// A host certificate naming `host`, signed by `ca`.
     fn host_cert(ca: &russh::keys::PrivateKey, host: &str) -> russh::keys::Certificate {
         let inner = ca_privkey().public_key().clone();
-        crate::ca::issue_host_certificate_with(
+        crate::ca::issuing::issue_host_certificate_with(
             ca,
             &inner,
             &[host.to_owned()],
@@ -504,7 +446,7 @@ mod tests {
         let verifier =
             HostKeyVerifier::with_trusted_ca(HostKeyPolicy::Pinned, Vec::new(), [ca_fp(&ca)]);
         let inner = ca_privkey().public_key().clone();
-        let user_cert = crate::ca::issue_user_certificate_with(
+        let user_cert = crate::ca::issuing::issue_user_certificate_with(
             &ca,
             &inner,
             &["db.example.com".to_owned()],
