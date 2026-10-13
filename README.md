@@ -14,7 +14,7 @@ ssh alex_host1@gw.example.com
   后端 sshd（目标机器）
 ```
 
-数据是纯转发的，网关不落盘（除非你显式开启会话录制）。认证、审计、访问控制都发生在网关这一侧；后端机器唯一的配置是把**终端用户的公钥**放进 `authorized_keys`——网关不持有任何后端私钥，它是靠转发用户的 ssh-agent 去拨号的。
+数据是纯转发的，网关默认不落盘（会话录制由控制面按 grant 开启，见「功能」）。认证、审计、访问控制都发生在网关这一侧；后端机器唯一的配置是把**终端用户的公钥**放进 `authorized_keys`——网关不持有任何后端私钥，它是靠转发用户的 ssh-agent 去拨号的。
 
 ## 功能
 
@@ -23,7 +23,7 @@ ssh alex_host1@gw.example.com
 - **认证**：客户端 → 网关支持公钥 / CA 签发的用户证书；网关 → 后端只有一种方式——转发客户端的 ssh-agent（`ssh -A` 语义）。
 - **防爆破 / 防时序**：每次认证拒绝有恒定时间填充（`auth_rejection_pad`），尝试次数上限（`max_auth_attempts`），每 IP 并发上限。
 - **会话语义完整**：exec / shell / scp / sftp / stderr（extended data）/ exit status / rekey / 信号全部按 SSH 协议原样透传；不伪造成功、不注入协议行为（I4）。
-- **审计与录制**：按通道录制抓包（`.srec`，默认关闭）；字节计数与操作事件写审计。
+- **审计与录制**：字节计数与操作事件写审计；按通道录制抓包（`.srec`），由控制面每个 grant 的 `policy.recording` 按会话开启，配置里的 `[recording] max_bytes_per_session` 只是预算上限（默认 64 MiB，设 0 整体禁用）。
 - **SFTP 命令级拦截**（默认关）：可拒绝特定命令（如 `REMOVE`/`RENAME`）并按路径前缀控制。
 - **可观测**：`/healthz`、`/readyz`、`/metrics`（Prometheus 文本格式）。
 - **优雅停机**：SIGTERM 排水后向客户端发协议级 `DISCONNECT[BY_APPLICATION]`。
@@ -42,7 +42,7 @@ install -m 0755 target/release/ssh-gw /usr/local/bin/ssh-gw
 
 ### 配置文件
 
-按 `config.example.toml` 复制成生产配置（例如 `/etc/ssh-gw/gateway.toml`），改里面指向你机器的路径。加载顺序：`$SSHGW_CONFIG` 环境变量 → 第一个命令行参数 → `/etc/ssh-gateway/config.toml`。
+按 `config.example.toml` 复制成生产配置（例如 `/etc/ssh-gw/gateway.toml`），改里面指向你机器的路径。加载顺序：`--config`/`-c` 旗标或第一个命令行参数 → `$SSHGW_CONFIG` 环境变量 → `/etc/ssh-gateway/config.toml`。
 
 ```bash
 /usr/local/bin/ssh-gw --config /etc/ssh-gw/gateway.toml
@@ -69,9 +69,9 @@ systemd 参考单元在 `deploy/ssh-gw.service`（已配好优雅排水和基本
    响应示例：
 
    ```json
-   {"target": {"host": "db.internal", "port": 22, "user": "alex"}, "policy": {"agent_forwarding": true, "ttl": 60}}
+   {"target": {"host": "db.internal", "port": 22, "user": "alex"}, "policy": {"agent_forwarding": true, "recording": false, "ttl": 60}}
    ```
-   拒绝返回 `{"status":403,...}`，未知 `{"status":404,...}`。`policy.agent_forwarding` 为 `true` 才会建立后端会话；缺省或 `false` 一律拒绝（网关没有可回落的凭据）。不想搭真实服务的话，仓库里有 [scripts/mock_control_plane.py](scripts/mock_control_plane.py)（按一条 JSON 规则表应答，用于本地联调）。
+   拒绝返回 `{"status":403,...}`，未知 `{"status":404,...}`。`policy.agent_forwarding` 为 `true` 才会建立后端会话；缺省或 `false` 一律拒绝（网关没有可回落的凭据）。`policy.recording` 为 `true` 时按会话开启 `.srec` 抓包（缺省 `false`，不录）。不想搭真实服务的话，仓库里有 [scripts/mock_control_plane.py](scripts/mock_control_plane.py)（按一条 JSON 规则表应答，用于本地联调）。
 4. **后端 host key 信任**：生产用 `host_key_policy="pinned"`（首次固化指纹）；初次联调可先 `accept-new` 再尽快 pin。
 
 ## 使用
