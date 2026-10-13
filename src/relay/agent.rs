@@ -47,9 +47,9 @@
 //!   moment the single backend signature succeeds, so the oracle window is one
 //!   signature wide (red lines 4/10).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -537,6 +537,61 @@ fn try_push<T>(tx: &mpsc::Sender<T>, closed: bool, item: T) -> Enqueued {
     }
 }
 
+/// The client channels currently occupying a slot on one session's backend
+/// connection.
+///
+/// `pool.channels_per_conn` caps how many channels a connection carries **at
+/// once**, exactly like sshd's `MaxSessions`, so the count has to fall when a
+/// channel is spent — and only the supervisor can know when that is: the
+/// down-pump's completion signal is the authority on a channel's liveness, and
+/// it never reaches the serial handler. A handler-side set alone therefore
+/// counts channels over the *lifetime* of a connection: a ControlMaster that
+/// reuses one connection for many short commands hits the cap after
+/// `channels_per_conn` of them and every later channel is refused with
+/// `ResourceShortage`.
+///
+/// Hence one set shared by the two tasks, retired from idempotently by
+/// whichever side observes an end first. Plain `std::sync::Mutex`, not the
+/// tokio one: every critical section is a `HashSet` insert/remove with no await
+/// inside, and the handler takes it on the serial event loop.
+pub type ChannelSlots = Arc<Mutex<HashSet<ChannelId>>>;
+
+/// An empty slot set for a fresh session.
+pub fn new_slots() -> ChannelSlots {
+    Arc::new(Mutex::new(HashSet::new()))
+}
+
+/// Claim one slot for an accepted client channel.
+///
+/// The handler calls this before the `OpenChannel` op is handed over, so the
+/// cap can never undercount a channel that is already on its way to the
+/// supervisor.
+pub fn reserve_slot(slots: &ChannelSlots, client_id: ChannelId) {
+    slots
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(client_id);
+}
+
+/// Give a channel's slot back. Idempotent: both the handler (client close, or
+/// an op it could not hand over) and the supervisor (backend half spent, or a
+/// channel it never managed to open) can report the same end.
+pub fn release_slot(slots: &ChannelSlots, client_id: ChannelId) {
+    slots
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&client_id);
+}
+
+/// How many channels are live on the session's backend connection right now.
+///
+/// Poison recovery: a poisoned lock means some task panicked while holding it,
+/// and the surviving tasks must still be able to serve and refuse channels
+/// rather than deadlock on the serial event loop.
+pub fn slot_count(slots: &ChannelSlots) -> usize {
+    slots.lock().unwrap_or_else(PoisonError::into_inner).len()
+}
+
 /// Everything the supervisor needs, bundled once so the spawned task owns its
 /// whole world and borrows nothing from the session.
 ///
@@ -553,6 +608,10 @@ pub struct AgentSupervisorArgs {
     /// record (red line 10).
     pub auditor: Option<Arc<crate::audit::Auditor>>,
     pub session_id: String,
+    /// Live-channel accounting shared with the handler (see [`ChannelSlots`]):
+    /// the supervisor retires a channel's slot here the moment its backend half
+    /// is spent, which is what keeps `channels_per_conn` a concurrent cap.
+    pub slots: ChannelSlots,
 }
 
 /// Queue depth for one agent session's pre-ready ops.
@@ -682,6 +741,7 @@ async fn run(
         bytes,
         auditor,
         session_id,
+        slots,
     } = args;
 
     // `dial_guard` keeps the queue open while we dial (the handler may be
@@ -744,7 +804,7 @@ async fn run(
             while let Ok(op) = rx.try_recv() {
                 backlog.push_back(op);
             }
-            fail_backlog(&up, backlog).await;
+            fail_backlog(&up, backlog, &slots).await;
             return;
         }
     };
@@ -816,6 +876,7 @@ async fn run(
             &bytes,
             &metrics,
             &pump_done_tx,
+            &slots,
         )
         .await;
     }
@@ -837,6 +898,7 @@ async fn run(
                         &bytes,
                         &metrics,
                         &pump_done_tx,
+                        &slots,
                     )
                     .await,
                 }
@@ -849,6 +911,11 @@ async fn run(
                 match done {
                     None => break,
                     Some(client_id) => {
+                        // Slot released unconditionally: the relay may already
+                        // be gone (a `Close` op dropped it), but the channel is
+                        // spent either way and `channels_per_conn` has to stop
+                        // counting it.
+                        release_slot(&slots, client_id);
                         if let Some(relay) = relays.remove(&client_id) {
                             let _ = relay.backend.close().await;
                         }
@@ -860,7 +927,8 @@ async fn run(
 
     // Session over: close every backend channel still mapped, then drop `handle`
     // (implicitly) so the backend transport task stops with it.
-    for (_, relay) in relays {
+    for (client_id, relay) in relays {
+        release_slot(&slots, client_id);
         let _ = relay.backend.close().await;
     }
 }
@@ -872,6 +940,7 @@ async fn run(
 /// Split out of the main loop so the dial-time backlog is replayed through
 /// exactly the same code path as live ops — two implementations would be two
 /// chances to drift.
+#[allow(clippy::too_many_arguments)]
 async fn serve_op(
     op: AgentOp,
     relays: &mut HashMap<ChannelId, Arc<ChannelRelay>>,
@@ -880,6 +949,7 @@ async fn serve_op(
     bytes: &Arc<ByteCounters>,
     metrics: &crate::metrics::Metrics,
     pump_done_tx: &mpsc::UnboundedSender<ChannelId>,
+    slots: &ChannelSlots,
 ) {
     match op.kind {
         AgentOpKind::OpenChannel { tap } => {
@@ -899,6 +969,7 @@ async fn serve_op(
                     metrics,
                     pump_done_tx,
                     relays,
+                    slots,
                 )
                 .await;
             }
@@ -924,7 +995,7 @@ async fn serve_op(
 /// request that asked for a reply gets a FAILURE, and every client channel the
 /// handler already accepted is closed. Never a key/cert fallback, never a
 /// fabricated SUCCESS.
-async fn fail_backlog(up: &ClientHandle, backlog: VecDeque<AgentOp>) {
+async fn fail_backlog(up: &ClientHandle, backlog: VecDeque<AgentOp>, slots: &ChannelSlots) {
     let mut accepted = Vec::new();
     for AgentOp { client_id, kind } in backlog {
         if matches!(kind, AgentOpKind::OpenChannel { .. }) {
@@ -934,6 +1005,10 @@ async fn fail_backlog(up: &ClientHandle, backlog: VecDeque<AgentOp>) {
         }
     }
     for client_id in accepted {
+        // The client is about to see the close, but a close the *server*
+        // initiated is not echoed back as a handler callback, so the slot has
+        // to be given back here or it leaks for the rest of the connection.
+        release_slot(slots, client_id);
         let _ = up.close(client_id).await;
     }
 }
@@ -950,6 +1025,7 @@ async fn open_backend_channel(
     metrics: &crate::metrics::Metrics,
     pump_done_tx: &mpsc::UnboundedSender<ChannelId>,
     relays: &mut HashMap<ChannelId, Arc<ChannelRelay>>,
+    slots: &ChannelSlots,
 ) {
     let opened = match handle.channel_open_session().await {
         Ok(channel) => channel,
@@ -962,6 +1038,10 @@ async fn open_backend_channel(
                 ?e,
                 "backend refused a session channel for an accepted client channel"
             );
+            // No down-pump was ever spawned for this channel, so nothing else
+            // will report it: hand the slot back here or the cap counts a
+            // channel that never existed on the backend.
+            release_slot(slots, client_id);
             let _ = up.close(client_id).await;
             return;
         }
@@ -1132,6 +1212,32 @@ mod tests {
         // Degenerate config values must still yield a usable queue.
         assert!(queue_capacity(0, 0) > 0);
         assert!(queue_capacity(1, u32::MAX) > 0);
+    }
+
+    #[test]
+    fn slots_track_live_channels_and_are_released_idempotently() {
+        // The per-connection cap counts *concurrent* channels (sshd MaxSessions
+        // semantics), so a spent channel has to give its slot back. Handler and
+        // supervisor can both observe the same channel ending — a client close
+        // and the backend half's end are two observations of one event — and
+        // the second release must be a no-op rather than free a stranger's
+        // slot.
+        let slots = new_slots();
+        assert_eq!(slot_count(&slots), 0);
+        for n in 1..=3 {
+            reserve_slot(&slots, channel_id(n));
+        }
+        assert_eq!(slot_count(&slots), 3);
+        release_slot(&slots, channel_id(2));
+        release_slot(&slots, channel_id(2));
+        assert_eq!(
+            slot_count(&slots),
+            2,
+            "releasing the same channel twice must not release two slots"
+        );
+        release_slot(&slots, channel_id(1));
+        release_slot(&slots, channel_id(3));
+        assert_eq!(slot_count(&slots), 0);
     }
 
     #[tokio::test]

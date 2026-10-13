@@ -17,7 +17,11 @@
 # Asserted: both slave commands return the right output, there is exactly ONE
 # backend dial and ONE agent signature for the whole connection (channels share
 # one backend session — they do not re-authenticate per channel), and no agent
-# channel is denied.
+# channel is denied. The connection then keeps opening channels one at a time
+# well past `channels_per_conn` (8) — 12 more — because that cap is concurrent
+# (sshd MaxSessions semantics), not a lifetime budget; a gateway that counted
+# accepted channels would refuse the 8th and break every later command on a
+# reused connection.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
@@ -78,6 +82,26 @@ else
 fi
 pass "channel #3 executed over the shared backend session"
 
+# (B2) The cap is *concurrent*, not a lifetime budget. `channels_per_conn` (8)
+# mirrors sshd's MaxSessions: a long-lived connection may open far more than 8
+# channels over its life provided it does not hold that many at once — which is
+# exactly what a ControlMaster driving many short commands does. Before the
+# slot accounting fix the handler counted accepted channels, so this loop hit
+# `ResourceShortage` on channel #8 and every later command on the connection
+# died (scripts/bench.sh Tier B caught it).
+LIVE_CHANNELS=12
+for i in $(seq 1 "$LIVE_CHANNELS"); do
+  seq_out=""
+  if seq_out="$(gw_ssh -S "$MC_SOCK" "$MC_TARGET" "printf MC_SEQ_$i")"; then
+    assert_contains "$seq_out" "MC_SEQ_$i" "sequential channel $i produced its own output"
+  else
+    tail_log "$SUBTOPO_DIR/gw.log" 40
+    fail "sequential channel $i of $LIVE_CHANNELS was refused or failed — the per-connection \
+cap counts channels over the connection's lifetime instead of at one instant"
+  fi
+done
+pass "$LIVE_CHANNELS further sequential channels reused the connection (cap is concurrent)"
+
 # (C) One connection means one backend dial and one signature: the channels are
 # multiplexed onto an already-authenticated backend session, not re-dialed.
 ok_total=""
@@ -92,8 +116,8 @@ sig_total="$(agent_topo_metric_value sshgw_agent_signatures_total)"
 denied_total="$(agent_topo_metric_value sshgw_agent_channel_denied_total)"
 fail_total="$(agent_topo_metric_value sshgw_agent_backend_auth_fail_total)"
 [ "${ok_total:-0}" = "1" ] || fail "expected 1 agent dial, got [${ok_total:-}]"
-[ "${dial_total:-0}" = "1" ] || fail "expected 1 backend dial for 3 channels, got [${dial_total:-}]"
-[ "${sig_total:-0}" = "1" ] || fail "expected 1 agent signature for 3 channels, got [${sig_total:-}]"
+[ "${dial_total:-0}" = "1" ] || fail "expected 1 backend dial for the whole connection, got [${dial_total:-}]"
+[ "${sig_total:-0}" = "1" ] || fail "expected 1 agent signature for the whole connection, got [${sig_total:-}]"
 [ "${denied_total:-0}" = "0" ] || fail "expected no denied agent channel, got [${denied_total:-}]"
 [ "${fail_total:-0}" = "0" ] || fail "expected no failed agent dial, got [${fail_total:-}]"
 pass "metrics: dial=$dial_total auth_ok=$ok_total sig=$sig_total denied=$denied_total fail=$fail_total"

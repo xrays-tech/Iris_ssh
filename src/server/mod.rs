@@ -659,6 +659,7 @@ impl server::Server for GatewayServer {
             taps: HashMap::new(),
             agent: None,
             agent_channels: HashSet::new(),
+            agent_slots: relay::agent::new_slots(),
             entry: None,
             limiter_reject,
             audited: false,
@@ -683,9 +684,19 @@ pub struct GatewaySession {
     /// there is no key/cert path left to fall back to (plan-agent-only D3).
     agent: Option<AgentSession>,
     /// Every client channel this session has handed to the supervisor, used
-    /// for the per-connection channel cap and to tell an agent channel from a
-    /// stale one. The relay state itself lives in the supervisor.
+    /// to tell an agent channel from a stale one. The relay state itself lives
+    /// in the supervisor.
+    ///
+    /// Deliberately *not* the per-connection channel cap's input: entries are
+    /// only dropped by [`Handler::channel_close`], which the peer's close does
+    /// not always produce, so this set counts channels over the lifetime of the
+    /// connection. The concurrent count lives in [`Self::agent_slots`].
     agent_channels: HashSet<ChannelId>,
+    /// Client channels currently occupying a slot on this session's backend
+    /// connection — the live set `pool.channels_per_conn` actually limits.
+    /// Shared with the supervisor, which retires a slot the moment a channel's
+    /// backend half is spent (see [`relay::agent::ChannelSlots`]).
+    agent_slots: relay::agent::ChannelSlots,
     entry: Option<Arc<SessionEntry>>,
     limiter_reject: bool,
     audited: bool,
@@ -887,6 +898,7 @@ impl GatewaySession {
                 // Only *this* channel goes; the session and its other channels
                 // carry on.
                 self.agent_channels.remove(&channel);
+                relay::agent::release_slot(&self.agent_slots, channel);
                 if let Some(tap) = self.taps.remove(&channel) {
                     tap.flush();
                 }
@@ -901,6 +913,7 @@ impl GatewaySession {
                 // Forget this one too; the handle stays in place so later
                 // opens are refused instead of resurrecting a dead supervisor.
                 self.agent_channels.remove(&channel);
+                relay::agent::release_slot(&self.agent_slots, channel);
                 if let Some(tap) = self.taps.remove(&channel) {
                     tap.flush();
                 }
@@ -975,14 +988,20 @@ impl GatewaySession {
         // Per-connection channel cap (§3.8 / sshd MaxSessions): every channel
         // is multiplexed onto this session's single backend connection, so the
         // configured (hard-capped) limit applies exactly as it does inline.
-        if !crate::pool::can_open_channel(
-            self.agent_channels.len(),
-            self.ctx.config.pool.channels_per_conn,
-        ) {
+        //
+        // Counted against the *live* slots, not `agent_channels`: MaxSessions
+        // limits concurrent channels, and a channel stops being live when its
+        // backend half is spent — which the supervisor reports and this handler
+        // never sees. Counting accepted channels instead would cap the number
+        // of channels a connection may open over its whole lifetime, killing
+        // any long-lived connection after `channels_per_conn` short commands
+        // (the ControlMaster pattern benchmark v2 exercises).
+        let live = relay::agent::slot_count(&self.agent_slots);
+        if !crate::pool::can_open_channel(live, self.ctx.config.pool.channels_per_conn) {
             self.ctx.metrics.agent_channel_denied();
             tracing::warn!(
                 target: "server",
-                channels = self.agent_channels.len(),
+                channels = live,
                 limit = self.ctx.config.pool.channels_per_conn,
                 "per-connection channel limit reached; refusing agent channel"
             );
@@ -1025,6 +1044,7 @@ impl GatewaySession {
                     bytes,
                     auditor: self.auditor.clone(),
                     session_id: self.session_id.to_string(),
+                    slots: Arc::clone(&self.agent_slots),
                 },
                 self.ctx.config.relay.window_size,
                 self.ctx.config.relay.max_packet,
@@ -1051,7 +1071,12 @@ impl GatewaySession {
         };
         match outcome {
             relay::agent::Enqueued::Accepted => {
+                // Both sets on the serial loop, so the handler is the only
+                // writer of the accepted side: `agent_channels` routes the
+                // client's later ops, `agent_slots` bounds the concurrent count
+                // (retired by whichever side observes the channel's end).
                 self.agent_channels.insert(client_id);
+                relay::agent::reserve_slot(&self.agent_slots, client_id);
                 reply.accept().await;
             }
             relay::agent::Enqueued::QueueFull | relay::agent::Enqueued::Closed => {
@@ -1638,6 +1663,10 @@ impl server::Handler for GatewaySession {
         // `agent_channels` is only ever populated for a supervised session, so
         // the membership test alone identifies one of this session's channels.
         if self.agent_channels.remove(&channel) {
+            // A client-initiated close frees the channel's slot here; the
+            // supervisor frees it from its side when the backend half ends, so
+            // a channel both sides watched end is released twice with no effect.
+            relay::agent::release_slot(&self.agent_slots, channel);
             // Best-effort only (red line 8): this callback runs on the
             // serial event loop, and `enqueue().await` would park it for as
             // long as the bounded queue stayed full while the backend was

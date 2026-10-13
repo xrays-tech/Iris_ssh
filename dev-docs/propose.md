@@ -192,7 +192,7 @@ async fn pump_backend_to_client(mut bch: Channel<client::Msg>, up: ServerUpstrea
 
 **为什么必须是 task 而不是 handler。** 网关必须作为 SSH 客户端向用户端发起 `channel_open_agent()`、建立 `AgentClient`、`request_identities()`，在需要签名时 `sign_request()`，再作为 SSH 客户端向后端完成握手 —— 这些都是 **await**，且必须发生在用户端连接的 session 事件循环之上。若在 `agent_request()`/handler 回调里直接 await，会阻塞 russh 的单线程串行事件循环，后端与用户端的后续消息都无法推进，形成**自锁死锁**（D11 违例）。
 
-**连接模型。** 一条用户端连接 → 一个 supervisor task → **一条**后端 `Handle`（russh client transport 的生命周期绑定该 Handle，不可丢弃）→ `HashMap<ChannelId, Arc<ChannelRelay>>` → 每个客户端 channel 一条后端 session channel、一个 `pump_backend_to_client`。channel 在 handler 侧立即 accept 并记录，`OpenChannel{client_id, tap}` 入队，由 supervisor 映射到后端；后端握手尚未完成时到达的 channel 照样入队等待，握手失败时统一被关闭（I4）。因此 §3.6 的"每 channel 有界"推广为**每连接 `channels_per_conn × window`** 的上界，`channels_per_conn` 由 handler 强制（超限 → `ResourceShortage` + `sshgw_agent_channel_denied_total`）。
+**连接模型。** 一条用户端连接 → 一个 supervisor task → **一条**后端 `Handle`（russh client transport 的生命周期绑定该 Handle，不可丢弃）→ `HashMap<ChannelId, Arc<ChannelRelay>>` → 每个客户端 channel 一条后端 session channel、一个 `pump_backend_to_client`。channel 在 handler 侧立即 accept 并登记到会话共享的**并发槽位**（`channels_per_conn` 限的是**同时**在用的 channel 数，语义同 sshd `MaxSessions`：channel 用完即释放槽位，由 supervisor 在后端半边结束时报告、handler 在客户端主动关闭时报告），`OpenChannel{client_id, tap}` 入队，由 supervisor 映射到后端；后端握手尚未完成时到达的 channel 照样入队等待，握手失败时统一被关闭（I4）。因此 §3.6 的"每 channel 有界"推广为**每连接 `channels_per_conn × window`** 的上界，`channels_per_conn` 由 handler 强制（超限 → `ResourceShortage` + `sshgw_agent_channel_denied_total`）。
 
 以下四条限定词任一违反即视为越过红线 11：
 
