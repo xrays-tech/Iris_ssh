@@ -118,7 +118,7 @@ POST /api/v1/resolve  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA25
 
 **网关强制不变量：**
 
-- **I1** 同一 channel 上，客户端→后端的所有 CHANNEL_REQUEST / DATA / EOF / CLOSE **按到达序转发**，不合并、不重排、不注入网关自有请求。
+- **I1** 同一 channel 上，客户端→后端的所有 CHANNEL_REQUEST / DATA / EOF / CLOSE **按到达序转发**，不重排、不注入网关自有请求。唯一的合并例外是同一 channel 上**连续的 DATA** 可并成一个字节缓冲（字节流等价、顺序不变，授权见 §3.5.1 限定词 2）。
 - **I2** `want_reply` 标志原样透传；后端回执（SUCCESS/FAILURE）按 FIFO 与已转发请求一一对应地路由回客户端。
 - **I3** `shell`/`exec`/`subsystem` 为「执行型」请求：发出后该 channel 进入 DataFlow 态，网关此后只透传 data/eof/signal/exit/close，**不得再补发任何请求**。
 - **I4** 失败/拒绝一律使用协议原生机制（channel open failure / request failure / DISCONNECT），**不伪造 exec 输出或 exit code**。
@@ -198,7 +198,8 @@ async fn pump_backend_to_client(mut bch: Channel<client::Msg>, up: ServerUpstrea
 
 1. **每会话单一顺序消费者。** 每条用户端连接至多一个 supervisor task、一个 FIFO 队列。禁止 per-request spawn、禁止多消费者合并、禁止乱序消费、禁止注入请求。
 2. **per-channel FIFO（I1）。** FIFO 串行消费保证同一 channel 上签名请求与后续 pty/shell/env/data 的因果顺序不被打乱；跨 channel 顺序**不是**不变量 —— 每个 channel 有自己的 relay 与自己的 down-pump。
-3. **handler 侧永不阻塞、内存有界（C5/D11）。** handler 回调内只做 `try_send`（Dialing 状态下队列满 → 该 channel 原生失败并计数，**绝不 await**）；Ready 状态下的 `send().await` 等价于原来的内联背压，不新增缓冲。队列容量 = `ceil(relay.window_size / max_packet) + 64` 槽位（64 个空载控制槽供 pty/env/OpenChannel 排队），保证入队数据总量 ≤ `relay.window_size`（I2/I3 记忆体上界继续成立）。锁内不 await（D11）：就绪信号用 `AtomicU8` + `Notify`，不用 `Mutex` 保护的条件变量。
+   **合并授权（I1 的唯一例外）：** 同一 channel 上**连续的 `DATA` 可合并为一个字节缓冲** —— 字节流等价、顺序不变；这是 `relay::agent::DialStash` 在拨号期把客户端涓流小包并成一次转发的前提，也就是拨号期驻留量有界的前提（见限定词 3 与 §3.6）。`CHANNEL_REQUEST` / `EOF` / `CLOSE` 及其它控制 op **一律不合并**、不重排、不注入。
+3. **handler 侧永不阻塞、内存有界（C5/D11）。** handler 回调内只做 `try_send`（Dialing 状态下队列满 → 该 channel 原生失败并计数，**绝不 await**）；Ready 状态下的 `send().await` 等价于原来的内联背压，不新增缓冲。队列容量 = `ceil(relay.window_size / max_packet) + 64` 槽位（64 个空载控制槽供 pty/env/OpenChannel 排队），保证入队数据总量 ≤ `relay.window_size`（I2/I3 记忆体上界继续成立）。拨号期额外靠 `Handler::adjust_window` 把本会话 channel 的窗口目标压到 2 字节涓流（agent 握手通道除外），拨号期实际驻留 ≈ 一个窗口加一次补窗；supervisor 与队列**并行**拨号，期间的 op 进 `DialStash` 并按限定词 2 合并。锁内不 await（D11）：就绪信号用 `AtomicU8` + `Notify`，不用 `Mutex` 保护的条件变量。
 4. **失败走协议原生、不回退凭证（I4/红线 3）。** supervisor 任一环节失败（grant 超时、agent 通道被拒、无匹配指纹身份、`connect_agent` 认证失败、后端通道建立失败）→ 排空队列并对 pending 请求回 `Handle::channel_failure`、再 `Handle::close` 已 accept 的 channel，**绝不**回退到任何网关自有凭证（它们已不存在），也绝不静默降级。
 
 **签名面最小化（红线 4）。** 只对 resolve 出的目标拨号签名，且只用与 `grant.fingerprint` 匹配的 agent 身份；唯一那次签名成功后**立即关闭转发过来的 agent 通道**，签名窗口只有一个签名那么宽。用户本地 agent 不受影响。

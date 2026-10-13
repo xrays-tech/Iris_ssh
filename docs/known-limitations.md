@@ -48,3 +48,10 @@
 - **调研提示的关键机会（未落地，需实测）**：russh 单跳回环可达 400~580 MB/s；同构双会话中继（warpgate）rsync≈直连；**两份被忽视的低成本项第一是双腿 `nodelay=true`（当前 Nagle 开）**，其次是腿 A/B 隔离诊断、cipher A/B（aes-gcm vs chacha20）、写路径流水化（仿 bssh 6.2x 经验）。
 - **影响**：粗略说「经网关 scp 比直连慢 ~6 倍」属预期特性，非故障；容量规划按此基准（连接级 KPI：ControlMaster 复用、每连接建立成本、并发会话容量）而非单连接吞吐。
 - **触发条件 / 处置**：若单连接吞吐成为业务硬需求 → 架构级选项：ProxyJump 直通引导（客户端 `-J`，内层 SSH 密文透传省一跳加密，UX/审计需产品决策）或可信后端裸 TCP 直通（需威胁建模评审）。注意这两条都依赖 `direct-tcpip`，而它在 agent-only 改造中已是**无条件恒拒绝**——要重开属于产品决策，不是配置项。参照基线见 perf-report 末尾。
+
+## 8. 控制面契约变更：`policy.backend_auth` / `tcp_forwarding*` 已废弃，jump 已删除
+
+- **状态**：agent-only 改造（plan-agent-only D1..D5，`1f00dd7`..`8152126`）删掉了后端侧凭证与跳板能力，控制面上与之对应的三个策略字段随之**失效**：`policy.backend_auth`、`policy.tcp_forwarding`、`policy.tcp_forwarding_targets` **网关一律忽略**。serde 忽略未知字段，所以旧控制面下发的记录仍然可用——不会报错，但也不会产生任何效果。
+- **唯一门**：后端认证的唯一开关是 `policy.agent_forwarding`。为 `false` 的 grant **整体拒绝**，既没有、也不会回落成 key/cert（网关手里没有第二套凭证）；`tcp_forwarding = true` 不改变任何行为，`direct-tcpip` 恒拒绝（jump 模式已随 D1 删除，网关不是出站跳板）。
+- **触发条件**（运维说明）：控制面若仍在下发这三个字段，需要在下一次策略迭代中删除，以免运维或审计从策略里读出"这个会话开了转发/用了 key"的错觉。
+- **处置**：无需数据迁移。审计侧判断"是否 agent 会话"看审计记录的 `auth_kind="agent"`（见 `docs/ops-runbook.md` §5.7），指标看 `sshgw_agent_backend_auth_*`；上线前确认告警与看板没有基于 `tcp_forwarding` 或 `backend_auth` 的规则。
