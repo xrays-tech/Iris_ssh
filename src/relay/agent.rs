@@ -1238,4 +1238,99 @@ mod tests {
         assert!(!AgentOpKind::Close.wants_reply());
         assert!(!AgentOpKind::OpenChannel { tap: None }.wants_reply());
     }
+
+    // --- DialStash: the pre-ready backlog -----------------------------------
+
+    /// `ChannelId`'s constructor is private to russh, so a test builds one the
+    /// way the library itself does — by decoding it from the wire. Same
+    /// technique as `record::tests::placeholder_channel_id`.
+    fn channel_id(n: u32) -> ChannelId {
+        let bytes = n.to_be_bytes();
+        let mut cursor = &bytes[..];
+        ssh_encoding::Decode::decode(&mut cursor).expect("decode a channel id")
+    }
+
+    fn data_op(id: ChannelId, payload: &[u8]) -> AgentOp {
+        AgentOp::new(
+            id,
+            AgentOpKind::Data {
+                data: Bytes::copy_from_slice(payload),
+            },
+        )
+    }
+
+    fn data_payload(op: &AgentOp) -> &[u8] {
+        match &op.kind {
+            AgentOpKind::Data { data } => data,
+            other => panic!("expected a Data op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_stash_coalesces_a_run_of_data_on_one_channel() {
+        // The coalescing is the exception granted by propose.md 3.5.1
+        // qualifier 2: a client trickling one keystroke at a time during the
+        // dial must not cost one backlog entry per packet, or the stash stops
+        // being bounded by the relay window.
+        let a = channel_id(1);
+        let mut stash = DialStash::default();
+        stash.push(data_op(a, b"abc"));
+        stash.push(data_op(a, b"de"));
+
+        let ops = stash.flush();
+        assert_eq!(ops.len(), 1, "one run must collapse into one buffer");
+        assert_eq!(ops[0].client_id, a);
+        assert_eq!(data_payload(&ops[0]), b"abcde");
+        assert!(
+            stash.flush().is_empty(),
+            "flush takes the whole backlog, it does not leave a tail"
+        );
+    }
+
+    #[test]
+    fn the_stash_never_merges_across_channels_and_keeps_push_order() {
+        // I1 is per channel, but the replay is global: Data(A), Data(B),
+        // Data(A) must come back as three ops in exactly that order, each
+        // carrying only its own channel's bytes.
+        let a = channel_id(1);
+        let b = channel_id(2);
+        let mut stash = DialStash::default();
+        stash.push(data_op(a, b"a1"));
+        stash.push(data_op(b, b"b1"));
+        stash.push(data_op(a, b"a2"));
+
+        let ops = stash.flush();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].client_id, a);
+        assert_eq!(data_payload(&ops[0]), b"a1");
+        assert_eq!(ops[1].client_id, b);
+        assert_eq!(data_payload(&ops[1]), b"b1");
+        assert_eq!(ops[2].client_id, a);
+        assert_eq!(data_payload(&ops[2]), b"a2");
+    }
+
+    #[test]
+    fn a_control_op_is_never_merged_and_seals_the_run_before_it() {
+        // Data(A), Close(A), Data(A): the Close is a barrier, not part of the
+        // byte stream, so it must land between the two buffers in order. The
+        // same barrier applies when the control op is for another channel.
+        let a = channel_id(1);
+        let b = channel_id(2);
+        let mut stash = DialStash::default();
+        stash.push(data_op(a, b"x"));
+        stash.push(AgentOp::new(a, AgentOpKind::Close));
+        stash.push(data_op(a, b"y"));
+        stash.push(AgentOp::new(b, AgentOpKind::Eof));
+        stash.push(data_op(b, b"z"));
+
+        let ops = stash.flush();
+        assert_eq!(ops.len(), 5, "control ops must never be folded away");
+        assert_eq!((ops[0].client_id, ops[2].client_id), (a, a));
+        assert_eq!(data_payload(&ops[0]), b"x");
+        assert!(matches!(ops[1].kind, AgentOpKind::Close));
+        assert_eq!(data_payload(&ops[2]), b"y");
+        assert!(matches!(ops[3].kind, AgentOpKind::Eof));
+        assert_eq!(ops[4].client_id, b);
+        assert_eq!(data_payload(&ops[4]), b"z");
+    }
 }

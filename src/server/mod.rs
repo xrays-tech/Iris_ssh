@@ -1286,6 +1286,15 @@ impl server::Handler for GatewaySession {
     /// case — `target` is session-wide and sticky, so returning `current` would
     /// leave a collapsed session collapsed forever; instead the first packet
     /// after the dial flips it back to full speed.
+    ///
+    /// That flip is not instantaneous, and the cost is deliberate. `target` is
+    /// only consulted when russh tops the window up, and the WINDOW_ADJUST it
+    /// sends is computed against the target it had *before* the call, so
+    /// recovery takes two more packets on this channel: the first one flips the
+    /// target to `full` (its own adjust is still the collapsed couple of
+    /// bytes), the second one earns the adjust that restores the full window.
+    /// An interactive session sees that as its first one or two keystrokes
+    /// after the backend is up; a bulk transfer sees a couple of milliseconds.
     fn adjust_window(&mut self, channel: ChannelId, _current: u32) -> u32 {
         let full = self.ctx.config.relay.window_size;
         let dialing = self
