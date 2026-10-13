@@ -184,16 +184,22 @@ async fn pump_backend_to_client(mut bch: Channel<client::Msg>, up: ServerUpstrea
 - 一条客户端连接 lazily 建立一条后端连接，多 channel 复用（scp/rsync 走 ControlMaster 复用连接时天然受益）。
 - 会话状态机：`Handshake → Auth → Authorized → ChannelOpen(懒拨号) → RequestRelaying(执行型请求前) → DataFlow(执行型请求后) → Closed`；任意一侧断开联动关闭另一侧，审计落盘（session-id 用 UUIDv7 串联两侧日志）。
 
-### 3.5.1 单顺序消费者例外（agent 穿透模式，红线 11）
+### 3.5.1 单顺序消费者（唯一数据面架构，红线 11）
 
-**动机。** §3.5 的设计前提是「handler 侧同步处理，不做跨会话异步等待」。agent 穿透打破了这个前提：网关必须作为 SSH 客户端，向用户端发起 `channel_open_agent()`、建立 `AgentClient`、`request_identities()` 并在需要签名时调用 `sign_request()` —— 这些都是 **await**，且必须发生在用户端连接的 session 事件循环之上。若在 `agent_request()`/handler 回调里直接 await，会阻塞 russh 的单线程串行事件循环，导致后端/用户端后续消息无法推进，形成**自锁死锁**（D11 违例）。
+**定位（升级：从"例外"到"唯一数据面"）。** 本节不再是例外条款。后端认证已固定为 agent 穿透 —— `backend_auth = "key"`/`"cert"`、`credential_map`、key 文件、cert-dial、`[ca] signing_key`、jump/direct-tcpip 全部删除 —— 因此每条用户端连接只有一种数据通路：handler 侧只做 tap 与非阻塞入队，「agent 通道生命周期 + 后端拨号 + 队列消费 + 每 channel 转发」整体跑在一个 **per-session supervisor task** 里。原来"非 agent 路径字节级不变"的限定词随之作废：内联 relay 分支已删除，`agent_mode()` 判断也不复存在。
 
-**例外条款。** agent 模式下，允许把「agent 通道生命周期 + 后端拨号 + 队列消费」整体搬进一个 **per-session supervisor task**，handler 侧只做非阻塞入队。该例外受以下四条限定词约束，任一违反即视为越过红线 11：
+**为什么必须是 task 而不是 handler。** 网关必须作为 SSH 客户端向用户端发起 `channel_open_agent()`、建立 `AgentClient`、`request_identities()`，在需要签名时 `sign_request()`，再作为 SSH 客户端向后端完成握手 —— 这些都是 **await**，且必须发生在用户端连接的 session 事件循环之上。若在 `agent_request()`/handler 回调里直接 await，会阻塞 russh 的单线程串行事件循环，后端与用户端的后续消息都无法推进，形成**自锁死锁**（D11 违例）。
 
-1. **作用域仅限 agent 模式。** supervisor 只在 `backend_auth = "agent"` 且 `allow_agent_backend_auth = true` 时存在；非 agent 路径（key/cert）**字节级不变**，不引入任何新的 task、channel 或 await 点。
-2. **每会话单一顺序消费者。** 每条用户端连接至多一个 supervisor task、一个 FIFO 队列。禁止 per-request spawn、禁止多消费者合并、禁止乱序消费、禁止注入请求。FIFO 串行消费保证 I1（channel ↔ 后端 1:1 绑定）不被破坏 —— 签名请求与后续 pty/shell/env/data 的因果顺序由串行消费天然保证。
-3. **handler 侧永不阻塞、内存有界（C5/D11）。** handler 回调内只做 `try_send`（Dialing 状态下队列满 → 该 channel 原生失败并计数，**绝不 await**）；Ready 状态下的 `send().await` 等价于今天的内联背压，不新增缓冲。队列容量 = `ceil(relay.window_size / max_packet)` 槽位，保证入队数据总量 ≤ `relay.window_size`（I2/I3 记忆体上界继续成立）。锁内不 await（D11）：就绪信号用 oneshot/watch，不用 `Mutex` 保护的条件变量。
-4. **失败走协议原生、不回退凭证（I4/红线 3）。** supervisor 任一环节失败（grant 超时、agent 通道被拒、无匹配指纹身份、`connect_agent` 认证失败、后端通道建立失败）→ 排空队列并对 pending 请求回 `Handle::channel_failure`、再 `Handle::close`，**绝不**回退到 `backend_auth = "key"`/`"cert"`，也绝不静默降级。签名面最小化（红线 4）：只对 resolve 出的目标拨号签名，且只用与 `grant.fingerprint` 匹配的 agent 身份。
+**连接模型。** 一条用户端连接 → 一个 supervisor task → **一条**后端 `Handle`（russh client transport 的生命周期绑定该 Handle，不可丢弃）→ `HashMap<ChannelId, Arc<ChannelRelay>>` → 每个客户端 channel 一条后端 session channel、一个 `pump_backend_to_client`。channel 在 handler 侧立即 accept 并记录，`OpenChannel{client_id, tap}` 入队，由 supervisor 映射到后端；后端握手尚未完成时到达的 channel 照样入队等待，握手失败时统一被关闭（I4）。因此 §3.6 的"每 channel 有界"推广为**每连接 `channels_per_conn × window`** 的上界，`channels_per_conn` 由 handler 强制（超限 → `ResourceShortage` + `sshgw_agent_channel_denied_total`）。
+
+以下四条限定词任一违反即视为越过红线 11：
+
+1. **每会话单一顺序消费者。** 每条用户端连接至多一个 supervisor task、一个 FIFO 队列。禁止 per-request spawn、禁止多消费者合并、禁止乱序消费、禁止注入请求。
+2. **per-channel FIFO（I1）。** FIFO 串行消费保证同一 channel 上签名请求与后续 pty/shell/env/data 的因果顺序不被打乱；跨 channel 顺序**不是**不变量 —— 每个 channel 有自己的 relay 与自己的 down-pump。
+3. **handler 侧永不阻塞、内存有界（C5/D11）。** handler 回调内只做 `try_send`（Dialing 状态下队列满 → 该 channel 原生失败并计数，**绝不 await**）；Ready 状态下的 `send().await` 等价于原来的内联背压，不新增缓冲。队列容量 = `ceil(relay.window_size / max_packet) + 64` 槽位（64 个空载控制槽供 pty/env/OpenChannel 排队），保证入队数据总量 ≤ `relay.window_size`（I2/I3 记忆体上界继续成立）。锁内不 await（D11）：就绪信号用 `AtomicU8` + `Notify`，不用 `Mutex` 保护的条件变量。
+4. **失败走协议原生、不回退凭证（I4/红线 3）。** supervisor 任一环节失败（grant 超时、agent 通道被拒、无匹配指纹身份、`connect_agent` 认证失败、后端通道建立失败）→ 排空队列并对 pending 请求回 `Handle::channel_failure`、再 `Handle::close` 已 accept 的 channel，**绝不**回退到任何网关自有凭证（它们已不存在），也绝不静默降级。
+
+**签名面最小化（红线 4）。** 只对 resolve 出的目标拨号签名，且只用与 `grant.fingerprint` 匹配的 agent 身份；唯一那次签名成功后**立即关闭转发过来的 agent 通道**，签名窗口只有一个签名那么宽。用户本地 agent 不受影响。
 
 **可观测性。** 上述失败均需可观测：`auth_kind="agent"` 进入审计与指标，`sshgw_agent_signatures_total`、`sshgw_agent_channel_denied_total` 与 `agent_identity`（指纹）随审计记录落盘。
 
@@ -266,11 +272,11 @@ Checkout 防护：
  - 默认模式仍是每会话独连，池化 opt-in
 ```
 
-> **落地口径（agent 穿透落地时收紧为互斥）**：上表的「池化连接上禁用 agent forwarding」在实现中被收紧为 **`[backend] backend_auth = "agent"` 与 `[pool] enabled = true` 直接互斥、启动即报错**，而不是运行时对池化连接禁用转发。
+> **落地口径（已收紧为无条件互斥）**：上表的「池化连接上禁用 agent forwarding」不再是运行时规则。agent-only 改造之后后端凭证只有一种，池化连接的"下一条 channel 属于哪个用户、该用哪把身份"问题无从调和，因此 **`[pool] enabled = true` 直接是配置错误、启动即报错**（`src/config.rs`），而不是在运行时对池化连接禁用转发。
 >
-> 原因是语义而非保守：agent 穿透的身份是 **per-session 的**（每个终端用户自己的 agent、自己被授权的指纹），而池化连接是 **per-target 跨会话共享的**，一条共享连接无法携带"下一条 channel 属于哪个用户、该用哪把 key 签名"这样的身份。运行时"对池化连接禁用转发"会让同一份配置在池开/关时给出两种后端凭据，属于静默降级的一种，正是 plan-agent-passthrough 红线 3 要避免的形状。因此选择在配置校验期一次性拒绝（`src/config.rs` 的 `agent_backend_auth_is_incompatible_with_pooling`），把矛盾暴露在部署时而不是用户会话里。
+> 原因是语义而非保守：agent 穿透的身份是 **per-session 的**（每个终端用户自己的 agent、自己被授权的指纹），而池化连接是 **per-target 跨会话共享的**，一条共享连接无法携带"下一条 channel 属于哪个用户、该用哪把 key 签名"这样的身份。运行时禁用会让同一份配置在池开/关时给出两种后端行为，属于静默降级的一种，正是红线 3 要避免的形状。因此选择在配置校验期一次性拒绝，把矛盾暴露在部署时而不是用户会话里。
 >
-> 两者的连接模型也因此天然分层：非 agent 会话可以选择池化摊薄 RTT，agent 会话独占一条后端连接（正是 §3.5.1 允许单 FIFO 消费者的前提）。
+> 连接模型也随之只剩一种：每会话独占一条后端连接，其上承载 ≤ `channels_per_conn` 条 channel（正是 §3.5.1 单 FIFO 消费者 + 每 channel 一个 relay 的前提）；§3.8 的池化摊薄 RTT 是被放弃的 M2 优化，不再是可选路径。
 
 ---
 
