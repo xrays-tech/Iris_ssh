@@ -32,8 +32,6 @@ pub struct GatewayConfig {
     pub ca: CaConfig,
     /// SFTP command-level interception (B3).
     pub intercept: InterceptConfig,
-    /// Jump mode / direct-tcpip policy (B4).
-    pub jump: JumpConfig,
     /// Session recording (B2).
     pub recording: RecordingConfig,
     pub shutdown: ShutdownConfig,
@@ -223,20 +221,6 @@ pub struct SftpInterceptConfig {
     pub denied_path_prefixes: Vec<String>,
 }
 
-/// Jump-mode (direct-tcpip) configuration (B4).
-#[derive(Debug, Clone)]
-pub struct JumpConfig {
-    /// Master switch. Off = every direct-tcpip request is rejected locally,
-    /// which is the pre-M3 baseline.
-    pub enabled: bool,
-    /// Additional gateway-wide target allow-list (`host`, `host:port`,
-    /// `*:port`). Merged with the per-grant `policy.tcp_forwarding_targets`.
-    pub allowed_targets: Vec<String>,
-    /// Whether loopback/private/link-local destinations may be reached. Off by
-    /// default: the gateway must not become an SSRF pivot into the private net.
-    pub allow_private_networks: bool,
-}
-
 // --------------------------------------------------------------------------
 // Raw TOML structures (fields still strings, validated afterwards).
 // --------------------------------------------------------------------------
@@ -261,8 +245,6 @@ struct RawConfig {
     ca: RawCa,
     #[serde(default)]
     intercept: RawIntercept,
-    #[serde(default)]
-    jump: RawJump,
     #[serde(default)]
     recording: RawRecording,
 }
@@ -310,33 +292,6 @@ struct RawSftpIntercept {
     allowed_path_prefixes: Vec<String>,
     #[serde(default)]
     denied_path_prefixes: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawJump {
-    #[serde(default = "default_jump_enabled")]
-    enabled: bool,
-    #[serde(default)]
-    allowed_targets: Vec<String>,
-    #[serde(default = "default_allow_private_networks")]
-    allow_private_networks: bool,
-}
-
-impl Default for RawJump {
-    fn default() -> Self {
-        RawJump {
-            enabled: default_jump_enabled(),
-            allowed_targets: Vec::new(),
-            allow_private_networks: default_allow_private_networks(),
-        }
-    }
-}
-
-fn default_jump_enabled() -> bool {
-    false
-}
-fn default_allow_private_networks() -> bool {
-    false
 }
 
 #[derive(Debug, Deserialize)]
@@ -945,13 +900,6 @@ impl GatewayConfig {
             },
         };
 
-        // --- M3: jump mode (B4) ---------------------------------------------
-        let jump = JumpConfig {
-            enabled: raw.jump.enabled,
-            allowed_targets: raw.jump.allowed_targets.clone(),
-            allow_private_networks: raw.jump.allow_private_networks,
-        };
-
         // --- M3: session recording (B2 / B5) --------------------------------
         let recording_dir = PathBuf::from(raw.recording.dir.trim());
         if recording_dir.as_os_str().is_empty() {
@@ -976,7 +924,6 @@ impl GatewayConfig {
             limits,
             ca,
             intercept,
-            jump,
             recording,
             shutdown,
             metrics: MetricsConfig { addr: metrics_addr },

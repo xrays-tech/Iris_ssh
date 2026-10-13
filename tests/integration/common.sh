@@ -163,3 +163,11 @@ assert_ordered() {
 
 # strip CR (pty output carries CRLF) from a var
 decr() { printf '%s' "$1" | tr -d '\r'; }
+
+# gw_metric_value <metric-name> -> the integer value of a counter on the *main*
+# gateway that run_integration.sh starts. Sub-topology gateways are queried by
+# `subtopo_metric` instead. Prints nothing (and fails) when unavailable.
+gw_metric_value() {
+  curl -fsS --max-time 5 "http://${GW_ADDR:-127.0.0.1}:${GW_METRICS_PORT:-}/metrics" \
+    2>/dev/null | awk -v m="$1" '$1==m {print $2; exit}'
+}

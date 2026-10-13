@@ -65,11 +65,10 @@ struct MetricsInner {
     sftp_requests_seen_total: AtomicU64,
     sftp_requests_denied_total: AtomicU64,
 
-    // M3: jump mode (B4)
-    jump_open_total: AtomicU64,
-    jump_denied_total: AtomicU64,
-    /// jump targets refused because of their address class (SSRF guard).
-    jump_forbidden_address_total: AtomicU64,
+    /// A `direct-tcpip` ("local TCP forwarding") channel open was refused.
+    /// The gateway is never an outbound pivot, so this fires for every such
+    /// request; a rising counter means someone is probing for forwarding.
+    direct_tcpip_denied_total: AtomicU64,
 
     // M3: session recording (B2)
     recorded_bytes_total: AtomicU64,
@@ -85,8 +84,8 @@ struct MetricsInner {
     /// Signature operations the gateway relayed to the user's agent. Bounded by
     /// one per agent-mode session (we offer exactly one authorized identity).
     agent_signatures_total: AtomicU64,
-    /// Channel opens refused *because* agent mode caps the session at one
-    /// channel, or because jump forwarding is unavailable there.
+    /// Channel opens refused because the session's per-connection channel cap
+    /// (`pool.channels_per_conn`) would be exceeded.
     agent_channel_denied_total: AtomicU64,
 
     // disconnect reason histogram, indexed by SSH reason code (0..=15).
@@ -325,20 +324,11 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A `direct-tcpip` channel was opened for the client (B4).
-    pub fn jump_open(&self) {
-        self.inner.jump_open_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A `direct-tcpip` request was refused (B4).
-    pub fn jump_denied(&self) {
-        self.inner.jump_denied_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A `direct-tcpip` target was refused for its address class (B4 SSRF guard).
-    pub fn jump_forbidden_address(&self) {
+    /// A `direct-tcpip` channel open was refused (the gateway is never an
+    /// outbound pivot; there is no policy that can turn this on).
+    pub fn direct_tcpip_denied(&self) {
         self.inner
-            .jump_forbidden_address_total
+            .direct_tcpip_denied_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -403,8 +393,8 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A channel open was refused because agent mode caps the session at one
-    /// channel, or because it does not support jump forwarding.
+    /// A channel open was refused because it would exceed the session's
+    /// per-connection channel cap.
     pub fn agent_channel_denied(&self) {
         self.inner
             .agent_channel_denied_total
@@ -521,18 +511,8 @@ impl Metrics {
         );
         push_counter(
             &mut out,
-            "sshgw_jump_open_total",
-            &self.inner.jump_open_total,
-        );
-        push_counter(
-            &mut out,
-            "sshgw_jump_denied_total",
-            &self.inner.jump_denied_total,
-        );
-        push_counter(
-            &mut out,
-            "sshgw_jump_forbidden_address_total",
-            &self.inner.jump_forbidden_address_total,
+            "sshgw_direct_tcpip_denied_total",
+            &self.inner.direct_tcpip_denied_total,
         );
         push_counter(
             &mut out,

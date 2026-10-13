@@ -470,7 +470,6 @@ ALL_CASES=(
   case_control_plane_failopen
   case_wire_ordering
   case_client_matrix
-  case_jump
   case_sftp_intercept
   case_hostkey_rotation
   case_host_cert_authority

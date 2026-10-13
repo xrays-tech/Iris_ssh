@@ -1206,15 +1206,15 @@ impl server::Handler for GatewaySession {
         Ok(())
     }
 
-    /// Jump mode: a `direct-tcpip` ("local TCP forwarding") channel request (B4).
+    /// `direct-tcpip` ("local TCP forwarding") is always refused.
     ///
-    /// The gateway is an outbound pivot for these, so two gates apply before any
-    /// socket is opened — the jump policy must be enabled **and** the target must
-    /// clear [`crate::jump::authorize_jump_target`] (allow-list plus the
-    /// private/loopback/link-local address-class guard that stops the gateway
-    /// becoming an SSRF foothold in the network behind it). Everything else is
-    /// refused with a protocol-native open failure (I4) — including the
-    /// pre-M3 default, where jump mode is simply off.
+    /// The gateway terminates the client's transport and opens exactly one kind
+    /// of outbound connection: the session's own backend leg. It is not an
+    /// outbound pivot for arbitrary TCP, so there is no policy that can turn
+    /// this on — jump mode was removed with the agent-only backend decision
+    /// (dev-docs/plan-agent-only.md). Refusing explicitly (rather than leaving
+    /// russh's `ChannelOpenHandle` to be dropped) keeps the answer a property of
+    /// the protocol state machine and makes the refusal countable (I4).
     #[allow(clippy::too_many_arguments)]
     async fn channel_open_direct_tcpip(
         &mut self,
@@ -1226,125 +1226,17 @@ impl server::Handler for GatewaySession {
         reply: server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        // C2 agent passthrough: jump forwarding and the agent leg do not
-        // coexist in the MVP — the supervisor owns this session's single
-        // backend channel, so there is nothing to pivot a forwarded TCP
-        // connection through. Refuse natively (I4) and count it.
-        if self.agent_mode() {
-            self.ctx.metrics.agent_channel_denied();
-            tracing::info!(
-                target: "server",
-                originator = originator_address,
-                host = host_to_connect,
-                port = port_to_connect,
-                "refusing direct-tcpip: jump forwarding is unavailable in agent mode"
-            );
-            reply
-                .reject(ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
-            return Ok(());
-        }
-
-        let target = crate::jump::JumpTarget {
-            host: host_to_connect.to_owned(),
-            port: u16::try_from(port_to_connect).unwrap_or(0),
-        };
-        let grant_targets = self
-            .grant
-            .as_ref()
-            .map(|g| g.policy.tcp_forwarding_targets.clone())
-            .unwrap_or_default();
-        let deny = crate::jump::authorize_jump_target(
-            self.ctx.config.jump.enabled,
-            self.ctx.config.jump.allow_private_networks,
-            &self.ctx.config.jump.allowed_targets,
-            &grant_targets,
-            crate::jump::resolve_target(host_to_connect),
-            &target,
+        self.ctx.metrics.direct_tcpip_denied();
+        tracing::info!(
+            target: "server",
+            originator = originator_address,
+            host = host_to_connect,
+            port = port_to_connect,
+            "refusing direct-tcpip: the gateway is never an outbound pivot"
         );
-        if let Err(reason) = deny {
-            self.ctx.metrics.jump_denied();
-            if matches!(reason, crate::jump::JumpDenial::ForbiddenAddress { .. }) {
-                self.ctx.metrics.jump_forbidden_address();
-            }
-            tracing::info!(
-                target: "server",
-                originator = originator_address,
-                host = host_to_connect,
-                port = port_to_connect,
-                %reason,
-                "refusing direct-tcpip request"
-            );
-            reply
-                .reject(ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
-            return Ok(());
-        }
-
-        // Allowed: open the channel toward the backend host, then ask the
-        // backend leg for a matching direct-tcpip channel and relay the two.
-        let Some(grant) = self.grant.clone() else {
-            reply
-                .reject(ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
-            return Ok(());
-        };
-        if self.ensure_backend().await.is_err() {
-            reply.reject(ChannelOpenFailure::ConnectFailed).await;
-            return Ok(());
-        }
-        // Borrow the backend handle only for the async open; the owned channel
-        // that comes back outlives the borrow so `self.relays` can be mutated.
-        let opened = match self.backend.as_ref() {
-            Some(backend) => backend
-                .channel_open_direct_tcpip(
-                    host_to_connect.to_owned(),
-                    port_to_connect,
-                    format!("{}:{}", grant.target.host, grant.target.port),
-                    0,
-                )
-                .await
-                .ok(),
-            None => None,
-        };
-        match opened {
-            Some(channel_half) => {
-                let client_id = _channel.id();
-                let (backend_read, backend_write) = channel_half.split();
-                let bytes = self
-                    .auditor
-                    .as_ref()
-                    .map(|a| a.byte_counters())
-                    .unwrap_or_default();
-                let up = _session.handle();
-                tokio::spawn(relay::pump_backend_to_client(
-                    backend_read,
-                    up,
-                    client_id,
-                    ReplyRouter::default(),
-                    Arc::new(relay::OutboundWindow::uncalibrated()),
-                    Arc::clone(&bytes),
-                    self.ctx.metrics.clone(),
-                    None,
-                ));
-                self.relays.insert(
-                    client_id,
-                    Arc::new(ChannelRelay::new(
-                        client_id,
-                        backend_write,
-                        ReplyRouter::default(),
-                        Arc::new(relay::OutboundWindow::uncalibrated()),
-                        bytes,
-                        self.ctx.metrics.clone(),
-                    )),
-                );
-                self.ctx.metrics.jump_open();
-                reply.accept().await;
-            }
-            None => {
-                reply.reject(ChannelOpenFailure::ConnectFailed).await;
-            }
-        }
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
         Ok(())
     }
 
@@ -2505,167 +2397,6 @@ mod tests {
         );
     }
 
-    /// Build a context with an explicit `[jump]` policy.
-    fn jump_ctx(
-        keys: &mut TestKeyGuard,
-        enabled: bool,
-        allowed: &str,
-        allow_private: bool,
-    ) -> Arc<GatewayContext> {
-        let host_key = keys.add_key();
-        let backend_key = keys.add_key();
-        let toml = format!(
-            r#"
-            [listen]
-            addr = "127.0.0.1:0"
-            [host_keys]
-            keys = [{{ path = "{host_key}", state = "active" }}]
-            [backend]
-            private_key = "{backend_key}"
-            host_key_policy = "accept-new"
-            [control_plane]
-            url = "http://127.0.0.1:1"
-            [jump]
-            enabled = {enabled}
-            allow_private_networks = {allow_private}
-            allowed_targets = [{allowed}]
-        "#
-        );
-        let config = GatewayConfig::parse(&toml).unwrap();
-        GatewayContext::build_with_client(
-            config,
-            Arc::new(FixControlPlane {
-                result: Ok(ok_response()),
-            }),
-        )
-        .unwrap()
-    }
-
-    // ---- M3 B4: jump mode target authorization ----
-
-    #[test]
-    fn jump_is_denied_by_default_config() {
-        let mut keys = TestKeyGuard::new();
-        // Even with a permissive-looking allow-list, the master switch is off.
-        let ctx = jump_ctx(&mut keys, false, "\"*:22\"", false);
-        assert!(!ctx.config.jump.enabled, "jump must default to off");
-        let deny = crate::jump::authorize_jump_target(
-            ctx.config.jump.enabled,
-            ctx.config.jump.allow_private_networks,
-            &ctx.config.jump.allowed_targets,
-            &[],
-            Some(std::net::IpAddr::from([8, 8, 8, 8])),
-            &crate::jump::JumpTarget {
-                host: "8.8.8.8".to_owned(),
-                port: 22,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(deny, crate::jump::JumpDenial::Disabled);
-    }
-
-    #[test]
-    fn jump_allow_list_permits_only_listed_targets() {
-        let mut keys = TestKeyGuard::new();
-        let ctx = jump_ctx(&mut keys, true, "\"db.example.com:5432\"", false);
-        let authorize = |host: &str, port: u16| {
-            crate::jump::authorize_jump_target(
-                true,
-                false,
-                &ctx.config.jump.allowed_targets,
-                &[],
-                Some(std::net::IpAddr::from([8, 8, 8, 8])),
-                &crate::jump::JumpTarget {
-                    host: host.to_owned(),
-                    port,
-                },
-            )
-        };
-        assert!(authorize("db.example.com", 5432).is_ok());
-        // An unlisted host:port must be refused...
-        let err = authorize("db.example.com", 22).unwrap_err();
-        assert!(
-            matches!(err, crate::jump::JumpDenial::NotAllowed { .. }),
-            "an unlisted port must be refused, got {err}"
-        );
-        assert!(
-            authorize("other.example.com", 5432).is_err(),
-            "an unlisted host must be refused"
-        );
-    }
-
-    #[test]
-    fn jump_refuses_private_destinations_even_when_listed() {
-        let mut keys = TestKeyGuard::new();
-        let ctx = jump_ctx(&mut keys, true, "\"*:80\"", false);
-        let deny = crate::jump::authorize_jump_target(
-            true,
-            ctx.config.jump.allow_private_networks,
-            &ctx.config.jump.allowed_targets,
-            &[],
-            Some(std::net::IpAddr::from([169, 254, 169, 254])),
-            &crate::jump::JumpTarget {
-                host: "169.254.169.254".to_owned(),
-                port: 80,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(
-            deny,
-            crate::jump::JumpDenial::ForbiddenAddress {
-                host: "169.254.169.254".to_owned(),
-                port: 80
-            },
-            "the cloud metadata address must never be an SSRF foothold"
-        );
-    }
-
-    #[test]
-    fn grant_policy_targets_extend_the_gateway_allow_list() {
-        // S6 contract: control-plane `policy.tcp_forwarding_targets` union with
-        // the gateway-wide list.
-        let grant_targets = vec!["grant.example.com:443".to_owned()];
-        let ok = crate::jump::authorize_jump_target(
-            true,
-            false,
-            &["gw.example.com:22".to_owned()],
-            &grant_targets,
-            Some(std::net::IpAddr::from([8, 8, 8, 8])),
-            &crate::jump::JumpTarget {
-                host: "grant.example.com".to_owned(),
-                port: 443,
-            },
-        );
-        assert!(ok.is_ok(), "a grant-listed target must be reachable");
-    }
-
-    #[test]
-    fn legacy_policy_without_targets_denies_jump() {
-        // Backward compatibility: a control plane that predates
-        // `tcp_forwarding_targets` (absent field -> empty list) keeps default-deny.
-        let legacy = crate::types::Policy {
-            tcp_forwarding: true,
-            ..Default::default()
-        };
-        assert!(
-            legacy.tcp_forwarding_targets.is_empty(),
-            "an absent list must deserialize to empty"
-        );
-        let deny = crate::jump::authorize_jump_target(
-            true,
-            false,
-            &[],
-            &legacy.tcp_forwarding_targets,
-            Some(std::net::IpAddr::from([8, 8, 8, 8])),
-            &crate::jump::JumpTarget {
-                host: "8.8.8.8".to_owned(),
-                port: 22,
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(deny, crate::jump::JumpDenial::NotAllowed { .. }));
-    }
-
     #[test]
     fn max_auth_attempts_is_wired_into_the_server_config() {
         // The anti-bruteforce cap must come from config, not from russh's built-in
@@ -2813,15 +2544,6 @@ mod tests {
         assert!(
             !ctx.config.intercept.sftp.enabled,
             "SFTP interception must default to off"
-        );
-        assert!(!ctx.config.jump.enabled, "jump mode must default to off");
-        assert!(
-            !ctx.config.jump.allow_private_networks,
-            "the SSRF guard must stay on by default"
-        );
-        assert!(
-            ctx.config.jump.allowed_targets.is_empty(),
-            "an empty jump allow-list must deny everything"
         );
         assert!(
             !ctx.config.recording.dir.as_os_str().is_empty(),

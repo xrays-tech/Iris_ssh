@@ -16,7 +16,6 @@ pub mod backend;
 pub mod ca;
 pub mod config;
 pub mod error;
-pub mod jump;
 pub mod metrics;
 pub mod policy;
 pub mod pool;

@@ -8,9 +8,9 @@
 #      resolved, and only that one (the audit record names it);
 #   2. the agent is never used for anything but that target's authentication —
 #      an agent-mode session is a single-channel, single-target thing;
-#   3. jump forwarding (`direct-tcpip`) is refused in agent mode: there is no
-#      second channel to pivot a forwarded connection through, and inventing one
-#      would widen the surface the agent signature protects.
+#   3. `direct-tcpip` forwarding is refused in agent mode: the gateway is never
+#      an outbound pivot, and a second channel would widen the surface the agent
+#      signature protects.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
@@ -43,7 +43,7 @@ assert_contains "$audit" '"auth_kind":"agent"' "audit record reports auth_kind=a
 assert_contains "$audit" '"target_host":"127.0.0.1"' "audit names the resolved host"
 assert_contains "$audit" "\"target_port\":${ST_SSHD_PORT}" "audit names the resolved port"
 
-# (3) Jump forwarding is unavailable in agent mode and is counted.
+# (3) direct-tcpip forwarding is refused in agent mode and is counted.
 FWD_PORT="$(alloc_port)"
 ssh -p "$ST_GW_PORT" -i "$USER_KEY" -A -N \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
@@ -82,19 +82,19 @@ PY
 then
   cleanup_fwd
   tail_log "$SUBTOPO_DIR/gw.log" 40
-  fail "agent mode accepted a direct-tcpip jump — the agent signature must not \
+  fail "agent mode accepted a direct-tcpip forward — the agent signature must not \
 be reachable through a second channel"
 else
   cleanup_fwd
-  pass "agent mode refused the direct-tcpip jump"
+  pass "agent mode refused the direct-tcpip forward"
 fi
 
-denied="$(agent_topo_metric_value sshgw_agent_channel_denied_total)"
+denied="$(agent_topo_metric_value sshgw_direct_tcpip_denied_total)"
 # The probe retries until the refusal lands, so it can trip more than once.
-[ "${denied:-0}" -ge 1 ] || fail "expected at least one denied channel in agent mode, got [${denied:-}]"
-pass "sshgw_agent_channel_denied_total=$denied"
+[ "${denied:-0}" -ge 1 ] || fail "expected at least one refused direct-tcpip open, got [${denied:-}]"
+pass "sshgw_direct_tcpip_denied_total=$denied"
 
-# (2) The successful dial still happened exactly once: the jump was refused
+# (2) The successful dial still happened exactly once: the forward was refused
 # before it could consume a second signature.
 ok_total="$(agent_topo_metric_value sshgw_agent_backend_auth_ok_total)"
 sig_total="$(agent_topo_metric_value sshgw_agent_signatures_total)"

@@ -33,18 +33,11 @@ SUBTOP_TTL_JITTER="${SUBTOP_TTL_JITTER:-3s}"
 SUBTOP_WINDOW="${SUBTOP_WINDOW:-1MB}"
 SUBTOP_KEEPALIVE_INTERVAL="${SUBTOP_KEEPALIVE_INTERVAL:-15s}"
 SUBTOP_KEEPALIVE_MAX_MISS="${SUBTOP_KEEPALIVE_MAX_MISS:-2}"
-# B4 jump / B3 sftp-intercept drivers (defaults keep every existing case unchanged).
-SUBTOP_JUMP_ENABLED="${SUBTOP_JUMP_ENABLED:-false}"
-SUBTOP_JUMP_TARGETS="${SUBTOP_JUMP_TARGETS:-}"          # space-separated host[:port]
-SUBTOP_JUMP_ALLOW_PRIVATE="${SUBTOP_JUMP_ALLOW_PRIVATE:-false}"
+# B3 sftp-intercept drivers (defaults keep every existing case unchanged).
 SUBTOP_SFTP_ENABLED="${SUBTOP_SFTP_ENABLED:-false}"
 SUBTOP_SFTP_DENY="${SUBTOP_SFTP_DENY:-}"                # space-separated SFTP cmd names
 SUBTOP_SFTP_ALLOW_PREFIX="${SUBTOP_SFTP_ALLOW_PREFIX:-}"
 SUBTOP_SFTP_DENY_PREFIX="${SUBTOP_SFTP_DENY_PREFIX:-}"
-# B4: when true, the default resolve rule carries policy.tcp_forwarding=true and a
-# policy.tcp_forwarding_targets entry for the sub-topology backend, and that same
-# "127.0.0.1:$ST_SSHD_PORT" is auto-added to [jump] allowed_targets.
-SUBTOP_TCP_FORWARDING="${SUBTOP_TCP_FORWARDING:-false}"
 # Overridable host key (for rotation rehearsal); defaults to the shared asset key.
 SUBTOP_HOSTKEY="${SUBTOP_HOSTKEY:-$IT_ASSET_DIR/hostkey_ed25519}"
 # M4 backend-cert topology knobs (all default off -> identical to prior behaviour).
@@ -120,11 +113,7 @@ subtopo_start() {
   if [ -n "${SUBTOP_RULES:-}" ]; then
     cp "$SUBTOP_RULES" "$SUBTOPO_DIR/rules.json"
   else
-    local _pol_extra="" _bktgt="127.0.0.1:${ST_SSHD_PORT}"
-    if [ "$SUBTOP_TCP_FORWARDING" = "true" ]; then
-      _pol_extra=",\"tcp_forwarding\":true,\"tcp_forwarding_targets\":[\"127.0.0.1:${ST_SSHD_PORT}\"]"
-      case " $SUBTOP_JUMP_TARGETS " in *" $_bktgt "*) : ;; *) SUBTOP_JUMP_TARGETS="$SUBTOP_JUMP_TARGETS $_bktgt" ;; esac
-    fi
+    local _pol_extra=""
     if [ "$SUBTOP_AGENT_FORWARDING" = "true" ]; then
       _pol_extra="$_pol_extra,\"agent_forwarding\":true"
     fi
@@ -147,11 +136,9 @@ subtopo_start() {
     "$IT_ASSET_DIR/backend_ed25519" "$_ba" "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
     "$ST_CP_PORT" "$SUBTOP_CACHE_TTL"     "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
 
-  # B4 jump + B3 sftp-intercept sections (defaults are inert; older gateways that
-  # predate these fields simply ignore the unknown sections).
+  # B3 sftp-intercept section (defaults are inert; older gateways that predate
+  # these fields simply ignore the unknown sections).
   {
-    printf '[jump]\nenabled=%s\nallowed_targets=%s\nallow_private_networks=%s\n' \
-      "$SUBTOP_JUMP_ENABLED" "$(toml_arr "$SUBTOP_JUMP_TARGETS")" "$SUBTOP_JUMP_ALLOW_PRIVATE"
     printf '[intercept.sftp]\nenabled=%s\ndeny_commands=%s\nallowed_path_prefixes=%s\ndenied_path_prefixes=%s\n' \
       "$SUBTOP_SFTP_ENABLED" "$(toml_arr "$SUBTOP_SFTP_DENY")" \
       "$(toml_arr "$SUBTOP_SFTP_ALLOW_PREFIX")" "$(toml_arr "$SUBTOP_SFTP_DENY_PREFIX")"

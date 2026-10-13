@@ -25,7 +25,6 @@ ssh alex_host1@gw.example.com
 - **会话语义完整**：exec / shell / scp / sftp / stderr（extended data）/ exit status / rekey / 信号全部按 SSH 协议原样透传；不伪造成功、不注入协议行为（I4）。
 - **审计与录制**：按通道录制抓包（`.srec`，默认关闭）；字节计数与操作事件写审计。
 - **SFTP 命令级拦截**（默认关）：可拒绝特定命令（如 `REMOVE`/`RENAME`）并按路径前缀控制。
-- **jump / 端口转发（direct-tcpip）**（默认关）：需要目标在白名单且过地址类闸门（回环/内网/CGNAT/云元数据地址默认拒绝，防 SSRF）。
 - **可观测**：`/healthz`、`/readyz`、`/metrics`（Prometheus 文本格式）。
 - **优雅停机**：SIGTERM 排水后向客户端发协议级 `DISCONNECT[BY_APPLICATION]`。
 
@@ -95,7 +94,7 @@ scp -P 2222 build.tar alex_host1@gw.example.com:/tmp/
 sftp -P 2222 alex_host1@gw.example.com
 ```
 
-被连载的会话、端口转发等行为和直连后端基本一致（`[jump]` / 端口转发默认是拒绝的，要放行需显式配置）。
+被连载的会话行为和直连后端基本一致；端口转发（`direct-tcpip`）一律拒绝——网关不是出站跳板。
 
 观察运行状态：
 

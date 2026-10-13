@@ -60,4 +60,11 @@ case "$result" in
   *)
     fail "unexpected probe result: $result" ;;
 esac
+
+# The refusal is unconditional (jump mode was removed with the agent-only
+# backend decision): there is no config that can turn forwarding on, and the
+# gateway counts every attempt.
+denied="$(gw_metric_value sshgw_direct_tcpip_denied_total)"
+[ "${denied:-0}" -ge 1 ] || fail "expected sshgw_direct_tcpip_denied_total >= 1, got [${denied:-}]"
+pass "sshgw_direct_tcpip_denied_total=$denied"
 echo "OK: case_port_forward_denied"

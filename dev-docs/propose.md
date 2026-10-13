@@ -27,7 +27,6 @@
 | L4 纯 TCP 转发 | ❌ | 否决 |
 | OpenSSH ForceCommand | ✅（shell 层） | 过渡备选 |
 | **russh 双会话管道** | ✅ | **✅ 采用** |
-| Jump 模式（direct-tcpip） | ❌ 需 `-J` | M3 可选模式 |
 | libssh 绑定 / 自研协议栈 | ✅ | 备选 / 否决 |
 
 选型：`russh`（纯 Rust + tokio，server/client 双角色，aes-gcm/chacha20、curve25519、ed25519、OpenSSH 私钥加载）。
@@ -106,7 +105,7 @@ POST /api/v1/resolve  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA25
 | `env` | 原样（可配白名单过滤） | 多数客户端 want_reply=0，仍按 FIFO 透传 |
 | `window-change` / `signal` / `break@openssh.com` | 原样 | 无回执语义 |
 | `auth-agent-req@openssh.com` | **默认拒绝**：本地 request_failure | 不转发后端 |
-| `x11-req` / `direct-tcpip` / `forwarded-tcpip` | **默认拒绝** | jump 模式（M3）下按策略放开并校验目标 |
+| `x11-req` / `direct-tcpip` / `forwarded-tcpip` | **一律拒绝** | 网关不是出站跳板，无配置可放开（jump 模式已随 agent-only 决策移除） |
 | 后端 → `exit-status` / `exit-signal` / `eof` / `close` | 回传客户端 | `ssh gw 'exit 42'` 必须拿到 42 |
 | 全局请求 `keepalive@openssh.com`（客户端→网关） | 网关本地应答 success | M2 可配端到端转发到后端做活链路检测 |
 | 全局请求 `hostkeys-00@openssh.com` | **网关应答本侧全部 host 公钥** | 支撑 host key 轮换（见 6.3），不转发后端 |
@@ -401,7 +400,7 @@ JSON 日志 + Prometheus 指标：active sessions、auth 成败（含 offered/�
 
 - **M1（3 周）**：端到端 shell/exec/sftp 打通；**严格 FIFO 管线 + 保序测试**；**背压保险丝 + 内存准入**；外部解析/授权 + 认证授权边界（含坏签名测试）；审计分类；优雅退出基础版；集成测试框架。
 - **M2（2~3 周）**：连接池 + **keepalive 假死检测 + 熔断**；**host key 多密钥 + 轮换流程与 hostkeys-00**；稳定性（keepalive、rekey、限流）；性能基准调优。
-- **M3**：Host/用户 CA、会话录制、SFTP 拦截器实现、jump 模式（direct-tcpip）、HA 演练。
+- **M3**：Host/用户 CA、会话录制、SFTP 拦截器实现、HA 演练。
 
 ---
 

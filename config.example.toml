@@ -47,8 +47,7 @@ env_allowlist = []      # empty = pass env through (M1); non-empty filters names
 #           credential of its own, and if the agent cannot produce the authorized
 #           identity the session fails instead of falling back to one.
 #           Agent mode is one backend connection for the whole session, so it is
-#           mutually exclusive with `[pool] enabled = true`; it also disables
-#           `direct-tcpip` (jump forwarding) on that session.
+#           mutually exclusive with `[pool] enabled = true`.
 [backend]
 private_key = "/etc/ssh-gw/backend_root_ed25519"   # default key
 # credential_map maps a backend username to its key path (overrides private_key).
@@ -159,12 +158,7 @@ deny_commands = ["REMOVE", "RENAME"]
 # allowed_path_prefixes = ["/data/"]      # empty = all paths allowed
 # denied_path_prefixes = ["/data/secret"]
 
-# --- M3: jump mode / direct-tcpip (B4) ---------------------------------------
-# Default off: every direct-tcpip request is refused locally, exactly as before
-# M3. With it on, a target must appear in an allow-list AND pass the address-class
-# guard (loopback/private/link-local/CGNAT + the cloud metadata address are
-# refused unless `allow_private_networks` is set).
-[jump]
-enabled = false
-allow_private_networks = false
-# allowed_targets = ["db.example.com:5432", "*:22"]
+# NOTE: `direct-tcpip` / `forwarded-tcpip` (local/remote port forwarding) is
+# always refused. The gateway is never an outbound pivot; there is no
+# configuration that turns forwarding on. Every attempt is counted as
+# `sshgw_direct_tcpip_denied_total`.

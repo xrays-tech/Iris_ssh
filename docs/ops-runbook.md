@@ -14,7 +14,7 @@
   网关 Server(认证/解析) → 授权 → 双会话中继 Relay → 后端 sshd(目标)
         │        │
         │        └─ Resolver → 控制面 POST /api/v1/resolve（策略决策）
-        └── 审计 / 指标 / 拦截器（SFTP/录制/jump）
+        └── 审计 / 指标 / 拦截器（SFTP/录制）
 ```
 
 - **会话生命周期**：`TCP → KEX(网关 host key) → userauth(alex_host1, 公钥/证书) → resolve+authorize → channel_open(懒拨号后端) → 数据双向中继 → 关闭联动`。
@@ -87,7 +87,6 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | `[ca]` | `trusted_ca_keys` / `signing_key` / `cert_lifetime` | 注释 | 证书 CA（见 §5.4） |
 | `[recording]` | `dir` / `max_bytes_per_session` | `/var/lib/ssh-gateway/recordings` / `64MiB` | 会话录制（`0` 关闭） |
 | `[intercept.sftp]` | `enabled` / `deny_commands` / 路径前缀 | `false` | SFTP 命令级拦截 |
-| `[jump]` | `enabled` / `allow_private_networks` / `allowed_targets` | `false` | direct-tcpip 跳板（默认拒绝） |
 
 ---
 
@@ -144,7 +143,7 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 | **`sshgw_relay_window_budget_bytes`** | **预留窗预算**（`active_sessions×window×2`，非实时在途） | 按内存预算容量规划；**勿当实时缓冲** |
 | `sshgw_window_exhausted_total` | 背压熔断触发 | 持续增加=慢消费者或窗口过小 |
 | `sshgw_sftp_requests_seen_total` / `denied_total` | SFTP 拦截 | denied 突增=策略命中 |
-| `sshgw_jump_open_total` / `denied_total` / `forbidden_address_total` | jump 模式 | forbidden 突增=扫描 |
+| `sshgw_direct_tcpip_denied_total` | 端口转发拒绝（恒拒绝） | 突增=客户端在探测转发能力 |
 | `sshgw_pool_dead_detected_total` / `tracked_conns` | 池健康 | 池化场景启用 |
 | `sshgw_recorded_sessions_total` / `bytes_total` | 录制 | 磁盘配额预警 |
 | `sshgw_cert_auth_accept_total` / `reject_total` | 证书认证 | reject 突增=证书问题 |
@@ -164,7 +163,7 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 | RSS 持续上涨 | `relay_window_budget_bytes` / 慢消费者 | 调 `window_size` / `max_packet`、排查背压 |
 | SFTP 操作被拒绝 | `sftp_requests_denied_total` + 拦截配置 | 检查 `[intercept.sftp] deny_commands/路径` |
 | 认证总失败 | `auth_*` 指标 + 审计（指纹/签名算法/principal） | 核对 key/证书与授权策略 |
-| 端口转发不通 | jump 默认拒绝 | 需 `[jump] enabled` + 白名单 + 地址类护栏；**agent 会话永远拒绝跳板**（见 §5.7） |
+| 端口转发不通 | 设计如此 | `direct-tcpip` **恒拒绝**，无任何配置可放开；网关不是出站跳板 |
 | `-A` 会话立刻失败 | `agent_backend_auth_fail_total` + 网关日志中的 reason | 见 §5.7 排障表 |
 | `-A` 会话成功但客户端挂住不退出 | 网关未关闭转发的 agent 通道 | 属缺陷；升级到含 C2 修复的版本 |
 
