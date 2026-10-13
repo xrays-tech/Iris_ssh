@@ -79,7 +79,7 @@ struct MetricsInner {
     agent_backend_auth_ok_total: AtomicU64,
     /// Agent-mode sessions that could not authenticate to the backend. Every
     /// one of these ends in a protocol-native channel close — never in a
-    /// fallback to the gateway's own key or certificate.
+    /// fallback to another credential, because the gateway holds none (D3).
     agent_backend_auth_fail_total: AtomicU64,
     /// Signature operations the gateway relayed to the user's agent. Bounded by
     /// one per agent-mode session (we offer exactly one authorized identity).

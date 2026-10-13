@@ -156,9 +156,10 @@ pub struct Auditor {
     /// mutability so `Arc<Auditor>` handles (the serial handler *and* the
     /// detached up-pump task) can record without exclusive access.
     command: Mutex<Option<CommandInfo>>,
-    /// How the gateway authenticated *to the backend* for this session:
-    /// `"key"`/`"cert"` (the gateway's own credential) or `"agent"` (the end
-    /// user's forwarded agent — plan-agent-passthrough C2).
+    /// How the session authenticated *to the backend*: `"agent"` when the end
+    /// user's forwarded agent signed (plan-agent-passthrough C2 — the only
+    /// credential the gateway has since plan-agent-only D3), or `"none"` on a
+    /// session that has not opened a backend channel yet.
     auth_kind: Mutex<String>,
     /// The agent identity fingerprint used for `"agent"`, when there was one.
     agent_identity: Mutex<Option<String>>,
@@ -185,7 +186,7 @@ impl Auditor {
             started_at: Instant::now(),
             bytes: Arc::new(ByteCounters::default()),
             command: Mutex::new(None),
-            auth_kind: Mutex::new("key".to_owned()),
+            auth_kind: Mutex::new("none".to_owned()),
             agent_identity: Mutex::new(None),
             agent_signatures: AtomicU64::new(0),
             metrics,
@@ -197,9 +198,11 @@ impl Auditor {
         Arc::clone(&self.bytes)
     }
 
-    /// Record which credential the gateway used to reach the backend. The
-    /// default is `"key"`; agent mode sets `"agent"` (C2), which is what makes
-    /// an agent-forwarded session distinguishable in the audit trail.
+    /// Record which credential the session used to reach the backend. Every
+    /// backend channel sets `"agent"` (C2) before its dial starts — even if
+    /// that dial then fails — so the record says which credential was
+    /// attempted; the `"none"` default survives only on a session that never
+    /// opened one.
     pub fn set_auth_kind(&self, kind: &str) {
         let mut guard = self.auth_kind.lock().unwrap_or_else(|e| e.into_inner());
         *guard = kind.to_owned();
@@ -299,11 +302,12 @@ pub struct AuditRecord {
     pub target_user: String,
     pub command_class: String,
     pub command: Option<String>,
-    /// How the gateway authenticated to the backend: `"key"`/`"cert"` for its
-    /// own credential, `"agent"` when the end user's forwarded agent signed
-    /// (plan-agent-passthrough C2). An auditor must be able to tell a
-    /// user-signed session from a gateway-signed one without cross-referencing
-    /// anything (red line 10).
+    /// How the session authenticated to the backend: `"agent"` when the end
+    /// user's forwarded agent signed (plan-agent-passthrough C2 — the only
+    /// credential that exists since plan-agent-only D3), `"none"` on a session
+    /// that never opened a backend channel. An auditor must be able to tell a
+    /// user-signed session apart without cross-referencing anything (red line
+    /// 10).
     pub auth_kind: String,
     /// The `SHA256:` fingerprint of the agent identity that signed, when
     /// `auth_kind == "agent"`.

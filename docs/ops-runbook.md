@@ -135,7 +135,8 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 |---|---|---|
 | `sshgw_active_sessions` | 活跃会话数 | 与 `max_sessions` 对比，>80% 预警 |
 | `sshgw_auth_accept_total` / `reject_total` / `offered_total` | 认证结果（offered/最终两阶段） | reject 突增 / offered 幻增（爆破） |
-| `sshgw_resolve_ok_total` / `err_total` / `cache_hit_total` / `miss_total` / `circuit_open_total` | 控制面解析 | err 率突增 / circuit_open>0 |
+| `sshgw_resolve_ok_total` / `err_total` | 控制面解析 | err 率突增 |
+| ~~`sshgw_resolve_cache_hit_total` / `miss_total` / `circuit_open_total`~~ | **已导出但从未累加**（解析器尚未接线），恒为 0 | 勿据此告警 |
 | `sshgw_backend_dial_ok_total` / `fail_total` / `latency_seconds` | 后端拨号 | fail 上升 / P95 上升 |
 | `sshgw_backend_lost_total` | 后端假死检出 | >0 即查 |
 | `sshgw_disconnect_reason_total` | 断开原因直方图（含 `reason="11"` 排水） | 异常原因激增 |
@@ -143,8 +144,8 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 | `sshgw_window_exhausted_total` | 背压熔断触发 | 持续增加=慢消费者或窗口过小 |
 | `sshgw_sftp_requests_seen_total` / `denied_total` | SFTP 拦截 | denied 突增=策略命中 |
 | `sshgw_direct_tcpip_denied_total` | 端口转发拒绝（恒拒绝） | 突增=客户端在探测转发能力 |
-| `sshgw_pool_dead_detected_total` / `tracked_conns` | 池健康 | 池化场景启用 |
-| `sshgw_recorded_sessions_total` / `bytes_total` | 录制 | 磁盘配额预警 |
+| ~~`sshgw_pool_dead_detected_total` / `tracked_conns`~~ | 池已不可启用（`enabled=true` 即配置错误），且从未接线，恒为 0 | 勿据此告警；拨号健康看上面的 `backend_dial_*` 与 `backend_lost` |
+| `sshgw_recorded_sessions_total` / `bytes_total` | 录制 | 磁盘配额预警（`sessions_total` 已接线；**`bytes_total` 目前恒为 0**，配额看磁盘用量） |
 | `sshgw_cert_auth_accept_total` / `reject_total` | 证书认证 | reject 突增=证书问题 |
 | `sshgw_agent_backend_auth_ok_total` / `fail_total` | agent 模式后端认证结果 | fail>0 且 ok 不动=用户 agent 未转发/缺 key |
 | `sshgw_agent_signatures_total` | 经网关中继的 agent 签名次数 | 与 `ok_total` 长期偏离=会话复用异常 |

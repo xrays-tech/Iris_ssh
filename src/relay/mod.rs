@@ -598,22 +598,6 @@ pub fn apply_tap_down(
     }
 }
 
-/// Forward an `exec` request (raw command bytes), enqueuing the reply slot
-/// *before* the send (I2). Returns the receiver the request-path driver awaits.
-pub async fn forward_exec(
-    relay: &ChannelRelay,
-    want_reply: bool,
-    command: &[u8],
-) -> Result<Option<oneshot::Receiver<bool>>, String> {
-    let rx = relay.router.push(want_reply);
-    relay
-        .backend
-        .exec(want_reply, command.to_vec())
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(rx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
