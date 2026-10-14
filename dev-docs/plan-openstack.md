@@ -1,5 +1,12 @@
 # Plan — OpenStack 实例 UUID 即路由（instance_uuid as SSH username）
 
+> **决策（2026-10-14）：采用方案 B** —— `routing="openstack_only"` +
+> `authorization="openstack_only"` + `allow_any_authenticated_key=true`
+> （显式实验室模式，默认关闭；无需控制面，`[control_plane]` 可整体省略）。
+> 后果：该网关注定只服务 UUID 用户名，非 UUID 用户名一律拒绝（无 CP 回退）；
+> 任何通过前腿验签的密钥 + 已知 project 内 UUID → 可达该实例（受 application
+> credential 的 project scope 限制）。方案 A（控制面授权）不再实施，仅保留对比说明。
+
 Status: 设计提案（analysis/design only，不写代码）。基线 HEAD `62c3945`
 （agent-only：后端只用客户端 `ssh -A` 转发的 agent 签名认证；用户名即路由，
 经控制面 `POST /api/v1/resolve` 解析目标）。待 @oracle 复审 O2/O3 的 diff。
