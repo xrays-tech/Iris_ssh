@@ -73,6 +73,9 @@ POST /api/v1/resolve  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA25
 - `route_for(principal, routing, openstack_enabled)` 是**纯谓词**（无 I/O）：
   规范小写 v4 实例 UUID → Nova；`routing="hybrid"` 时其余走控制面，
   `routing="openstack_only"` 时其余**在任何网络调用之前**就拒绝（无控制面回退）。
+  **当前只有 `openstack_only` 能被启用**：`hybrid` 与 `authorization="control_plane"`
+  的组合在 `enabled=true` 时被配置校验拒绝——控制面授权的方案 A（CP 授权、Nova 只换
+  地址）尚未实现，否则会出现"UUID 经 Nova 解析却从未被控制面授权"的静默越权。
 - `[control_plane]` 因此在 `openstack_only` 下可整节省略——这是 O3 把
   `require_control_plane` 换成"按配置构造、缺路由即启动期报错"的由来。
 - 缓存/单飞/熔断的机制照搬：OpenStack 走**独立的一份**（自己的 TTL、自己的熔断），

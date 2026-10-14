@@ -77,8 +77,8 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `timeout` | `2s` | 控制面请求超时 |
 | | `fail_open` | `false`（注释） | 控制面故障时用旧缓存放行 |
 | `[openstack]` | `enabled` | `false` | **默认关**：缺本节或 `enabled=false` 时行为与旧版完全一致（路由谓词对所有 principal 都答"控制面"） |
-| | `routing` | `hybrid` | `hybrid`：UUID→Nova，其余→控制面；`openstack_only`：只认规范 UUID，**无控制面回退**，非 UUID 直接拒绝 |
-| | `authorization` | `control_plane` | `control_plane`：授权权威仍在控制面（推荐）；`openstack_only`：**实验室模式**，必须同时 `allow_any_authenticated_key = true`，语义是"任意通过前腿验签的密钥 + 已知 UUID ⇒ 可达该实例"（见 §5.8 / `known-limitations.md` §9） |
+| | `routing` | `hybrid` | `hybrid`：UUID→Nova，其余→控制面；`openstack_only`：只认规范 UUID，**无控制面回退**，非 UUID 直接拒绝。**启用态（`enabled=true`）目前只接受 `openstack_only`**——`hybrid` 会以 `openstack.routing` 配置错误拒绝启动，等方案 A（控制面授权）落地 |
+| | `authorization` | `control_plane` | `control_plane`：授权权威仍在控制面（默认值，但**启用态下不可用**：`routing`/`authorization` 任一为可启用的组合都必须两者同时为 `openstack_only`，方案 A 未实现）；`openstack_only`：**实验室模式**，必须同时 `allow_any_authenticated_key = true`，语义是"任意通过前腿验签的密钥 + 已知 UUID ⇒ 可达该实例"（见 §5.8 / `known-limitations.md` §9） |
 | | `auth_url` / `application_credential_*` / `project_id` | — | Keystone v3；`project_id` 是 token scope，也是可见实例范围的爆炸半径闸门；secret 支持 `_file` 与环境变量注入 |
 | | `nova_endpoint` | 空 | 显式 Nova base URL（跳过 catalog 发现；测试/内网云用） |
 | | `timeout` / `cache_ttl` / `fail_open` | `3s` / `30s` / `false` | 独立于 `[control_plane]` 的缓存与超时；`fail_open=true` 才允许在 TTL 过期后用旧地址（且须配合 `host_key_policy="pinned"`） |
@@ -211,7 +211,7 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 
 **定位**：这是**显式实验室/内网 PoC 模式**，不是生产路由方案。它去掉控制面这条依赖，让"OpenStack 实例 UUID 本身就是路由"：客户端用 `<instance-uuid>@gw` 登录，网关查 Nova 拿地址与后端用户，再用转发来的 agent 签名拨进实例。默认关闭；不写 `[openstack]` 节时行为与旧版完全一致。
 
-**启用条件（缺一不可，配置层会拒绝其它组合）**
+**启用条件（缺一不可；配置层只接受这一种组合，其余组合启动即报 `openstack.routing` / `openstack.authorization` 错误——`routing="hybrid"` 或"控制面授权"都属于方案 A，尚未实现）**
 ```toml
 [openstack]
 enabled = true

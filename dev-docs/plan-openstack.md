@@ -347,6 +347,12 @@ GatewaySession::resolve_grant
 - **绝不**允许用户名里携带 host/IP；目标 host 只能来自 Nova 返回，杜绝 SSRF 到
   任意主机。UUID 本身不构成"用户可控的 host"。
 
+> **【已实施，O1】**：四个组合里只有两个在配置层合法，其中**启用态只接受纯模式**。
+> `routing="hybrid"` 与 `authorization="control_plane"` 的组合（方案 A）**尚未实现**，
+> 因此 `enabled=true` 时它们被 `openstack.routing` / `openstack.authorization`
+> 组合规则拒绝（config.rs:1205-1259），错误信息直说"hybrid would authorize outside
+> the control plane"。`enabled=false` 短路在这些规则之前，永远可接受。
+
 **结论**：`routing`（走哪条源）与 `authorization`（谁授权）**解耦**：
 - `routing=hybrid` + `authorization=control_plane`：安全默认。
 - `routing=openstack_only` + `authorization=openstack_only` + 危险开关：实验室。
@@ -499,6 +505,7 @@ recording = false
 - `case_openstack_preauth_no_lookup.sh` ✅ — 未验签 probe（仅 offered）不得产生 Nova 请求
   （断言 mock `__log` 为空），验签后才出现。
 - `case_openstack_hybrid_fallback.sh` ⏳ — 非 UUID 用户名仍走 CP（原用例语义不变）。
+  依赖方案 A：`hybrid` 当前**启用即被拒绝**，该用例与 `cp_authorized` 一起等方案 A。
 - `case_openstack_only_rejects_nonuuid.sh` ✅（实际名 `case_openstack_non_uuid.sh`） — pure 模式拒绝非 UUID。
 - `case_openstack_cp_authorized.sh` ⏳（方案 A）— CP 拒绝时不查 Nova（`__log` 空）且拒绝；
   CP 允许时才查 Nova。

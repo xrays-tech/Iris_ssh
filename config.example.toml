@@ -78,28 +78,42 @@ timeout = "2s"
 # --- OpenStack: instance UUID as the route (plan-openstack) -------------------
 # DISABLED BY DEFAULT: with this section absent or `enabled = false` the
 # gateway behaves exactly as before (the route predicate answers "control plane"
-# for every principal), which is what keeps the feature byte-for-byte inert.
+# for every principal), which is what keeps the feature byte-for-byte inert —
+# and `enabled = false` is accepted whatever `routing`/`authorization` say.
 #
-#   routing         = "hybrid"        UUID -> Nova, everything else -> [control_plane]
-#                   | "openstack_only"  canonical UUIDs only, NO control-plane fallback
-#   authorization   = "control_plane"  the control plane still authorizes (recommended)
-#                   | "openstack_only"  THE GATEWAY GRANTS ON NOVA'S ANSWER ALONE
+# ⚠ Exactly ONE combination can be enabled today, and it is the laboratory one:
 #
-# ⚠ `authorization = "openstack_only"` is an explicit LABORATORY mode. It
-# requires `allow_any_authenticated_key = true` — a deliberately alarming name
-# for its real meaning: *any key that passes front-leg verification can reach
-# any instance UUID it can guess*, limited only by the application credential's
-# project scope. The gateway logs a warning at startup and another for plain
-# http. Never enable it on a shared or internet-facing gateway; see
-# `docs/known-limitations.md` §9.
+#     enabled = true
+#     routing = "openstack_only"        # canonical instance UUIDs only, NO
+#                                       # control-plane fallback for anything else
+#     authorization = "openstack_only"  # Nova's project scope is the authority
+#     allow_any_authenticated_key = true
 #
-# The example below is the hybrid/recommended shape, commented out. The target
-# host always comes from Nova (never from the username), so this section cannot
-# be used to dial an arbitrary address.
+# `authorization = "openstack_only"` means *any key that passes front-leg
+# verification can reach any instance UUID it can guess*, limited only by the
+# application credential's project scope — hence the deliberately alarming
+# `allow_any_authenticated_key` flag, which the validator demands explicitly
+# and on which the gateway warns at startup (plus another warning for plain
+# http). Never enable it on a shared or internet-facing gateway; see
+# `docs/known-limitations.md` §9 and `docs/ops-runbook.md` §5.8.
+#
+# The safe shapes are *parsed* but refused while the feature is on, because the
+# control-plane authorization variant (plan-openstack §3.5 scheme A: control
+# plane authorizes, Nova only maps UUID -> address) is NOT implemented:
+#   - `routing = "hybrid"`            -> `openstack.routing` config error
+#   - `authorization = "control_plane"` with an enabled route -> config error
+# until scheme A lands, a hybrid route would authorize outside the control
+# plane. The fields stay so that turning the section back off is never a
+# two-step operation.
+#
+# The example below is the enabled lab shape, commented out. The target host
+# always comes from Nova (never from the username), so this section cannot be
+# used to dial an arbitrary address.
 # [openstack]
 # enabled = true
-# routing = "hybrid"
-# authorization = "control_plane"
+# routing = "openstack_only"
+# authorization = "openstack_only"
+# allow_any_authenticated_key = true
 #
 # # --- Keystone v3 (application credential is the recommended auth_method) ---
 # auth_url = "https://keystone.example.internal:5000/v3"
