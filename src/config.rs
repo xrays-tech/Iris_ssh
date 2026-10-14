@@ -25,7 +25,14 @@ pub struct GatewayConfig {
     pub relay: RelayConfig,
     pub backend: BackendConfig,
     pub pool: PoolConfig,
-    pub control_plane: ControlPlaneConfig,
+    /// External control plane. `None` only when the gateway runs in OpenStack
+    /// pure mode (`routing = "openstack_only"`), where no control plane exists
+    /// (plan-openstack §0-7 / §3.6).
+    pub control_plane: Option<ControlPlaneConfig>,
+    /// OpenStack instance-UUID routing (plan-openstack §3.6). `None` when the
+    /// section is absent or `enabled = false` — the default, which leaves the
+    /// gateway byte-for-byte unchanged.
+    pub openstack: Option<OpenStackConfig>,
     pub limits: LimitsConfig,
     /// Certificate authority (B1: host/user CA).
     pub ca: CaConfig,
@@ -114,6 +121,202 @@ pub struct ControlPlaneConfig {
     pub fail_open: bool,
     /// Extra jitter applied to `cache_ttl` to avoid thundering-herd expiry.
     pub cache_ttl_jitter: Duration,
+}
+
+// --------------------------------------------------------------------------
+// OpenStack instance-UUID routing (plan-openstack §3.5 / §3.6).
+//
+// `routing` (which resolver answers) and `authorization` (who decides) are
+// deliberately two separate knobs — see plan-openstack §3.5. Only two of the
+// four combinations are legal; the other two are rejected at validation time
+// so a gateway can never silently authorize OpenStack grants outside the
+// control plane.
+// --------------------------------------------------------------------------
+
+/// Which resolver serves a principal (plan-openstack §3.1 / F2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenStackRouting {
+    /// UUID-shaped principals resolve through OpenStack, everything else through
+    /// the control plane. Requires `authorization = "openstack_only"`, which in
+    /// turn requires the danger flag — so `hybrid` cannot be enabled until the
+    /// control-plane authorization variant (scheme A) exists.
+    #[default]
+    Hybrid,
+    /// Only UUID-shaped principals are accepted; there is no control-plane
+    /// fallback for anything else, and `[control_plane]` may be omitted.
+    OpenStackOnly,
+}
+
+/// Who authorizes a principal (plan-openstack §3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenStackAuthorization {
+    /// The control plane remains the sole authorization authority (red line 1).
+    #[default]
+    ControlPlane,
+    /// **Lab mode**: any key that passes front-leg signature verification may
+    /// reach any UUID it can name. Requires `allow_any_authenticated_key`.
+    OpenStackOnly,
+}
+
+/// Keystone v3 authentication method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenStackAuthMethod {
+    #[default]
+    ApplicationCredential,
+    /// Escape hatch for tests / short-lived tooling: a pre-issued `X-Auth-Token`.
+    Token,
+}
+
+/// Which endpoint interface to pick from the service catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EndpointInterface {
+    #[default]
+    Public,
+    Internal,
+    Admin,
+}
+
+/// IP version filter for the selected instance address (plan-openstack §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressFamily {
+    #[default]
+    IPv4,
+    IPv6,
+    /// Keep both families; ordering still applies.
+    Any,
+}
+
+/// Whether floating or fixed addresses win when both exist (plan-openstack §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpPrefer {
+    #[default]
+    Floating,
+    Fixed,
+    /// Prefer floating (best cross-network reachability) but never fail on
+    /// ties between types.
+    Any,
+}
+
+/// What to do when more than one address survives filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnAmbiguous {
+    /// Fail loud (default): a wrong guess could cross a network security zone.
+    #[default]
+    Reject,
+    /// Take the first address in stable (network, addr) order and warn.
+    First,
+}
+
+/// One `[[openstack.backend_user_map]]` rule (plan-openstack §3.4).
+///
+/// All present conditions are AND-ed; a rule with no condition at all is
+/// rejected at validation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendUserRule {
+    /// Instance-name matcher. Empty = "no name condition"; a leading `^`
+    /// selects *prefix* matching, otherwise the match is exact.
+    pub match_name: String,
+    /// Metadata entries that must all be present with equal values.
+    pub match_metadata: std::collections::BTreeMap<String, String>,
+    /// Backend login user to use when this rule matches.
+    pub user: String,
+}
+
+/// Validated `[openstack]` section.
+///
+/// `Debug` is hand-written so the application-credential secret and the static
+/// token are never rendered into logs, `{:?}` diagnostics or test failures.
+#[derive(Clone)]
+pub struct OpenStackConfig {
+    pub routing: OpenStackRouting,
+    pub authorization: OpenStackAuthorization,
+    pub allow_any_authenticated_key: bool,
+
+    // --- Keystone v3 -----------------------------------------------------
+    pub auth_url: String,
+    pub auth_method: OpenStackAuthMethod,
+    pub application_credential_id: String,
+    /// Resolved from `application_credential_secret_file` → literal value →
+    /// `$SSHGW_OPENSTACK_APPLICATION_CREDENTIAL_SECRET` (first non-empty wins).
+    pub application_credential_secret: String,
+    /// Resolved the same way from `token_file` → `token` →
+    /// `$SSHGW_OPENSTACK_TOKEN`; only used with `auth_method = "token"`.
+    pub token: String,
+    /// Token scope. Strongly recommended: it is the blast-radius gate on which
+    /// instances this gateway can see at all (plan-openstack §3.2 / R5).
+    pub project_id: String,
+    pub user_domain_name: String,
+    pub project_domain_name: String,
+    pub region: String,
+    pub interface: EndpointInterface,
+    /// Explicit Nova base URL; skips catalog lookup (tests / internal clouds).
+    pub nova_endpoint: String,
+    pub microversion: String,
+
+    // --- transport / caching ---------------------------------------------
+    pub timeout: Duration,
+    /// TTL of the instance-IP cache, independent of `control_plane.cache_ttl`.
+    pub cache_ttl: Duration,
+    /// Serve a stale IP when Nova is unreachable. Requires
+    /// `[backend] host_key_policy = "pinned"` (plan-openstack red line 5).
+    pub fail_open: bool,
+    pub verify_tls: bool,
+    /// Custom CA bundle; empty means the system roots.
+    pub ca_bundle: PathBuf,
+
+    // --- address selection (plan-openstack §3.3) ---------------------------
+    /// Network name filter; empty accepts any network.
+    pub network: String,
+    pub address_family: AddressFamily,
+    pub prefer: IpPrefer,
+    pub on_ambiguous: OnAmbiguous,
+
+    // --- backend login user (plan-openstack §3.4) --------------------------
+    pub default_backend_user: String,
+    pub backend_user_metadata_key: String,
+    pub backend_user_map: Vec<BackendUserRule>,
+
+    pub ssh_port: u16,
+    pub recording: bool,
+}
+
+impl std::fmt::Debug for OpenStackConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenStackConfig")
+            .field("routing", &self.routing)
+            .field("authorization", &self.authorization)
+            .field(
+                "allow_any_authenticated_key",
+                &self.allow_any_authenticated_key,
+            )
+            .field("auth_url", &self.auth_url)
+            .field("auth_method", &self.auth_method)
+            .field("application_credential_id", &self.application_credential_id)
+            .field("application_credential_secret", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("project_id", &self.project_id)
+            .field("user_domain_name", &self.user_domain_name)
+            .field("project_domain_name", &self.project_domain_name)
+            .field("region", &self.region)
+            .field("interface", &self.interface)
+            .field("nova_endpoint", &self.nova_endpoint)
+            .field("microversion", &self.microversion)
+            .field("timeout", &self.timeout)
+            .field("cache_ttl", &self.cache_ttl)
+            .field("fail_open", &self.fail_open)
+            .field("verify_tls", &self.verify_tls)
+            .field("ca_bundle", &self.ca_bundle)
+            .field("network", &self.network)
+            .field("address_family", &self.address_family)
+            .field("prefer", &self.prefer)
+            .field("on_ambiguous", &self.on_ambiguous)
+            .field("default_backend_user", &self.default_backend_user)
+            .field("backend_user_metadata_key", &self.backend_user_metadata_key)
+            .field("backend_user_map", &self.backend_user_map)
+            .field("ssh_port", &self.ssh_port)
+            .field("recording", &self.recording)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +415,9 @@ struct RawConfig {
     backend: RawBackend,
     #[serde(default)]
     pool: RawPool,
-    control_plane: RawControlPlane,
+    control_plane: Option<RawControlPlane>,
+    #[serde(default)]
+    openstack: Option<RawOpenStack>,
     #[serde(default)]
     limits: RawLimits,
     #[serde(default)]
@@ -385,6 +590,139 @@ fn default_cp_timeout() -> String {
 }
 fn default_cache_ttl_jitter() -> String {
     "3s".to_owned()
+}
+
+// --- [openstack] raw shape (plan-openstack §3.6) ---------------------------
+
+#[derive(Debug, Deserialize)]
+struct RawOpenStack {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_routing")]
+    routing: String,
+    #[serde(default = "default_authorization")]
+    authorization: String,
+    #[serde(default)]
+    allow_any_authenticated_key: bool,
+
+    // Keystone
+    #[serde(default)]
+    auth_url: String,
+    #[serde(default = "default_auth_method")]
+    auth_method: String,
+    #[serde(default)]
+    application_credential_id: String,
+    #[serde(default)]
+    application_credential_secret: String,
+    #[serde(default)]
+    application_credential_secret_file: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    token_file: String,
+    #[serde(default)]
+    project_id: String,
+    #[serde(default = "default_user_domain_name")]
+    user_domain_name: String,
+    #[serde(default = "default_project_domain_name")]
+    project_domain_name: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default = "default_interface")]
+    interface: String,
+    #[serde(default)]
+    nova_endpoint: String,
+    #[serde(default = "default_microversion")]
+    microversion: String,
+
+    // transport / caching
+    #[serde(default = "default_openstack_timeout")]
+    timeout: String,
+    #[serde(default = "default_openstack_cache_ttl")]
+    cache_ttl: String,
+    #[serde(default)]
+    fail_open: bool,
+    #[serde(default = "default_verify_tls")]
+    verify_tls: bool,
+    #[serde(default)]
+    ca_bundle: String,
+
+    // address selection
+    #[serde(default)]
+    network: String,
+    #[serde(default = "default_address_family")]
+    address_family: String,
+    #[serde(default = "default_prefer")]
+    prefer: String,
+    #[serde(default = "default_on_ambiguous")]
+    on_ambiguous: String,
+
+    // backend login user
+    #[serde(default)]
+    default_backend_user: String,
+    #[serde(default)]
+    backend_user_metadata_key: String,
+    #[serde(default)]
+    backend_user_map: Vec<RawBackendUserRule>,
+
+    #[serde(default = "default_ssh_port")]
+    ssh_port: u16,
+    #[serde(default)]
+    recording: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBackendUserRule {
+    #[serde(default)]
+    match_name: String,
+    #[serde(default)]
+    match_metadata: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    user: String,
+}
+
+fn default_routing() -> String {
+    "hybrid".to_owned()
+}
+fn default_authorization() -> String {
+    "control_plane".to_owned()
+}
+fn default_auth_method() -> String {
+    "application_credential".to_owned()
+}
+fn default_interface() -> String {
+    "public".to_owned()
+}
+fn default_address_family() -> String {
+    "ipv4".to_owned()
+}
+fn default_prefer() -> String {
+    "floating".to_owned()
+}
+fn default_on_ambiguous() -> String {
+    "reject".to_owned()
+}
+
+fn default_user_domain_name() -> String {
+    "Default".to_owned()
+}
+fn default_project_domain_name() -> String {
+    "Default".to_owned()
+}
+fn default_microversion() -> String {
+    "2.1".to_owned()
+}
+fn default_openstack_timeout() -> String {
+    "3s".to_owned()
+}
+fn default_openstack_cache_ttl() -> String {
+    "30s".to_owned()
+}
+fn default_verify_tls() -> bool {
+    true
+}
+fn default_ssh_port() -> u16 {
+    22
 }
 
 #[derive(Debug, Deserialize)]
@@ -700,21 +1038,45 @@ impl GatewayConfig {
             idle_ping_threshold: Duration::from_secs(30),
         };
 
-        if raw.control_plane.url.trim().is_empty() {
-            return Err(ConfigError::Invalid {
-                field: "control_plane.url".into(),
-                reason: "must not be empty".into(),
-            });
-        }
-        let control_plane = ControlPlaneConfig {
-            url: raw.control_plane.url.trim().to_owned(),
-            cache_ttl: parse_duration("control_plane.cache_ttl", &raw.control_plane.cache_ttl)?,
-            timeout: parse_duration("control_plane.timeout", &raw.control_plane.timeout)?,
-            fail_open: raw.control_plane.fail_open,
-            cache_ttl_jitter: parse_duration(
-                "control_plane.cache_ttl_jitter",
-                &raw.control_plane.cache_ttl_jitter,
-            )?,
+        // --- [openstack]: instance-UUID routing (plan-openstack §3.6) ------
+        // Enum and combination rules are checked even when the section is
+        // disabled, so a typo or a contradictory pair fails at boot instead of
+        // on the first UUID that ever arrives.
+        let openstack = validate_openstack(raw.openstack, host_key_policy)?;
+
+        // `[control_plane]` is required in every routing mode except the
+        // OpenStack pure mode, where the gateway talks to no control plane at
+        // all (plan-openstack §0-7).
+        let control_plane_required =
+            !matches!(&openstack, Some(os) if os.routing == OpenStackRouting::OpenStackOnly);
+        let control_plane = match raw.control_plane {
+            None if control_plane_required => {
+                return Err(ConfigError::Invalid {
+                    field: "control_plane".into(),
+                    reason: "section is required unless [openstack] is enabled with \
+                             routing = \"openstack_only\""
+                        .into(),
+                });
+            }
+            None => None,
+            Some(cp) => {
+                if cp.url.trim().is_empty() {
+                    return Err(ConfigError::Invalid {
+                        field: "control_plane.url".into(),
+                        reason: "must not be empty".into(),
+                    });
+                }
+                Some(ControlPlaneConfig {
+                    url: cp.url.trim().to_owned(),
+                    cache_ttl: parse_duration("control_plane.cache_ttl", &cp.cache_ttl)?,
+                    timeout: parse_duration("control_plane.timeout", &cp.timeout)?,
+                    fail_open: cp.fail_open,
+                    cache_ttl_jitter: parse_duration(
+                        "control_plane.cache_ttl_jitter",
+                        &cp.cache_ttl_jitter,
+                    )?,
+                })
+            }
         };
 
         let limits = LimitsConfig {
@@ -803,6 +1165,7 @@ impl GatewayConfig {
             backend,
             pool,
             control_plane,
+            openstack,
             limits,
             ca,
             intercept,
@@ -810,6 +1173,497 @@ impl GatewayConfig {
             shutdown,
             metrics: MetricsConfig { addr: metrics_addr },
         })
+    }
+}
+
+// --------------------------------------------------------------------------
+// [openstack] validation (plan-openstack §3.6).
+//
+// Everything here is pure apart from reading a secret file; every rule reports
+// the offending `openstack.*` field so an operator can fix the file without a
+// debugger. Combination rules run *before* the `enabled` early-return because
+// a disabled section with a contradictory pair is still a landmine left for
+// whoever flips `enabled = true`.
+// --------------------------------------------------------------------------
+
+/// Validate the whole `[openstack]` section.
+///
+/// Returns `Ok(None)` when the section is absent or disabled: no OpenStack
+/// resolver exists, and (red line 8) nothing about existing behaviour changes.
+fn validate_openstack(
+    raw: Option<RawOpenStack>,
+    host_key_policy: HostKeyPolicy,
+) -> std::result::Result<Option<OpenStackConfig>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    // --- enums (always) ---------------------------------------------------
+    let routing = parse_routing(&raw.routing)?;
+    let authorization = parse_authorization(&raw.authorization)?;
+    let auth_method = parse_auth_method(&raw.auth_method)?;
+    let interface = parse_interface(&raw.interface)?;
+    let address_family = parse_address_family(&raw.address_family)?;
+    let prefer = parse_prefer(&raw.prefer)?;
+    let on_ambiguous = parse_on_ambiguous(&raw.on_ambiguous)?;
+
+    // --- combination rules (always) --------------------------------------
+    // 1. routing = openstack_only ⇒ authorization = openstack_only.
+    //    A "control_plane" authority with no control plane configured would
+    //    advertise an authorization source that is never consulted.
+    if routing == OpenStackRouting::OpenStackOnly
+        && authorization != OpenStackAuthorization::OpenStackOnly
+    {
+        return Err(ConfigError::Invalid {
+            field: "openstack.authorization".into(),
+            reason: "routing = \"openstack_only\" requires authorization = \"openstack_only\": \
+                     with no control plane left in the path, \"control_plane\" would name an \
+                     authority that is never consulted"
+                .into(),
+        });
+    }
+    // 2. authorization = openstack_only ⇒ routing = openstack_only.
+    //    Hybrid + openstack_only authorization would give one gateway two
+    //    authorization semantics (plan-openstack §3.5 refuses to offer it),
+    //    and hybrid + control_plane authorization would require the
+    //    control-plane-authorization scheme (A), which is not implemented.
+    if authorization == OpenStackAuthorization::OpenStackOnly
+        && routing != OpenStackRouting::OpenStackOnly
+    {
+        return Err(ConfigError::Invalid {
+            field: "openstack.routing".into(),
+            reason: "authorization = \"openstack_only\" requires routing = \"openstack_only\": \
+                     the hybrid authorization variant (control plane authorizes, OpenStack only \
+                     resolves an address) is not implemented, so a hybrid route would authorize \
+                     outside the control plane (plan-openstack §3.5)"
+                .into(),
+        });
+    }
+    // 3. authorization = openstack_only ⇒ explicit danger flag.
+    if authorization == OpenStackAuthorization::OpenStackOnly && !raw.allow_any_authenticated_key {
+        return Err(ConfigError::Invalid {
+            field: "openstack.allow_any_authenticated_key".into(),
+            reason: "must be set to true explicitly: openstack_only authorization means any \
+                     key that passes front-leg signature verification can reach any instance \
+                     UUID it knows (plan-openstack §3.5 R1)"
+                .into(),
+        });
+    }
+    // 4. routing = openstack_only ⇒ enabled (otherwise every principal would be
+    //    routed at a resolver that is switched off).
+    if routing == OpenStackRouting::OpenStackOnly && !raw.enabled {
+        return Err(ConfigError::Invalid {
+            field: "openstack.enabled".into(),
+            reason: "routing = \"openstack_only\" requires enabled = true: with the resolver \
+                     switched off the route would be a dead end"
+                .into(),
+        });
+    }
+
+    if !raw.enabled {
+        return Ok(None);
+    }
+
+    // --- enabled: only the pure mode exists until scheme A lands -----------
+    if routing != OpenStackRouting::OpenStackOnly {
+        return Err(ConfigError::Invalid {
+            field: "openstack.routing".into(),
+            reason: "hybrid cannot be enabled while authorization = \"control_plane\": the \
+                     control-plane authorization variant (plan-openstack §3.5 scheme A) is not \
+                     implemented, so a hybrid route would resolve UUIDs through OpenStack \
+                     without the control plane ever authorizing them. Set \
+                     routing = \"openstack_only\" (plus authorization and \
+                     allow_any_authenticated_key), or disable [openstack]"
+                .into(),
+        });
+    }
+
+    // --- Keystone ----------------------------------------------------------
+    let auth_url = raw.auth_url.trim().to_owned();
+    if auth_url.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "openstack.auth_url".into(),
+            reason: "must not be empty when [openstack] is enabled".into(),
+        });
+    }
+    if !auth_url.starts_with("https://") && !auth_url.starts_with("http://") {
+        return Err(ConfigError::Invalid {
+            field: "openstack.auth_url".into(),
+            reason: format!(
+                "not an absolute http(s) URL: {auth_url:?} (expected e.g. \
+                 \"https://keystone.example:5000/v3\")"
+            ),
+        });
+    }
+
+    let nova_endpoint = raw.nova_endpoint.trim().to_owned();
+    if !nova_endpoint.is_empty()
+        && !nova_endpoint.starts_with("https://")
+        && !nova_endpoint.starts_with("http://")
+    {
+        return Err(ConfigError::Invalid {
+            field: "openstack.nova_endpoint".into(),
+            reason: format!("not an absolute http(s) URL: {nova_endpoint:?}"),
+        });
+    }
+
+    let application_credential_id = raw.application_credential_id.trim().to_owned();
+    let application_credential_secret = resolve_secret(
+        "openstack.application_credential_secret_file",
+        &raw.application_credential_secret_file,
+        &raw.application_credential_secret,
+        std::env::var("SSHGW_OPENSTACK_APPLICATION_CREDENTIAL_SECRET")
+            .ok()
+            .as_deref(),
+    )?;
+    let token = resolve_secret(
+        "openstack.token_file",
+        &raw.token_file,
+        &raw.token,
+        std::env::var("SSHGW_OPENSTACK_TOKEN").ok().as_deref(),
+    )?;
+    match auth_method {
+        OpenStackAuthMethod::ApplicationCredential => {
+            if application_credential_id.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "openstack.application_credential_id".into(),
+                    reason: "must not be empty when auth_method = \"application_credential\""
+                        .into(),
+                });
+            }
+            if application_credential_secret.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "openstack.application_credential_secret".into(),
+                    reason: "required: set the literal value, \
+                             openstack.application_credential_secret_file, or the \
+                             SSHGW_OPENSTACK_APPLICATION_CREDENTIAL_SECRET environment variable"
+                        .into(),
+                });
+            }
+        }
+        OpenStackAuthMethod::Token => {
+            if token.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "openstack.token".into(),
+                    reason: "required when auth_method = \"token\": set the literal value, \
+                             openstack.token_file, or the SSHGW_OPENSTACK_TOKEN environment \
+                             variable"
+                        .into(),
+                });
+            }
+        }
+    }
+
+    // --- transport / caching ----------------------------------------------
+    let timeout = parse_duration("openstack.timeout", &raw.timeout)?;
+    if timeout.is_zero() {
+        return Err(ConfigError::Invalid {
+            field: "openstack.timeout".into(),
+            reason: "must be > 0".into(),
+        });
+    }
+    let cache_ttl = parse_duration("openstack.cache_ttl", &raw.cache_ttl)?;
+    if cache_ttl.is_zero() {
+        return Err(ConfigError::Invalid {
+            field: "openstack.cache_ttl".into(),
+            reason: "must be > 0".into(),
+        });
+    }
+    // Red line 5: a stale instance IP is only safe to dial if the backend host
+    // key pins the *right* instance, otherwise a recycled address turns
+    // fail-open into a man-in-the-middle on ourselves.
+    if raw.fail_open && host_key_policy != HostKeyPolicy::Pinned {
+        return Err(ConfigError::Invalid {
+            field: "openstack.fail_open".into(),
+            reason: "requires [backend] host_key_policy = \"pinned\": serving a stale instance \
+                     address is only safe if host-key verification rejects the wrong instance \
+                     (plan-openstack §5.2 red line 5)"
+                .into(),
+        });
+    }
+    let microversion = raw.microversion.trim().to_owned();
+    if microversion.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "openstack.microversion".into(),
+            reason: "must not be empty".into(),
+        });
+    }
+
+    // --- backend login user (plan-openstack §3.4) --------------------------
+    let default_backend_user = raw.default_backend_user.trim().to_owned();
+    if default_backend_user.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "openstack.default_backend_user".into(),
+            reason: "required when [openstack] is enabled: there is no universal default login \
+                     name across cloud images, so the fallback must be stated"
+                .into(),
+        });
+    }
+    validate_backend_user(&default_backend_user, "openstack.default_backend_user")?;
+
+    let backend_user_metadata_key = raw.backend_user_metadata_key.trim().to_owned();
+    if backend_user_metadata_key.chars().any(char::is_control) {
+        return Err(ConfigError::Invalid {
+            field: "openstack.backend_user_metadata_key".into(),
+            reason: "must not contain control characters".into(),
+        });
+    }
+
+    let mut backend_user_map = Vec::with_capacity(raw.backend_user_map.len());
+    for (idx, rule) in raw.backend_user_map.into_iter().enumerate() {
+        let field = format!("openstack.backend_user_map[{idx}]");
+        if rule.match_name.is_empty() && rule.match_metadata.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: field.clone(),
+                reason: "rule has no condition: give it match_name and/or match_metadata \
+                         (an unconditional rule would override default_backend_user for \
+                         every instance)"
+                    .into(),
+            });
+        }
+        if !rule.match_name.is_empty() {
+            validate_name_pattern(&rule.match_name, &format!("{field}.match_name"))?;
+        }
+        for key in rule.match_metadata.keys() {
+            if key.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: format!("{field}.match_metadata"),
+                    reason: "metadata key must not be empty".into(),
+                });
+            }
+        }
+        validate_backend_user(&rule.user, &format!("{field}.user"))?;
+        backend_user_map.push(BackendUserRule {
+            match_name: rule.match_name,
+            match_metadata: rule.match_metadata,
+            user: rule.user,
+        });
+    }
+
+    let ssh_port = raw.ssh_port;
+    if ssh_port == 0 {
+        return Err(ConfigError::Invalid {
+            field: "openstack.ssh_port".into(),
+            reason: "must be within [1, 65535]".into(),
+        });
+    }
+
+    Ok(Some(OpenStackConfig {
+        routing,
+        authorization,
+        allow_any_authenticated_key: raw.allow_any_authenticated_key,
+        auth_url,
+        auth_method,
+        application_credential_id,
+        application_credential_secret,
+        token,
+        project_id: raw.project_id.trim().to_owned(),
+        user_domain_name: raw.user_domain_name.trim().to_owned(),
+        project_domain_name: raw.project_domain_name.trim().to_owned(),
+        region: raw.region.trim().to_owned(),
+        interface,
+        nova_endpoint,
+        microversion,
+        timeout,
+        cache_ttl,
+        fail_open: raw.fail_open,
+        verify_tls: raw.verify_tls,
+        ca_bundle: PathBuf::from(raw.ca_bundle.trim()),
+        network: raw.network.trim().to_owned(),
+        address_family,
+        prefer,
+        on_ambiguous,
+        default_backend_user,
+        backend_user_metadata_key,
+        backend_user_map,
+        ssh_port,
+        recording: raw.recording,
+    }))
+}
+
+/// Resolve a secret from file → literal → environment value, first non-empty
+/// wins. Reading the file at load time means a bad path fails the boot, not the
+/// first login attempt.
+///
+/// The environment value is passed in rather than read here so the precedence
+/// rules are testable without mutating process-global state (which would race
+/// with the other config tests running in parallel).
+fn resolve_secret(
+    file_field: &str,
+    file: &str,
+    literal: &str,
+    env_value: Option<&str>,
+) -> std::result::Result<String, ConfigError> {
+    if !file.trim().is_empty() {
+        let path = PathBuf::from(file.trim());
+        let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        // Strip the trailing newline editors insist on adding; keep the rest.
+        let text = text.trim_end_matches(['\n', '\r']);
+        if text.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: file_field.to_owned(),
+                reason: format!("secret file {path:?} is empty"),
+            });
+        }
+        return Ok(text.to_owned());
+    }
+    if !literal.is_empty() {
+        return Ok(literal.to_owned());
+    }
+    if let Some(value) = env_value {
+        if !value.is_empty() {
+            return Ok(value.to_owned());
+        }
+    }
+    // Left empty on purpose: the caller reports which field is missing.
+    Ok(String::new())
+}
+
+/// Backend login user: non-empty, no whitespace, no control characters. It is
+/// handed verbatim to the backend's `service username` request, so anything
+/// that could smuggle protocol structure is rejected here (fail loud at boot,
+/// plan-openstack §3.4).
+fn validate_backend_user(value: &str, field: &str) -> std::result::Result<(), ConfigError> {
+    if value.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            reason: "must not be empty".into(),
+        });
+    }
+    if let Some(bad) = value.chars().find(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            reason: format!("must not contain whitespace or control characters (found {bad:?})"),
+        });
+    }
+    Ok(())
+}
+
+/// `match_name` supports exact match, or prefix match when it starts with `^`.
+/// Regex quantifiers/grouping are *not* supported (plan-openstack §3.4: v1 is
+/// exact/prefix only), and a pattern that looks like regex is rejected rather
+/// than silently matched literally — a too-narrow rule fails every login.
+fn validate_name_pattern(value: &str, field: &str) -> std::result::Result<(), ConfigError> {
+    const REGEX_ONLY: &[char] = &['*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\', '$'];
+    let body = value.strip_prefix('^').unwrap_or(value);
+    if body.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            reason: "prefix pattern after '^' must not be empty".into(),
+        });
+    }
+    if let Some(c) = body.chars().find(|c| REGEX_ONLY.contains(c)) {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            reason: format!(
+                "unsupported regular-expression metacharacter {c:?}: only exact match, or \
+                 prefix match when the pattern starts with '^' (plan-openstack §3.4)"
+            ),
+        });
+    }
+    if body.contains('^') {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            reason: "'^' is only allowed once, at the very start".into(),
+        });
+    }
+    Ok(())
+}
+
+fn enum_error(field: &str, value: &str, expected: &str) -> ConfigError {
+    ConfigError::Invalid {
+        field: field.to_owned(),
+        reason: format!("unknown value {value:?} (expected {expected})"),
+    }
+}
+
+fn parse_routing(value: &str) -> std::result::Result<OpenStackRouting, ConfigError> {
+    match value.trim() {
+        "hybrid" => Ok(OpenStackRouting::Hybrid),
+        "openstack_only" => Ok(OpenStackRouting::OpenStackOnly),
+        other => Err(enum_error(
+            "openstack.routing",
+            other,
+            "\"hybrid\" or \"openstack_only\"",
+        )),
+    }
+}
+
+fn parse_authorization(value: &str) -> std::result::Result<OpenStackAuthorization, ConfigError> {
+    match value.trim() {
+        "control_plane" => Ok(OpenStackAuthorization::ControlPlane),
+        "openstack_only" => Ok(OpenStackAuthorization::OpenStackOnly),
+        other => Err(enum_error(
+            "openstack.authorization",
+            other,
+            "\"control_plane\" or \"openstack_only\"",
+        )),
+    }
+}
+
+fn parse_auth_method(value: &str) -> std::result::Result<OpenStackAuthMethod, ConfigError> {
+    match value.trim() {
+        "application_credential" => Ok(OpenStackAuthMethod::ApplicationCredential),
+        "token" => Ok(OpenStackAuthMethod::Token),
+        other => Err(enum_error(
+            "openstack.auth_method",
+            other,
+            "\"application_credential\" or \"token\"",
+        )),
+    }
+}
+
+fn parse_interface(value: &str) -> std::result::Result<EndpointInterface, ConfigError> {
+    match value.trim() {
+        "public" => Ok(EndpointInterface::Public),
+        "internal" => Ok(EndpointInterface::Internal),
+        "admin" => Ok(EndpointInterface::Admin),
+        other => Err(enum_error(
+            "openstack.interface",
+            other,
+            "\"public\", \"internal\" or \"admin\"",
+        )),
+    }
+}
+
+fn parse_address_family(value: &str) -> std::result::Result<AddressFamily, ConfigError> {
+    match value.trim() {
+        "ipv4" => Ok(AddressFamily::IPv4),
+        "ipv6" => Ok(AddressFamily::IPv6),
+        "any" => Ok(AddressFamily::Any),
+        other => Err(enum_error(
+            "openstack.address_family",
+            other,
+            "\"ipv4\", \"ipv6\" or \"any\"",
+        )),
+    }
+}
+
+fn parse_prefer(value: &str) -> std::result::Result<IpPrefer, ConfigError> {
+    match value.trim() {
+        "floating" => Ok(IpPrefer::Floating),
+        "fixed" => Ok(IpPrefer::Fixed),
+        "any" => Ok(IpPrefer::Any),
+        other => Err(enum_error(
+            "openstack.prefer",
+            other,
+            "\"floating\", \"fixed\" or \"any\"",
+        )),
+    }
+}
+
+fn parse_on_ambiguous(value: &str) -> std::result::Result<OnAmbiguous, ConfigError> {
+    match value.trim() {
+        "reject" => Ok(OnAmbiguous::Reject),
+        "first" => Ok(OnAmbiguous::First),
+        other => Err(enum_error(
+            "openstack.on_ambiguous",
+            other,
+            "\"reject\" or \"first\"",
+        )),
     }
 }
 
@@ -865,7 +1719,10 @@ mod tests {
         assert_eq!(cfg.backend.host_key_policy, HostKeyPolicy::Pinned);
         assert!(!cfg.pool.enabled);
         assert_eq!(cfg.pool.channels_per_conn, 8);
-        assert_eq!(cfg.control_plane.cache_ttl, Duration::from_secs(30));
+        assert_eq!(
+            cfg.control_plane.as_ref().expect("present").cache_ttl,
+            Duration::from_secs(30)
+        );
         assert_eq!(cfg.limits.max_sessions, 10_000);
         assert_eq!(cfg.shutdown.drain_wait, Duration::from_secs(60));
         // Unspecified fields take documented defaults:
@@ -1091,5 +1948,518 @@ mod tests {
     fn channels_per_conn_over_eight_rejected() {
         let bad = minimal_toml().replace("channels_per_conn = 8", "channels_per_conn = 16");
         assert!(GatewayConfig::parse(&bad).is_err());
+    }
+
+    // --- [openstack] / instance-UUID routing (plan-openstack §3.6, §4.1) ----
+
+    /// Base config **without** `[control_plane]`, so tests can prove which
+    /// routing modes demand a control plane and which do not.
+    fn base_without_control_plane() -> String {
+        r#"
+            [listen]
+            addr = "127.0.0.1:2222"
+
+            [host_keys]
+            keys = [{ path = "/etc/ssh-gw/host_ed25519", state = "active" }]
+
+            [backend]
+            host_key_policy = "pinned"
+        "#
+        .to_owned()
+    }
+
+    /// A valid OpenStack pure-mode section: the lab mode of plan-openstack
+    /// §3.5, with every hand-set knob it requires.
+    fn openstack_pure_section() -> String {
+        r#"
+            [openstack]
+            enabled = true
+            routing = "openstack_only"
+            authorization = "openstack_only"
+            allow_any_authenticated_key = true
+            auth_url = "https://keystone.example.internal:5000/v3"
+            application_credential_id = "appcred-id"
+            application_credential_secret = "s3cr3t"
+            nova_endpoint = "http://127.0.0.1:8774/v2.1"
+            default_backend_user = "cloud-user"
+        "#
+        .to_owned()
+    }
+
+    fn parse_err(toml: &str) -> ConfigError {
+        match GatewayConfig::parse(toml).unwrap_err() {
+            Error::Config(err) => err,
+            other => panic!("expected a config error, got {other:?}"),
+        }
+    }
+
+    fn invalid_field(toml: &str) -> String {
+        match parse_err(toml) {
+            ConfigError::Invalid { field, .. } => field,
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openstack_is_absent_by_default_and_control_plane_still_required() {
+        let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
+        assert!(
+            cfg.openstack.is_none(),
+            "default off = no OpenStack resolver"
+        );
+        assert!(cfg.control_plane.is_some());
+
+        // No control plane and no OpenStack section at all stays an error —
+        // the "control_plane became optional" change is mode-scoped, not a
+        // loosening of the existing rule.
+        let err = invalid_field(&base_without_control_plane());
+        assert_eq!(err, "control_plane");
+    }
+
+    #[test]
+    fn pure_openstack_mode_needs_no_control_plane() {
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section()
+        );
+        let cfg =
+            GatewayConfig::parse(&toml).expect("pure mode must parse without a control plane");
+        assert!(cfg.control_plane.is_none());
+        let os = cfg.openstack.expect("openstack configured");
+        assert_eq!(os.routing, OpenStackRouting::OpenStackOnly);
+        assert_eq!(os.authorization, OpenStackAuthorization::OpenStackOnly);
+        assert!(os.allow_any_authenticated_key);
+        assert_eq!(os.auth_method, OpenStackAuthMethod::ApplicationCredential);
+        assert_eq!(os.application_credential_id, "appcred-id");
+        assert_eq!(os.application_credential_secret, "s3cr3t");
+        assert_eq!(os.auth_url, "https://keystone.example.internal:5000/v3");
+        assert_eq!(os.nova_endpoint, "http://127.0.0.1:8774/v2.1");
+        assert_eq!(os.default_backend_user, "cloud-user");
+        assert!(os.backend_user_map.is_empty());
+        assert!(os.backend_user_metadata_key.is_empty());
+        // Documented defaults (plan-openstack §3.6).
+        assert_eq!(os.timeout, Duration::from_secs(3));
+        assert_eq!(os.cache_ttl, Duration::from_secs(30));
+        assert_eq!(os.microversion, "2.1");
+        assert_eq!(os.interface, EndpointInterface::Public);
+        assert_eq!(os.address_family, AddressFamily::IPv4);
+        assert_eq!(os.prefer, IpPrefer::Floating);
+        assert_eq!(os.on_ambiguous, OnAmbiguous::Reject);
+        assert_eq!(os.ssh_port, 22);
+        assert!(!os.fail_open);
+        assert!(os.verify_tls);
+        assert!(!os.recording);
+    }
+
+    #[test]
+    fn pure_mode_still_accepts_an_optional_control_plane() {
+        let toml = format!("{}{}", minimal_toml(), openstack_pure_section());
+        let cfg = GatewayConfig::parse(&toml).expect("both sections may coexist");
+        assert!(cfg.control_plane.is_some(), "an unused CP is tolerated");
+        assert!(cfg.openstack.is_some());
+    }
+
+    #[test]
+    fn non_pure_modes_still_require_a_control_plane() {
+        // Section present but disabled: no route exists, so the control plane
+        // is still mandatory.
+        let toml = format!(
+            "{}\n            [openstack]\n            enabled = false\n",
+            base_without_control_plane()
+        );
+        assert_eq!(invalid_field(&toml), "control_plane");
+    }
+
+    #[test]
+    fn openstack_only_requires_the_danger_flag() {
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section().replace("allow_any_authenticated_key = true\n", "")
+        );
+        assert_eq!(
+            invalid_field(&toml),
+            "openstack.allow_any_authenticated_key"
+        );
+    }
+
+    #[test]
+    fn openstack_only_routing_requires_enabled() {
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section().replace("enabled = true", "enabled = false")
+        );
+        assert_eq!(invalid_field(&toml), "openstack.enabled");
+    }
+
+    #[test]
+    fn authorization_and_routing_must_agree() {
+        // openstack_only authorization without an openstack_only route would
+        // give the gateway two authorization semantics (plan §3.5 refuses it).
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section()
+                .replace("routing = \"openstack_only\"", "routing = \"hybrid\"")
+        );
+        assert_eq!(invalid_field(&toml), "openstack.routing");
+
+        // The mirror: an openstack_only route with control-plane authorization
+        // would advertise an authority that is never consulted.
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section().replace(
+                "authorization = \"openstack_only\"",
+                "authorization = \"control_plane\""
+            )
+        );
+        assert_eq!(invalid_field(&toml), "openstack.authorization");
+    }
+
+    #[test]
+    fn hybrid_cannot_be_enabled_without_scheme_a() {
+        // `enabled = true` + `routing = "hybrid"` would resolve UUIDs through
+        // OpenStack while claiming control-plane authorization; scheme A is not
+        // implemented, so the gateway refuses to boot rather than silently
+        // authorizing outside the control plane.
+        let toml = format!(
+            "{}{}",
+            minimal_toml(),
+            openstack_pure_section()
+                .replace("routing = \"openstack_only\"", "routing = \"hybrid\"")
+        );
+        assert_eq!(invalid_field(&toml), "openstack.routing");
+    }
+
+    #[test]
+    fn enabled_requires_a_default_backend_user() {
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section().replace("default_backend_user = \"cloud-user\"\n", "")
+        );
+        assert_eq!(invalid_field(&toml), "openstack.default_backend_user");
+
+        // Whitespace-only is equally useless (§3.4 result validation).
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section().replace(
+                "default_backend_user = \"cloud-user\"",
+                "default_backend_user = \" \""
+            )
+        );
+        assert_eq!(invalid_field(&toml), "openstack.default_backend_user");
+    }
+
+    #[test]
+    fn backend_user_must_not_contain_whitespace_or_control_characters() {
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section().replace(
+                "default_backend_user = \"cloud-user\"",
+                "default_backend_user = \"cloud user\""
+            )
+        );
+        assert_eq!(invalid_field(&toml), "openstack.default_backend_user");
+    }
+
+    #[test]
+    fn fail_open_requires_a_pinned_host_key() {
+        // Red line 5: stale-IP dialing is only safe with host-key pinning.
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section().replace(
+                "nova_endpoint = \"http://127.0.0.1:8774/v2.1\"",
+                "nova_endpoint = \"http://127.0.0.1:8774/v2.1\"\n            fail_open = true"
+            ),
+        );
+        let unpinned = toml.replace(
+            "host_key_policy = \"pinned\"",
+            "host_key_policy = \"accept-new\"",
+        );
+        assert_eq!(invalid_field(&unpinned), "openstack.fail_open");
+
+        // With pinning it is accepted.
+        let cfg = GatewayConfig::parse(&toml).expect("pinned + fail_open is valid");
+        assert!(cfg.openstack.expect("configured").fail_open);
+    }
+
+    #[test]
+    fn unknown_enum_values_report_the_offending_field() {
+        let cases = [
+            ("routing = \"openstack_only\"", "routing = \"bogus\"", "openstack.routing"),
+            (
+                "authorization = \"openstack_only\"",
+                "authorization = \"bogus\"",
+                "openstack.authorization",
+            ),
+            (
+                "auth_url = \"https://keystone.example.internal:5000/v3\"",
+                "auth_url = \"https://keystone.example.internal:5000/v3\"\n            auth_method = \"password\"",
+                "openstack.auth_method",
+            ),
+            (
+                "default_backend_user = \"cloud-user\"",
+                "default_backend_user = \"cloud-user\"\n            address_family = \"ip\"",
+                "openstack.address_family",
+            ),
+            (
+                "default_backend_user = \"cloud-user\"",
+                "default_backend_user = \"cloud-user\"\n            prefer = \"strongest\"",
+                "openstack.prefer",
+            ),
+            (
+                "default_backend_user = \"cloud-user\"",
+                "default_backend_user = \"cloud-user\"\n            on_ambiguous = \"whatever\"",
+                "openstack.on_ambiguous",
+            ),
+            (
+                "default_backend_user = \"cloud-user\"",
+                "default_backend_user = \"cloud-user\"\n            interface = \"external\"",
+                "openstack.interface",
+            ),
+        ];
+        for (needle, replacement, expected) in cases {
+            let toml = format!(
+                "{}{}",
+                base_without_control_plane(),
+                openstack_pure_section().replace(needle, replacement)
+            );
+            assert_eq!(invalid_field(&toml), expected, "replacing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn enum_typos_are_caught_even_while_the_feature_is_disabled() {
+        // A landmine left in a disabled section must fail at boot, not on the
+        // first UUID that ever arrives.
+        let toml = format!(
+            "{}\n            [openstack]\n            enabled = false\n            routing = \"alĺ hybrids\"\n",
+            minimal_toml()
+        );
+        assert_eq!(invalid_field(&toml), "openstack.routing");
+    }
+
+    #[test]
+    fn missing_credentials_report_the_field_that_would_fix_them() {
+        let no_secret =
+            openstack_pure_section().replace("application_credential_secret = \"s3cr3t\"\n", "");
+        assert_eq!(
+            invalid_field(&format!("{}{no_secret}", base_without_control_plane())),
+            "openstack.application_credential_secret"
+        );
+
+        let no_id =
+            openstack_pure_section().replace("application_credential_id = \"appcred-id\"\n", "");
+        assert_eq!(
+            invalid_field(&format!("{}{no_id}", base_without_control_plane())),
+            "openstack.application_credential_id"
+        );
+
+        // auth_method = token swaps which credential is demanded.
+        let token_mode = openstack_pure_section()
+            .replace("application_credential_id = \"appcred-id\"\n", "")
+            .replace(
+                "application_credential_secret = \"s3cr3t\"",
+                "auth_method = \"token\"",
+            );
+        assert_eq!(
+            invalid_field(&format!("{}{token_mode}", base_without_control_plane())),
+            "openstack.token"
+        );
+    }
+
+    #[test]
+    fn secret_resolution_prefers_file_then_literal_then_environment() {
+        let env = Some("from-env");
+        assert_eq!(
+            resolve_secret("f", "", "from-literal", env).unwrap(),
+            "from-literal"
+        );
+        assert_eq!(resolve_secret("f", "", "", env).unwrap(), "from-env");
+        assert_eq!(resolve_secret("f", "", "", None).unwrap(), "");
+
+        // A file wins over both, with the trailing newline editors add removed.
+        let dir = std::env::temp_dir().join(format!("sshgw-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("secret.txt");
+        std::fs::write(&path, "file-secret\n").expect("write secret");
+        let resolved = resolve_secret("f", path.to_str().unwrap(), "from-literal", env).unwrap();
+        assert_eq!(resolved, "file-secret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_secret_file_is_an_error_not_a_fallback() {
+        let dir = std::env::temp_dir().join(format!("sshgw-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("empty.txt");
+        std::fs::write(&path, "\n").expect("write empty secret");
+        let err = resolve_secret(
+            "openstack.application_credential_secret_file",
+            path.to_str().unwrap(),
+            "from-literal",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("openstack.application_credential_secret_file: secret file {path:?} is empty")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secrets_never_appear_in_debug_output() {
+        let toml = format!("{}{}", minimal_toml(), openstack_pure_section());
+        let cfg = GatewayConfig::parse(&toml).expect("valid config");
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("s3cr3t"), "secret leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn absolute_urls_are_required_for_keystone_and_nova() {
+        let bad = openstack_pure_section().replace(
+            "auth_url = \"https://keystone.example.internal:5000/v3\"",
+            "auth_url = \"keystone.internal:5000/v3\"",
+        );
+        assert_eq!(
+            invalid_field(&format!("{}{bad}", base_without_control_plane())),
+            "openstack.auth_url"
+        );
+
+        let bad = openstack_pure_section().replace(
+            "nova_endpoint = \"http://127.0.0.1:8774/v2.1\"",
+            "nova_endpoint = \"nova.internal:8774\"",
+        );
+        assert_eq!(
+            invalid_field(&format!("{}{bad}", base_without_control_plane())),
+            "openstack.nova_endpoint"
+        );
+    }
+
+    #[test]
+    fn zero_timeouts_and_ports_are_rejected() {
+        let bad = openstack_pure_section().replace(
+            "default_backend_user = \"cloud-user\"",
+            "default_backend_user = \"cloud-user\"\n            timeout = \"0s\"",
+        );
+        assert_eq!(
+            invalid_field(&format!("{}{bad}", base_without_control_plane())),
+            "openstack.timeout"
+        );
+
+        let bad = openstack_pure_section().replace(
+            "default_backend_user = \"cloud-user\"",
+            "default_backend_user = \"cloud-user\"\n            cache_ttl = \"0s\"",
+        );
+        assert_eq!(
+            invalid_field(&format!("{}{bad}", base_without_control_plane())),
+            "openstack.cache_ttl"
+        );
+
+        let bad = openstack_pure_section().replace(
+            "default_backend_user = \"cloud-user\"",
+            "default_backend_user = \"cloud-user\"\n            ssh_port = 0",
+        );
+        assert_eq!(
+            invalid_field(&format!("{}{bad}", base_without_control_plane())),
+            "openstack.ssh_port"
+        );
+    }
+
+    #[test]
+    fn backend_user_rules_are_parsed_and_validated() {
+        let rules = r#"
+            [[openstack.backend_user_map]]
+            match_name = "^web-"
+            match_metadata = { role = "web" }
+            user = "ubuntu"
+
+            [[openstack.backend_user_map]]
+            match_metadata = { tier = "db" }
+            user = "postgres"
+        "#;
+        let toml = format!(
+            "{}{}{rules}",
+            base_without_control_plane(),
+            openstack_pure_section()
+        );
+        let cfg = GatewayConfig::parse(&toml).expect("rules are valid");
+        let os = cfg.openstack.expect("configured");
+        assert_eq!(os.backend_user_map.len(), 2);
+        assert_eq!(os.backend_user_map[0].match_name, "^web-");
+        assert_eq!(os.backend_user_map[0].user, "ubuntu");
+        assert_eq!(
+            os.backend_user_map[0]
+                .match_metadata
+                .get("role")
+                .map(String::as_str),
+            Some("web")
+        );
+        assert!(os.backend_user_map[1].match_name.is_empty());
+        assert_eq!(os.backend_user_map[1].user, "postgres");
+    }
+
+    #[test]
+    fn unconditional_or_nonsense_rules_are_rejected() {
+        let unconditional = r#"
+            [[openstack.backend_user_map]]
+            user = "ubuntu"
+        "#;
+        let toml = format!(
+            "{}{}{unconditional}",
+            base_without_control_plane(),
+            openstack_pure_section()
+        );
+        assert_eq!(invalid_field(&toml), "openstack.backend_user_map[0]");
+
+        // A rule with no usable user would silently break every login it wins.
+        let no_user = r#"
+            [[openstack.backend_user_map]]
+            match_name = "^web-"
+            user = ""
+        "#;
+        let toml = format!(
+            "{}{}{no_user}",
+            base_without_control_plane(),
+            openstack_pure_section()
+        );
+        assert_eq!(invalid_field(&toml), "openstack.backend_user_map[0].user");
+
+        // Regex is not implemented in v1: reject rather than match literally.
+        let regex = r#"
+            [[openstack.backend_user_map]]
+            match_name = "^web-.*"
+            user = "ubuntu"
+        "#;
+        let toml = format!(
+            "{}{}{regex}",
+            base_without_control_plane(),
+            openstack_pure_section()
+        );
+        assert_eq!(
+            invalid_field(&toml),
+            "openstack.backend_user_map[0].match_name"
+        );
+    }
+
+    #[test]
+    fn shipped_example_config_still_parses() {
+        // The optional-`control_plane` refactor must not loosen anything the
+        // shipped sample relies on: it has no `[openstack]` section, so it
+        // still needs its control plane and must come out unchanged.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let text = std::fs::read_to_string(&path).expect("example config exists");
+        let cfg = GatewayConfig::parse(&text).expect("config.example.toml must stay valid");
+        assert!(cfg.openstack.is_none());
+        assert!(cfg.control_plane.is_some());
     }
 }

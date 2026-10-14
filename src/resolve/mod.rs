@@ -23,7 +23,11 @@ use moka::future::Cache;
 use moka::Expiry;
 
 use crate::error::ResolveError;
-use crate::types::{AuthKey, Fingerprint, Grant, Principal};
+use crate::types::{AuthKey, Fingerprint, Grant, Principal, ResolveSource};
+
+pub mod router;
+
+pub use router::{route_for, ResolveRoute};
 
 /// A fully-validated control-plane target that resolves to the same `Grant`
 /// value as the resolver, used by callers that want the raw resolved grant.
@@ -416,6 +420,9 @@ impl Resolver {
                     agent_fingerprint: key.fingerprint.clone(),
                     target: resp.target,
                     policy: resp.policy,
+                    // Stamped again by the ResolveRouter, which is the only
+                    // component that knows which route produced this grant.
+                    resolve_source: ResolveSource::default(),
                 };
                 self.lock_last_good().insert(key.clone(), grant.clone());
                 CacheEntry::Resolved(Box::new(grant))
@@ -496,6 +503,7 @@ mod tests {
                 user: "root".into(),
             },
             policy: Policy::default(),
+            resolve_source: ResolveSource::default(),
         }
     }
 

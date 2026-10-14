@@ -73,6 +73,70 @@ impl Principal {
     }
 }
 
+/// Whether `raw` is a **canonical, lowercase UUID** (8-4-4-4-12 hyphens).
+///
+/// This is the route predicate for OpenStack instance-UUID routing
+/// (plan-openstack §0/F1): a username shaped like a UUID is treated as an
+/// OpenStack instance id, anything else is not.
+///
+/// Deliberately *not* restricted to version 4: OpenStack overwhelmingly emits
+/// UUIDv4, but historical instances can be UUIDv1 or otherwise, and refusing
+/// them would silently un-route live machines (R10). The check is on the
+/// canonical hyphenated shape only, so the 32-hex "simple" form, the `urn:uuid:`
+/// form and the braced form are all rejected — this predicate is about "does the
+/// username *look* like an instance id", not about general UUID parsing.
+///
+/// Lowercase is required: [`Principal`] rejects uppercase outright, and this
+/// function is also used to validate operator-supplied rules where the same
+/// "OpenStack always prints lowercase" assumption holds
+/// (`uuidgen | tr A-Z a-z`, or the id as returned by the Nova API).
+///
+/// Pure: no configuration, no I/O.
+pub fn is_instance_uuid(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
+        return false;
+    }
+    if raw.bytes().any(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    uuid::Uuid::parse_str(raw).is_ok()
+}
+
+/// Which resolver produced a [`Grant`] (observability only: it never changes
+/// what the grant authorizes).
+///
+/// Recorded in the audit record as `resolve_source` so an auditor can tell a
+/// control-plane grant from an OpenStack UUID-route grant without guessing
+/// from the target host (plan-openstack §3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ResolveSource {
+    /// Resolved (and authorized) by the external control plane.
+    #[default]
+    ControlPlane,
+    /// Resolved from OpenStack Nova (instance UUID → IP); authorization is the
+    /// gateway's own `allow_any_authenticated_key` lab mode (scheme B).
+    OpenStack,
+}
+
+impl ResolveSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResolveSource::ControlPlane => "control_plane",
+            ResolveSource::OpenStack => "openstack",
+        }
+    }
+}
+
+impl std::fmt::Display for ResolveSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::fmt::Display for Principal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -143,6 +207,11 @@ pub struct Grant {
     pub agent_fingerprint: Fingerprint,
     pub target: Target,
     pub policy: Policy,
+    /// Which resolver produced this grant. Stamped by the `ResolveRouter` after
+    /// a successful authorization — the router is the only component that knows
+    /// the route — and surfaced in the audit record as `resolve_source`. Purely
+    /// informational: it never changes what the grant authorizes.
+    pub resolve_source: ResolveSource,
 }
 
 /// The control-plane `POST /api/v1/resolve` request body (propose.md §3.1).
@@ -274,5 +343,65 @@ mod tests {
         let b = SessionId::generate();
         assert_ne!(a, b);
         assert!(a.to_string().len() == 36);
+    }
+
+    #[test]
+    fn instance_uuid_predicate_accepts_canonical_lowercase_uuids() {
+        // Whatever version the runtime clock produces (v7 here): the predicate
+        // must not care about the version nibble.
+        let runtime = uuid::Uuid::now_v7().to_string();
+        let cases = [
+            "00000000-0000-0000-0000-000000000000",
+            "4710fd67-1d3c-4c3e-9d35-6a5c0a9f7d1b",
+            "123e4567-e89b-12d3-a456-426614174000",
+            runtime.as_str(),
+        ];
+        for good in cases {
+            assert!(is_instance_uuid(good), "{good} should route as a UUID");
+        }
+    }
+
+    #[test]
+    fn instance_uuid_predicate_is_not_version_restricted() {
+        // v1 (time-based) and nil must still route: refusing them silently
+        // un-routes live machines.
+        assert!(is_instance_uuid("00000001-0000-1000-8000-00805f9b34fb"));
+        assert!(is_instance_uuid("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+    }
+
+    #[test]
+    fn instance_uuid_predicate_rejects_near_misses() {
+        let bad = [
+            "",                                      // empty
+            "not-a-uuid-at-all",                     // not hex
+            "alex_host1",                            // normal principal
+            "4710fd671d3c4c3e9d356a5c0a9f7d1b",      // 32-hex simple form
+            "4710fd67-1d3c-4c3e-9d35-6a5c0a9f7d1b0", // 37 chars
+            "4710fd67-1d3c-4c3e-9d35-6a5c0a9f7d1",   // 35 chars
+            "4710fd67_1d3c_4c3e_9d35_6a5c0a9f7d1b",  // wrong separators
+            "4710FD67-1D3C-4C3E-9D35-6A5C0A9F7D1B",  // uppercase (Principal rejects)
+            "4710fd67-1d3c-4c3e-9d35-6a5c0a9f7d1g",  // non-hex digit
+            "urn:uuid:4710fd67-1d3c-4c3e-9d35-6a5c0a9f7d1b",
+            "{4710fd67-1d3c-4c3e-9d35-6a5c0a9f7d1b}",
+        ];
+        for bad in bad {
+            assert!(!is_instance_uuid(bad), "{bad:?} must NOT route as a UUID");
+        }
+    }
+
+    #[test]
+    fn instance_uuid_predicate_has_no_separator_misreads() {
+        // Hyphen counts match but positions are wrong.
+        assert!(!is_instance_uuid("-4710fd67-1d3c-4c3e-9d35-6a5c0a9f"));
+        // A 36-char string that is all hex but for the dash positions.
+        assert!(!is_instance_uuid("4710fd671d3c4-c3e9d35-6a5c0a9f7d1b"));
+    }
+
+    #[test]
+    fn resolve_source_default_is_control_plane() {
+        assert_eq!(ResolveSource::default(), ResolveSource::ControlPlane);
+        assert_eq!(ResolveSource::ControlPlane.as_str(), "control_plane");
+        assert_eq!(ResolveSource::OpenStack.as_str(), "openstack");
+        assert_eq!(ResolveSource::OpenStack.to_string(), "openstack");
     }
 }

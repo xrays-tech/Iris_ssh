@@ -860,6 +860,7 @@ mod tests {
                 user: "root".into(),
             },
             policy: crate::types::Policy::default(),
+            resolve_source: crate::types::ResolveSource::default(),
         };
         assert_eq!(
             interceptor.on_subsystem_request("sftp", &grant).await,

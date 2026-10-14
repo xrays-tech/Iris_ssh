@@ -29,8 +29,8 @@ use russh::{Channel, ChannelId, ChannelOpenFailure, Pty};
 
 use crate::audit::{Auditor, CommandInfo};
 use crate::backend::BackendDialer;
-use crate::config::GatewayConfig;
-use crate::error::{Error, Result};
+use crate::config::{ControlPlaneConfig, GatewayConfig};
+use crate::error::{ConfigError, Error, Result};
 use crate::metrics::Metrics;
 use crate::policy::HostKeyVerifier;
 use crate::relay::{self, SubsystemInterceptor};
@@ -408,17 +408,32 @@ impl GatewayContext {
     /// Every failure here is fatal at startup (fail-closed): a bad host key or
     /// an unsafe credential must prevent the gateway from coming up sick.
     pub fn build(config: GatewayConfig) -> Result<Arc<GatewayContext>> {
-        let control_plane = HttpControlPlane::new(
-            config.control_plane.url.clone(),
-            config.control_plane.timeout,
-        )
-        .map_err(|e| {
+        let cp = Self::require_control_plane(&config)?;
+        let control_plane = HttpControlPlane::new(cp.url.clone(), cp.timeout).map_err(|e| {
             Error::io(
                 std::io::Error::other(e.to_string()),
                 "building control-plane HTTP client",
             )
         })?;
         Self::build_with_client(config, Arc::new(control_plane))
+    }
+
+    /// The control-plane settings, or a boot error when there are none.
+    ///
+    /// `[control_plane]` became optional so that OpenStack pure mode
+    /// (`routing = "openstack_only"`) can exist without a control plane at all
+    /// (plan-openstack §0-7). A context still has to be built *around* a
+    /// control-plane client in this shape, so its absence is fatal here rather
+    /// than a panic later; the OpenStack router replaces this path.
+    fn require_control_plane(config: &GatewayConfig) -> Result<ControlPlaneConfig> {
+        config.control_plane.clone().ok_or_else(|| {
+            ConfigError::Invalid {
+                field: "control_plane".into(),
+                reason: "this gateway build has no resolver for OpenStack-only routing:                          configure [control_plane] until the OpenStack router is wired"
+                    .into(),
+            }
+            .into()
+        })
     }
 
     /// [`build`] with an injected control-plane client (production uses
@@ -461,16 +476,17 @@ impl GatewayContext {
             Some(Arc::clone(&ca)),
         ));
 
+        let cp = Self::require_control_plane(&config)?;
         let resolver = Arc::new(Resolver::new(
             control_plane,
-            config.control_plane.cache_ttl,
+            cp.cache_ttl,
             Duration::from_secs(5), // negative cache
             Duration::from_secs(1), // transient coalesce
-            config.control_plane.cache_ttl_jitter,
-            config.control_plane.fail_open,
+            cp.cache_ttl_jitter,
+            cp.fail_open,
             5, // breaker failure threshold
-            config.control_plane.timeout * 3,
-            config.control_plane.timeout,
+            cp.timeout * 3,
+            cp.timeout,
         ));
 
         let interceptor: Arc<dyn SubsystemInterceptor> =

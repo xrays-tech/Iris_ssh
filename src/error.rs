@@ -60,6 +60,14 @@ pub enum ResolveError {
     /// The resolver's circuit breaker is open; requests fail fast.
     #[error("resolver circuit breaker is open for principal {principal:?}")]
     CircuitOpen { principal: String },
+
+    /// The principal matched no route: [`crate::resolve::route_for`] rejected it.
+    ///
+    /// Raised *before* any network call, so this is a configuration / traffic
+    /// shape failure, not an upstream outage — operators fix it by enabling the
+    /// OpenStack route or adjusting the routing mode.
+    #[error("principal {principal:?} is not routed: {reason}")]
+    Unrouted { principal: String, reason: String },
 }
 
 /// Backend host-key loading, host-key verification and dialing failures.

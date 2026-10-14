@@ -345,6 +345,7 @@ mod tests {
                 user: "root".into(),
             },
             policy: Policy::default(),
+            resolve_source: crate::types::ResolveSource::default(),
         }
     }
 

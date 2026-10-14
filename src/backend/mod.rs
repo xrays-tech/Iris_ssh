@@ -328,7 +328,15 @@ impl BackendDialer {
             verifier,
             client_config: Arc::new(client_config),
             metrics,
-            dial_timeout: config.control_plane.timeout,
+            // A control plane's timeout doubles as the dial deadline; in
+            // OpenStack pure mode there is no control plane, so fall back to
+            // the OpenStack request timeout and finally the 2s default.
+            dial_timeout: config
+                .control_plane
+                .as_ref()
+                .map(|cp| cp.timeout)
+                .or_else(|| config.openstack.as_ref().map(|os| os.timeout))
+                .unwrap_or(Duration::from_secs(2)),
             dial_breaker: DialCircuitBreaker::new(
                 config.pool.circuit_failure_threshold,
                 config.pool.circuit_reset_timeout,
@@ -584,6 +592,7 @@ mod tests {
                 user: "root".to_owned(),
             },
             policy: crate::types::Policy::default(),
+            resolve_source: crate::types::ResolveSource::default(),
         }
     }
 
