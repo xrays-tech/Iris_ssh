@@ -35,8 +35,8 @@
 set -uo pipefail
 
 SUBTOPO_DIR="${SUBTOPO_DIR:-}"
-ST_SSHD_PORT=""; ST_CP_PORT=""; ST_GW_PORT=""; ST_MET_PORT=""
-ST_GW_PID=""; ST_CP_PID=""; ST_SSHD_PID=""
+ST_SSHD_PORT=""; ST_CP_PORT=""; ST_GW_PORT=""; ST_MET_PORT=""; ST_OS_PORT=""
+ST_GW_PID=""; ST_CP_PID=""; ST_SSHD_PID=""; ST_OS_PID=""
 SUBTOP_FAIL_OPEN="${SUBTOP_FAIL_OPEN:-false}"
 SUBTOP_CACHE_TTL="${SUBTOP_CACHE_TTL:-30s}"
 SUBTOP_TTL_JITTER="${SUBTOP_TTL_JITTER:-3s}"
@@ -76,6 +76,35 @@ SUBTOP_SSH_A="${SUBTOP_SSH_A:-1}"
 # Whether subtopo_start is allowed to stand up an agent for this shell.
 SUBTOP_NO_AGENT="${SUBTOP_NO_AGENT:-0}"
 
+# --- OpenStack topology (plan-openstack §4.2) ------------------------------
+# SUBTOP_OPENSTACK          non-empty => render a [openstack] section AND start
+#                           scripts/mock_openstack.py (the gateway then routes
+#                           instance UUIDs to it). Empty keeps today's topology
+#                           byte-for-byte, which is what "default off" means.
+# SUBTOP_OPENSTACK_RULES    path to an instances rules JSON (static: every test
+#                           instance lives on 127.0.0.1 and the SSH port comes
+#                           from [openstack] ssh_port). Empty => a default
+#                           single-instance file built from the knobs below.
+# SUBTOP_OPENSTACK_PURE     "1" (default) => omit [control_plane] entirely, so
+#                           every OpenStack case also proves the gateway boots
+#                           with no control plane at all (MUST2). "0" keeps both.
+SUBTOP_OPENSTACK="${SUBTOP_OPENSTACK:-}"
+SUBTOP_OPENSTACK_RULES="${SUBTOP_OPENSTACK_RULES:-}"
+SUBTOP_OPENSTACK_PURE="${SUBTOP_OPENSTACK_PURE:-1}"
+SUBTOP_OPENSTACK_UUID="${SUBTOP_OPENSTACK_UUID:-550e8400-e29b-41d4-a716-446655440000}"
+SUBTOP_OS_METADATA_KEY="${SUBTOP_OS_METADATA_KEY:-iris_ssh_user}"
+SUBTOP_OS_METADATA_USER="${SUBTOP_OS_METADATA_USER:-${BACKEND_USER:-alex}}"
+SUBTOP_OS_DEFAULT_USER="${SUBTOP_OS_DEFAULT_USER:-${BACKEND_USER:-alex}}"
+SUBTOP_OS_ON_AMBIGUOUS="${SUBTOP_OS_ON_AMBIGUOUS:-reject}"
+# `[openstack]` carries its own cache/timeout knobs, independent of
+# [control_plane]; `fail_open` stays false (red line 5: serving a stale address
+# requires an explicit opt-in AND a pinned host-key policy).
+SUBTOP_OS_CACHE_TTL="${SUBTOP_OS_CACHE_TTL:-30s}"
+SUBTOP_OS_TIMEOUT="${SUBTOP_OS_TIMEOUT:-3s}"
+SUBTOP_OS_FAIL_OPEN="${SUBTOP_OS_FAIL_OPEN:-false}"
+# Extra `[openstack]` lines a case may need (e.g. network = "private").
+SUBTOP_OS_EXTRA="${SUBTOP_OS_EXTRA:-}"
+
 # toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
 toml_arr() {
   local out='[' first=1 v
@@ -110,6 +139,8 @@ subtopo_start() {
 
   ST_SSHD_PORT="$(alloc_port)"; ST_CP_PORT="$(alloc_port)"
   ST_GW_PORT="$(alloc_port)";   ST_MET_PORT="$(alloc_port)"
+  ST_OS_PORT=""
+  [ -n "$SUBTOP_OPENSTACK" ] && ST_OS_PORT="$(alloc_port)"
 
   # The agent-env case needs the backend to actually *accept* the variable the
   # gateway forwards; without an AcceptEnv line sshd drops it and the case would
@@ -135,13 +166,42 @@ subtopo_start() {
   local _env_al=""
   [ -n "$SUBTOP_ENV_ALLOWLIST" ] && _env_al="env_allowlist=$(toml_arr "$SUBTOP_ENV_ALLOWLIST")"
 
+  # Instance table for the mock Nova. Static on purpose: the SSH port lives in
+  # [openstack] ssh_port, never in the instance document, so a case can hand us
+  # a rules file it wrote before the topology existed.
+  if [ -n "$SUBTOP_OPENSTACK" ]; then
+    if [ -n "$SUBTOP_OPENSTACK_RULES" ]; then
+      cp "$SUBTOP_OPENSTACK_RULES" "$SUBTOPO_DIR/os_rules.json" || return 1
+    else
+      printf '{"servers":{"%s":{"addresses":{"private":[{"addr":"127.0.0.1","version":4,"OS-EXT-IPS:type":"fixed"}]},"metadata":{"%s":"%s"},"name":"inst-1","image":{"id":"img-1"}}},"default":{"status":404}}\n' \
+        "$SUBTOP_OPENSTACK_UUID" "$SUBTOP_OS_METADATA_KEY" "$SUBTOP_OS_METADATA_USER" \
+        > "$SUBTOPO_DIR/os_rules.json"
+    fi
+  fi
+
   # No [backend] credential: the gateway signs for the backend leg with the
   # client's forwarded agent (plan-agent-only D3), so [backend] carries only the
   # host-key policy.
-  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
+  # [control_plane] disappears in OpenStack pure mode: the gateway has to boot
+  # with no control plane at all there, and every OpenStack case re-proves it.
+  local _cp_toml=""
+  if [ -z "$SUBTOP_OPENSTACK" ] || [ "$SUBTOP_OPENSTACK_PURE" = "0" ]; then
+    _cp_toml="$(printf '[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n' \
+      "$ST_CP_PORT" "$SUBTOP_CACHE_TTL" "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER")"
+  fi
+  local _os_toml=""
+  if [ -n "$SUBTOP_OPENSTACK" ]; then
+    _os_toml="$(printf '[openstack]\nenabled = true\nrouting = "openstack_only"\nauthorization = "openstack_only"\nallow_any_authenticated_key = true\nauth_url = "http://127.0.0.1:%s/v3"\nnova_endpoint = "http://127.0.0.1:%s/v2.1"\napplication_credential_id = "cred-id"\napplication_credential_secret = "cred-secret"\nproject_id = "proj-1"\nregion = "RegionOne"\ninterface = "public"\nssh_port = %s\ncache_ttl = "%s"\ntimeout = "%s"\nfail_open = %s\naddress_family = "ipv4"\nprefer = "floating"\non_ambiguous = "%s"\ndefault_backend_user = "%s"\nbackend_user_metadata_key = "%s"\n%s\n' \
+      "$ST_OS_PORT" "$ST_OS_PORT" "$ST_SSHD_PORT" \
+      "$SUBTOP_OS_CACHE_TTL" "$SUBTOP_OS_TIMEOUT" "$SUBTOP_OS_FAIL_OPEN" \
+      "$SUBTOP_OS_ON_AMBIGUOUS" "$SUBTOP_OS_DEFAULT_USER" "$SUBTOP_OS_METADATA_KEY" \
+      "$SUBTOP_OS_EXTRA")"
+  fi
+
+  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n%s%s\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
     "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" "$_env_al" \
     "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
-    "$ST_CP_PORT" "$SUBTOP_CACHE_TTL"     "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
+    "$_cp_toml" "$_os_toml" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
 
   # B3 sftp-intercept section (defaults are inert; older gateways that predate
   # these fields simply ignore the unknown sections).
@@ -163,13 +223,23 @@ subtopo_start() {
     --port "$ST_CP_PORT" --rules "$SUBTOPO_DIR/rules.json" \
     >"$SUBTOPO_DIR/cp.log" 2>&1 &
   ST_CP_PID=$!
+  if [ -n "$SUBTOP_OPENSTACK" ]; then
+    python3 "$SUBTOPO_CASE_DIR/../../scripts/mock_openstack.py" \
+      --port "$ST_OS_PORT" --rules "$SUBTOPO_DIR/os_rules.json" \
+      --access-log "$SUBTOPO_DIR/os_access.log" \
+      >"$SUBTOPO_DIR/os.log" 2>&1 &
+    ST_OS_PID=$!
+  fi
   "$SUBTOPO_GW_BIN" --config "$SUBTOPO_DIR/gw.toml" >"$SUBTOPO_DIR/gw.log" 2>&1 &
   ST_GW_PID=$!
 
   wait_tcp_open 127.0.0.1 "$ST_SSHD_PORT" 20 || { tail_log "$SUBTOPO_DIR/sshd.log" 20; return 1; }
   wait_http_ok "http://127.0.0.1:${ST_CP_PORT}/healthz"  20 || { tail_log "$SUBTOPO_DIR/cp.log" 20;  return 1; }
+  if [ -n "$SUBTOP_OPENSTACK" ]; then
+    wait_http_ok "http://127.0.0.1:${ST_OS_PORT}/healthz" 20 || { tail_log "$SUBTOPO_DIR/os.log" 20; return 1; }
+  fi
   wait_http_ok "http://127.0.0.1:${ST_MET_PORT}/healthz" 20 || { tail_log "$SUBTOPO_DIR/gw.log" 20; return 1; }
-  log "subtopo up: gateway=$ST_GW_PORT cp=$ST_CP_PORT backend=$ST_SSHD_PORT"
+  log "subtopo up: gateway=$ST_GW_PORT cp=$ST_CP_PORT backend=$ST_SSHD_PORT${ST_OS_PORT:+ os=$ST_OS_PORT}"
 }
 
 # Kill server-side backend session procs on our port (drops the gateway's backend
@@ -262,6 +332,77 @@ subtopo_agent_stop() {
 subtopo_stop() {
   [ -n "$ST_GW_PID" ]  && kill -9 "$ST_GW_PID"  2>/dev/null || true
   [ -n "$ST_CP_PID" ]  && kill -9 "$ST_CP_PID"  2>/dev/null || true
+  subtopo_kill_os
   _subtopo_kill_port_sessions "$ST_SSHD_PORT"
   [ -n "$ST_SSHD_PID" ] && kill -9 "$ST_SSHD_PID" 2>/dev/null || true
+}
+
+# Kill the mock OpenStack only (the "Nova is down" case); the gateway keeps
+# running so the assertion is about fail-closed resolution, not about a dead
+# gateway.
+subtopo_kill_os() {
+  if [ -n "${ST_OS_PID:-}" ]; then
+    kill -TERM "$ST_OS_PID" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$ST_OS_PID" 2>/dev/null || true
+    ST_OS_PID=""
+  fi
+}
+
+# openstack_topo_start <authorized_keys-file> [instances-rules-json]
+#
+# Sub-topology with an agent-key-only backend *and* the OpenStack route: the
+# gateway resolves instance UUIDs through the mock Nova and reaches the backend
+# only by asking the client's forwarded agent to sign. No [control_plane] is
+# rendered (SUBTOP_OPENSTACK_PURE default), so a green case also proves pure
+# mode boots with no control plane (MUST2).
+openstack_topo_start() {
+  SUBTOP_SSHD_AUTHORIZED_KEYS="$1"
+  SUBTOP_AGENT_FORWARDING="true"
+  SUBTOP_OPENSTACK="1"
+  # Second argument is the instance table, not a mode: SUBTOP_OPENSTACK is the
+  # on/off switch (anything non-empty), SUBTOP_OPENSTACK_RULES is the table.
+  [ -n "${2:-}" ] && SUBTOP_OPENSTACK_RULES="$2"
+  subtopo_start
+}
+
+# subtopo_os_count <METHOD> <path-prefix> -> number of matching mock requests.
+# This is the MUST1 probe: "zero Nova requests while only the public-key shape
+# was checked" reads as `subtopo_os_count GET /v2.1/servers/` == 0.
+subtopo_os_count() {
+  local method="$1" prefix="$2"
+  curl -fsS --max-time 4 "http://127.0.0.1:${ST_OS_PORT}/__log" 2>/dev/null |
+    python3 -c 'import json, sys
+method, prefix = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(sys.stdin).get("requests", [])
+except Exception:
+    data = []
+print(sum(1 for r in data
+          if r.get("method") == method and str(r.get("path", "")).startswith(prefix)))' \
+      "$method" "$prefix"
+}
+
+# subtopo_os_statuses <METHOD> <path-prefix> -> the response codes of the
+# matching requests, space-separated. "404" and "200" look identical from the
+# client (both end in a plain auth failure) but only "200" proves the lookup
+# succeeded and the *selection* refused the instance.
+subtopo_os_statuses() {
+  local method="$1" prefix="$2"
+  curl -fsS --max-time 4 "http://127.0.0.1:${ST_OS_PORT}/__log" 2>/dev/null |
+    python3 -c 'import json, sys
+method, prefix = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(sys.stdin).get("requests", [])
+except Exception:
+    data = []
+print(" ".join(str(r.get("status", "-")) for r in data
+               if r.get("method") == method and str(r.get("path", "")).startswith(prefix)))' \
+      "$method" "$prefix"
+}
+
+# subtopo_os_log -> the mock's request log as JSON ({"requests":[]} when down).
+subtopo_os_log() {
+  curl -fsS --max-time 4 "http://127.0.0.1:${ST_OS_PORT}/__log" 2>/dev/null \
+    || printf '{"requests":[]}'
 }

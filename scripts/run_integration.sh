@@ -517,6 +517,16 @@ ALL_CASES=(
   case_agent_env
   case_agent_multichannel
   case_agent_cert_front
+  # plan-openstack §4.2 (layer O4): the instance-UUID route. `*_preauth_no_lookup`
+  # is MUST1, the pure-mode boot is asserted inside `case_openstack_uuid_route`.
+  case_openstack_uuid_route
+  case_openstack_unknown_uuid
+  case_openstack_no_address
+  case_openstack_ambiguous
+  case_openstack_user_map
+  case_openstack_preauth_no_lookup
+  case_openstack_non_uuid
+  case_openstack_upstream_down
 )
 
 resolve_case_path() {
