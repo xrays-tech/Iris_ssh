@@ -76,5 +76,5 @@
   - metadata 命中但值非法（空/含空白或控制字符）按 `reason=user_map` **告警后跳过并回落默认用户**，而不是当作 `Decode` 硬失败——避免一个脏标签把整批实例锁在门外。
   - `enabled=false` 的短路放在组合规则之前：关掉特性时不必先复位 `routing`/`authorization`；枚举拼写错误仍在校验期报错（拼错不能静默变成"关闭"）。
   - `auth_method="token"` 分支的 `auth_body` 已删除（该枚举值仍可解析，走 token 逃生口）；Keystone token 刷新单飞，401 只失效触发失败的那一个 token。
-- **触发条件**（运维说明）：需要在无控制面的内网实验环境里按实例 UUID 直连时启用；生产一律走默认（`authorization="control_plane"`）。
+- **触发条件**（运维说明）：需要在无控制面的内网实验环境里按实例 UUID 直连时启用；生产一律保持 `[openstack]` **默认关（不启用）**，待方案 A（`authorization="control_plane"` 控制面授权）落地后再考虑启用。
 - **处置 / 复审**：启用前逐条确认上面的授权语义；上线看板加 `sshgw_openstack_resolve_err_total` 与 `target=resolve` 的 reason 分布。复审重点：**方案 A（`authorization="control_plane"`）缺位是否可接受——它决定 hybrid 是否该被保留为"解析通过但不可启用"**、方案 B 的授权边界、`match_image` 的去留、以及"缓存 TTL 内不联网"是否与运维预期一致。
