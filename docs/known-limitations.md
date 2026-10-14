@@ -55,3 +55,20 @@
 - **唯一门**：后端认证的唯一开关是 `policy.agent_forwarding`。为 `false` 的 grant **整体拒绝**，既没有、也不会回落成 key/cert（网关手里没有第二套凭证）；`tcp_forwarding = true` 不改变任何行为，`direct-tcpip` 恒拒绝（jump 模式已随 D1 删除，网关不是出站跳板）。
 - **触发条件**（运维说明）：控制面若仍在下发这三个字段，需要在下一次策略迭代中删除，以免运维或审计从策略里读出"这个会话开了转发/用了 key"的错觉。
 - **处置**：无需数据迁移。审计侧判断"是否 agent 会话"看审计记录的 `auth_kind="agent"`（见 `docs/ops-runbook.md` §5.7），指标看 `sshgw_agent_backend_auth_*`；上线前确认告警与看板没有基于 `tcp_forwarding` 或 `backend_auth` 的规则。
+
+## 9. OpenStack 实例 UUID 即路由（方案 B）——已实现，但**只授权实验室/内网 PoC**
+
+- **状态**：plan-openstack 方案 B 已按分层 O1..O5 落地（`routing=openstack_only` + `authorization=openstack_only` + `allow_any_authenticated_key=true`），**默认关闭**：不写 `[openstack]` 节或 `enabled=false` 时，路由谓词对所有 principal 都答"控制面"，行为与旧版一致。用例覆盖 `case_openstack_*` 共 8 个（含 MUST1 预认证零联网 `case_openstack_preauth_no_lookup`）。
+- **授权语义（最重要的一条）**：`authorization="openstack_only"` 意味着**没有控制面这道授权**——任何通过前腿验签的密钥，只要知道/猜到实例 UUID，就能登进该实例，范围仅受 application credential 的 project scope 限制。`allow_any_authenticated_key=true` 是刻意刺眼的开关名，启动打 WARN；**禁止**用在共享或公网可达的网关上。缓解手段只有纵深：最小 project scope、`max_auth_attempts` + 负缓存限速枚举、所有失败对客户端同构拒绝、审计记录每次解析。
+- **`routing="openstack_only"` 没有控制面回退**：非 UUID principal 在任何网络调用之前就被拒绝（`reason=unrouted`），`[control_plane]` 节可整节省略。这不是降级路径，而是路由表本身决定的。
+- **预认证零联网**：`auth_publickey_offered` 只跑纯路由谓词，Nova/Keystone 查询发生在签名校验之后。改动这条等于把探测阶段变成未认证的查询放大器（MUST1，有黑盒用例看守）。
+- **目标地址只来自 Nova**：用户名里不允许携带 host/IP（SSRF 红线），多网络且未配 `network` 的实例按 `on_ambiguous="reject"` 拒绝。**代价**：这类实例在配置补上 `network` 之前是不可达的，属预期失败而非故障。
+- **缓存 vs fail-open 的分工**：`[openstack] cache_ttl` 之内缓存是权威的（与控制面路由一致，这不叫 fail-open）；TTL 过期后 Nova 不可达即拒绝，因为 `fail_open=false`（要放开必须显式 `fail_open=true` **且** `[backend] host_key_policy="pinned"`）。集成用例 `case_openstack_upstream_down` 用 1s TTL 把"过期后必须拒绝"钉死。
+- **本批次未实现/已裁决的偏离**（对着 plan-openstack 的差异说明，供复审）：
+  - `backend_user_map` 的 `match_image` **未实现**（plan §3.4 标为可选；按镜像名匹配还要额外查 Glance，v1 不做），且 `match_name` 只做**精确/前缀**匹配、不引入 `regex` 依赖（正是 plan 建议的 v1 取舍）。已实现的映射链：实例 metadata 键 → `[[openstack.backend_user_map]]` 规则（`match_name` + `match_metadata` AND、声明序首个命中）→ `default_backend_user`。
+  - `user_domain_name` / `project_domain_name` **已从配置删除**：application-credential/token 请求体都不发送它们，属于死配置（plan §3.6 草案里的字段）。
+  - metadata 命中但值非法（空/含空白或控制字符）按 `reason=user_map` **告警后跳过并回落默认用户**，而不是当作 `Decode` 硬失败——避免一个脏标签把整批实例锁在门外。
+  - `enabled=false` 的短路放在组合规则之前：关掉特性时不必先复位 `routing`/`authorization`；枚举拼写错误仍在校验期报错（拼错不能静默变成"关闭"）。
+  - `auth_method="token"` 分支的 `auth_body` 已删除（该枚举值仍可解析，走 token 逃生口）；Keystone token 刷新单飞，401 只失效触发失败的那一个 token。
+- **触发条件**（运维说明）：需要在无控制面的内网实验环境里按实例 UUID 直连时启用；生产一律走默认（`authorization="control_plane"`）。
+- **处置 / 复审**：启用前逐条确认上面的授权语义；上线看板加 `sshgw_openstack_resolve_err_total` 与 `target=resolve` 的 reason 分布。复审重点：方案 B 的授权边界、`match_image` 的去留、以及"缓存 TTL 内不联网"是否与运维预期一致。

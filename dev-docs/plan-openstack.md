@@ -305,6 +305,11 @@ GatewaySession::resolve_grant
    ```
    多条件为 AND；全空的规则非法（校验期拒绝）。用 `regex` crate（新增依赖）或
    简化 glob——建议 v1 先支持精确/前缀匹配，regex 作为可选。
+   > **【已实施，O2】**：`[[openstack.backend_user_map]]` 已落地，条件为
+   > `match_name`（`^` 前缀匹配，否则全等）+ `match_metadata`（子集全等），**未引入
+   > `regex` 依赖**；`match_image` **未实现**（plan 自身标注可选，且按镜像名匹配需
+   > 额外查 Glance）。映射链 = 实例 metadata 键 → 规则（声明序首个命中）→
+   > `default_backend_user`。
 3. **`default_backend_user`**（required 兜底）。
 
 - 结果校验：非空、无空白/控制字符；否则 `Decode`/配置错误（fail loud）。
@@ -376,8 +381,9 @@ application_credential_id = "..."
 application_credential_secret = "..."     # 用文件/环境变量注入更好，见注释
 # token = "..."                           # auth_method="token" 时的逃生口（仅测试）
 project_id = "..."                         # scope；强烈建议最小 project
-user_domain_name = "Default"
-project_domain_name = "Default"
+# user_domain_name / project_domain_name —— 【已移除，O2】草案里的这两个字段是
+# 死配置：application-credential 与静态 token 请求体都不发送它们，解析出来只是
+# 摆设，故从 RawConfig/OpenStackConfig 删除，避免运维误以为改了就生效。
 region = "RegionOne"
 interface = "public"                       # public | internal | admin
 # nova_endpoint = "https://nova.example.internal:8774/v2.1"  # 跳过 catalog
@@ -470,31 +476,43 @@ recording = false
 - `GET /healthz`、`GET /__log`（记录请求，供断言"未认证时未查 Nova"）。
 - `--port/--rules/--pidfile/--bind/--access-log`，SIGTERM 优雅退出。
 
-**harness 扩展**：`subtopo.sh` 增加 `SUBTOP_OPENSTACK_ENABLED/RULES/PORT` 等，
-在 `gw.toml` 渲染 `[openstack]`（nova_endpoint 指向 mock，backend 地址用
-`127.0.0.1:$ST_SSHD_PORT` 写入 rules），并在 162 行旁起 `mock_openstack.py`。
+**harness 扩展【已实施，O4】**：`subtopo.sh` 增加 `SUBTOP_OPENSTACK[_RULES/_PURE/_UUID]`
+与 `SUBTOP_OS_{METADATA_KEY,METADATA_USER,DEFAULT_USER,ON_AMBIGUOUS,CACHE_TTL,TIMEOUT,FAIL_OPEN,EXTRA}`
+及 `openstack_topo_start` / `subtopo_kill_os` / `subtopo_os_count` /
+`subtopo_os_statuses` / `subtopo_os_log`；在 `gw.toml` 渲染 `[openstack]`
+（`nova_endpoint`/`auth_url` 指向 mock，`ssh_port = $ST_SSHD_PORT`），并与
+`mock_control_plane.py` 并排起 `mock_openstack.py`。默认 `SUBTOP_OPENSTACK_PURE=1`
+→ **不渲染 `[control_plane]`**，因此每个 OpenStack 用例都顺带证明纯模式可启动。
+实例文档只带地址（端口来自 `[openstack] ssh_port`），所以 rules JSON 是静态的，
+用例可在拓扑起来之前就写好。
 
-**新用例**（注册进 `scripts/run_integration.sh:488-519`）：
-- `case_openstack_uuid_route.sh` — `ssh -A <uuid>@gw` 命中 Nova → 连入本地 sshd 模拟的
+**新用例**（注册进 `scripts/run_integration.sh` 的 `ALL_CASES`；**【已实施，O4】**
+下表标 ✅ 的已落地，标 ➖ 的有意裁剪，标 ⏳ 的留给后续批次）：
+- `case_openstack_uuid_route.sh` ✅ — `ssh -A <uuid>@gw` 命中 Nova → 连入本地 sshd 模拟的
   实例；断言命令执行成功、审计 `resolve_source=openstack`、`target_user` 为映射值。
-- `case_openstack_unknown_uuid.sh` — 未知 UUID → 404 → 协议原生拒绝（无会话）。
-- `case_openstack_no_address.sh` — 实例存在但 addresses 空 → 拒绝。
-- `case_openstack_multi_network.sh` — 两网络：配 `network` 命中其一；不配 → reject。
-- `case_openstack_ambiguous.sh` — 多候选且 `on_ambiguous=reject` → 拒绝；
+- `case_openstack_unknown_uuid.sh` ✅ — 未知 UUID → 404 → 协议原生拒绝（无会话）。
+- `case_openstack_no_address.sh` ✅ — 实例存在但 addresses 空 → 拒绝。
+- `case_openstack_multi_network.sh` ➖ — 两网络：配 `network` 命中其一；不配 → reject。
+- `case_openstack_ambiguous.sh` ✅ — 多候选且 `on_ambiguous=reject` → 拒绝；
   `first` → 稳定选择 + warn。
-- `case_openstack_user_map.sh` — metadata/规则/default 三条优先级各一断言。
-- `case_openstack_preauth_no_lookup.sh` — 未验签 probe（仅 offered）不得产生 Nova 请求
+- `case_openstack_user_map.sh` ✅ — metadata/规则/default 三条优先级各一断言。
+- `case_openstack_preauth_no_lookup.sh` ✅ — 未验签 probe（仅 offered）不得产生 Nova 请求
   （断言 mock `__log` 为空），验签后才出现。
-- `case_openstack_hybrid_fallback.sh` — 非 UUID 用户名仍走 CP（原用例语义不变）。
-- `case_openstack_only_rejects_nonuuid.sh` — pure 模式拒绝非 UUID。
-- `case_openstack_cp_authorized.sh`（方案 A）— CP 拒绝时不查 Nova（`__log` 空）且拒绝；
+- `case_openstack_hybrid_fallback.sh` ⏳ — 非 UUID 用户名仍走 CP（原用例语义不变）。
+- `case_openstack_only_rejects_nonuuid.sh` ✅（实际名 `case_openstack_non_uuid.sh`） — pure 模式拒绝非 UUID。
+- `case_openstack_cp_authorized.sh` ⏳（方案 A）— CP 拒绝时不查 Nova（`__log` 空）且拒绝；
   CP 允许时才查 Nova。
-- `case_openstack_upstream_down.sh` — mock OpenStack 停掉 → fail-closed 拒绝；
+- `case_openstack_upstream_down.sh` ✅ — mock OpenStack 停掉 → fail-closed 拒绝；
   `fail_open` + pinned host key 时旧 IP 仍可连（可选）。
-- `case_openstack_ipv6.sh` — 后端监听 `::1`，Nova 返回 v6 字面量（可选，视 CI 能力）。
+- `case_openstack_ipv6.sh` ⏳ — 后端监听 `::1`，Nova 返回 v6 字面量（可选，视 CI 能力）。
 
-**回归**：现有 31 个用例（`scripts/run_integration.sh:488-519`）必须全绿——关键是
-`enabled=false` 时行为字节级不变。
+**回归**：现有用例必须全绿——关键是 `enabled=false` 时行为字节级不变。
+> **【实测，O4/O5】**：全量 `scripts/run_integration.sh` = **38 pass / 0 fail /
+> 2 skip**，计 40 项 = infra prelude 1 + 既有用例 31 + 新增 OpenStack 用例 8；
+> 2 个 skip 是既有的真机 capability-gated 项（halfopen / netem）。另：`case_openstack_multi_network` 未单列，其两个分支由
+> `case_openstack_ambiguous`（不配 `network` → reject）与 `case_openstack_uuid_route`
+> （单网络正常命中）覆盖；`hybrid_fallback` / `cp_authorized`（方案 A）/ `ipv6` 留待
+> 方案 A 落地或需要真机能力时补。
 
 ---
 

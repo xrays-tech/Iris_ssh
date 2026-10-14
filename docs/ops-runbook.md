@@ -72,10 +72,19 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `channels_per_conn` | `8` | 每连接 ≤8（sshd MaxSessions 安全界） |
 | | `keepalive_interval` / `keepalive_max_miss` | `15s` / `2` | 假死检测（`keepalive_timeout` 为保留字段，实际语义见 §5.3） |
 | | `circuit_failure_threshold` / `circuit_reset_timeout` | `5` / `30s` | 拨号熔断 |
-| `[control_plane]` | `url` | — | 控制面 resolve 地址（POST /api/v1/resolve） |
+| `[control_plane]` | `url` | — | 控制面 resolve 地址（POST /api/v1/resolve）。**`routing="openstack_only"` 时整节可省略**（此时网关不向它发任何请求）；其余路由下必填 |
 | | `cache_ttl` | `30s` | 授权缓存 |
 | | `timeout` | `2s` | 控制面请求超时 |
 | | `fail_open` | `false`（注释） | 控制面故障时用旧缓存放行 |
+| `[openstack]` | `enabled` | `false` | **默认关**：缺本节或 `enabled=false` 时行为与旧版完全一致（路由谓词对所有 principal 都答"控制面"） |
+| | `routing` | `hybrid` | `hybrid`：UUID→Nova，其余→控制面；`openstack_only`：只认规范 UUID，**无控制面回退**，非 UUID 直接拒绝 |
+| | `authorization` | `control_plane` | `control_plane`：授权权威仍在控制面（推荐）；`openstack_only`：**实验室模式**，必须同时 `allow_any_authenticated_key = true`，语义是"任意通过前腿验签的密钥 + 已知 UUID ⇒ 可达该实例"（见 §5.8 / `known-limitations.md` §9） |
+| | `auth_url` / `application_credential_*` / `project_id` | — | Keystone v3；`project_id` 是 token scope，也是可见实例范围的爆炸半径闸门；secret 支持 `_file` 与环境变量注入 |
+| | `nova_endpoint` | 空 | 显式 Nova base URL（跳过 catalog 发现；测试/内网云用） |
+| | `timeout` / `cache_ttl` / `fail_open` | `3s` / `30s` / `false` | 独立于 `[control_plane]` 的缓存与超时；`fail_open=true` 才允许在 TTL 过期后用旧地址（且须配合 `host_key_policy="pinned"`） |
+| | `network` / `address_family` / `prefer` / `on_ambiguous` | `""` / `ipv4` / `floating` / `reject` | 地址选择；多网络实例不配 `network` 且候选 >1 → 拒绝（`on_ambiguous="reject"`） |
+| | `default_backend_user` / `backend_user_metadata_key` | — / `""` | 后端登录用户：metadata 命中 → 映射规则 → `default_backend_user`（enabled 时必填） |
+| | `ssh_port` | `22` | 所有实例的 SSH 端口（实例文档里不带端口） |
 | `[limits]` | `max_sessions` / `max_sessions_per_ip` | `10000` / `20` | 准入 |
 | | `auth_timeout` | `30s` | 首个 "none" 认证探测的 backoff 上限（实际延迟 = `min(auth_timeout, auth_rejection_pad)`；`0s` 关闭每连接 initial backoff，**保留每次拒绝的持续 pad**，公钥/证书为主的生产可用；非整个认证期预算） |
 | | `auth_rejection_pad` | `1s` | 每次认证拒绝的恒时填充（防时间泄露） |
@@ -93,6 +102,7 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 
 - **客户端 → 网关**：公钥（`auth_publickey`）或用户证书（`auth_openssh_certificate`，按 CA / 有效期 / principals 校验）。`auth_publickey_offered` 仅为预热/形状预检，**不**在该阶段做最终 accept。恶意签名一律被 russh 库拒。
 - **网关 → 后端**：agent 穿透（§2.4 / §5.7）。网关以用户转发来的 ssh-agent 签名认证，且**只签控制面已授权的那个指纹**；网关自身不提供任何 key/cert 凭据。
+- **目标来自哪里**：用户名只是一条**路由线索**，不是目标地址。启用 `[openstack]` 后规范形式的实例 UUID 走 Nova，其余源照旧走控制面（`routing="openstack_only"` 时非 UUID 直接拒绝、不回退）。目标 host 始终由 Nova 返回的地址决定，用户名里出现 host/IP 是不可能的（SSRF 红线）。预认证的 publickey 探测（`auth_publickey_offered`）在 OpenStack 路由上**只跑纯路由谓词、零网络调用**，真正的 Nova 查询发生在客户端完成签名校验之后（plan-openstack MUST1，用例 `case_openstack_preauth_no_lookup`）。
 
 ---
 
@@ -197,6 +207,44 @@ kill -TERM <ssh-gw-pid>        # 或 systemctl stop
 
 **可观测**：审计记录带 `auth_kind="agent"`、`agent_identity`（签名身份指纹）与 `agent_signatures`（签名次数）；指标见 §5.5 agent 三行。
 
+### 5.8 OpenStack 实验室模式（方案 B，`routing=openstack_only`）
+
+**定位**：这是**显式实验室/内网 PoC 模式**，不是生产路由方案。它去掉控制面这条依赖，让"OpenStack 实例 UUID 本身就是路由"：客户端用 `<instance-uuid>@gw` 登录，网关查 Nova 拿地址与后端用户，再用转发来的 agent 签名拨进实例。默认关闭；不写 `[openstack]` 节时行为与旧版完全一致。
+
+**启用条件（缺一不可，配置层会拒绝其它组合）**
+```toml
+[openstack]
+enabled = true
+routing = "openstack_only"          # 只认规范 UUID，非 UUID 直接拒绝、不回退控制面
+authorization = "openstack_only"    # 危险：授权权威就是 Nova 的回答
+allow_any_authenticated_key = true  # 必须显式置 true，接受其语义
+auth_url = "https://keystone.../v3"
+application_credential_id = "..."
+application_credential_secret_file = "/etc/ssh-gw/os-appcred.secret"
+project_id = "..."                  # scope = 爆炸半径闸门，给最小 project
+nova_endpoint = "https://nova.../v2.1"
+default_backend_user = "cloud-user"
+ssh_port = 22
+```
+此时 `[control_plane]` 整节可以不写。**启动日志会打两条 WARN**（`allow_any_authenticated_key = true: ... Lab mode only.` 与 `talking to OpenStack over plain http`），看到它们才说明模式确实打开了。
+
+**安全语义（写进变更单）**
+- 任意通过前腿验签的密钥，只要知道（或猜到）实例 UUID，就能登进该实例，**范围仅受 application credential 的 project 限制**。UUID 不是秘密（日志、对象存储、API 都会泄露），且 Nova 的 404/200 差异构成存在性预言机——所有失败对客户端同构 `Auth::reject()`，缓解靠 `max_auth_attempts` + 负缓存限速，不是靠 UUID 难猜。
+- 目标 host **只能**来自 Nova；`network` 过滤、`on_ambiguous="reject"`（默认）保证不会拨到歧义地址。
+- `fail_open` 默认 `false`：TTL 过期后 Nova 不可达即拒绝，不回落控制面。缓存**在 TTL 之内**是权威的（与控制面路由一致），这不是 fail-open。
+
+**排障**
+| 症状 / 日志关键字 | 含义 | 处置 |
+|---|---|---|
+| `reason="unrouted"`（`target=resolve` WARN） | principal 不是规范 UUID，`openstack_only` 直接拒绝 | 用户名必须是小写规范 v4 UUID |
+| `reason="not_found"` | Nova 404 / 实例无可用地址（两者客户端表现相同） | 核对 UUID 与 application credential 的 project 可见性 |
+| `reason="ambiguous"`（`target=openstack` WARN） | 多网络多地址且未配 `network` | 配 `network = "<name>"`，或确认 `on_ambiguous` |
+| `reason="unavailable"` / `reason="circuit_open"` | Keystone/Nova 不可达或熔断 | 看该源自己的熔断与 `sshgw_openstack_resolve_err_total`；**不会**影响控制面熔断 |
+| 实例达但登录失败 | 后端 `authorized_keys` / 用户不匹配 | 看映射链：metadata 键 → `backend_user_map` → `default_backend_user` |
+| 探测阶段有 `sshgw_auth_offered_total`、零 Nova 请求 | 预认证探测按设计不联网 | 属预期（MUST1），不是"解析没生效" |
+
+**可观测**：`sshgw_openstack_resolve_{ok,err}_total`、`sshgw_openstack_resolve_latency_seconds`（与既有 `sshgw_resolve_*` 分开，两条源的健康度不可混淆）；审计记录带 `resolve_source="openstack"`；pre-auth 失败没有会话也没有审计记录，只有一条 `target=resolve` 的结构化 WARN（含 principal / client_ip / source / reason）。
+
 ---
 
 ## 6. 健康检查
@@ -219,5 +267,6 @@ readinessProbe: { httpGet: { path: /readyz,  port: metrics }, periodSeconds: 5 }
   - `#3`：真机半开假死 / netem 演练脚本已交付并在测试真机实跑 PASS（检出口径 `~45s`）。
   - `#4`：8h soak 未跑（`SOAK_DURATION=28800` 参数化，运维排窗）。
   - `#5`：HA 演练为 client-side readyz 近似；PuTTY/WinSCP 为算法集模拟。
+  - `#9`：**OpenStack 实验室模式（方案 B）的边界** —— 授权语义、`match_image` 未实现、domain 字段已移除、缓存与 fail-open 的分工。
   - `#6`：offered 探测触发控制面 resolve（预热 miss，量级可接受）。
 - russh 上游限制（同算法 host key 轮换需 known_hosts 下发降级、`client::Handle` 非 Sync 限制跨会话池化）——按 §5.1/§5.3 与 known-limitations 处理。

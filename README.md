@@ -19,6 +19,7 @@ ssh alex_host1@gw.example.com
 ## 功能
 
 - **用户名即路由**：控制面接口 `POST /api/v1/resolve` 根据用户名返回目标后端 `{host, port, user}` 和策略；拒绝返回 403，未知返回 404。
+- **可选的 OpenStack 路由**（默认关）：写 `[openstack]` 节后，规范形式的实例 UUID 由 Nova 解析成 `{地址, 后端登录用户}`（`routing="hybrid"` 时其余用户名仍走控制面）。`routing="openstack_only"` + `authorization="openstack_only"` 是**实验室模式**：没有控制面回退，且任意通过前腿验签的密钥 + 已知 UUID 即可达该实例，需显式 `allow_any_authenticated_key = true` 才能开启——见 `config.example.toml` 注释、`docs/ops-runbook.md` §5.8 与 `docs/known-limitations.md` §9。
 - **双会话中继**：终结客户端 SSH（server 腿）+ 拨号后端（client 腿），双向转发。上行有窗口熔断（`outbound_guard`）防止缓冲无限增长。
 - **认证**：客户端 → 网关支持公钥 / CA 签发的用户证书；网关 → 后端只有一种方式——转发客户端的 ssh-agent（`ssh -A` 语义）。
 - **防爆破 / 防时序**：每次认证拒绝有恒定时间填充（`auth_rejection_pad`），尝试次数上限（`max_auth_attempts`），每 IP 并发上限。

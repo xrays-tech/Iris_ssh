@@ -63,11 +63,73 @@ circuit_failure_threshold = 5
 circuit_reset_timeout = "30s"
 
 # External control plane (resolve + authorize).
+#
+# Omittable when `[openstack] routing = "openstack_only"`: in that mode the
+# gateway resolves nothing through this endpoint, and a config that carries no
+# `[control_plane]` section at all is valid (plan-openstack MUST2). With any
+# other routing — including the default, feature-off configuration — this
+# section is required and its url must be non-empty.
 [control_plane]
 url = "https://cp.internal"
 cache_ttl = "30s"
 timeout = "2s"
 # fail_open = false  # uncomment to serve stale grants when the CP is down
+
+# --- OpenStack: instance UUID as the route (plan-openstack) -------------------
+# DISABLED BY DEFAULT: with this section absent or `enabled = false` the
+# gateway behaves exactly as before (the route predicate answers "control plane"
+# for every principal), which is what keeps the feature byte-for-byte inert.
+#
+#   routing         = "hybrid"        UUID -> Nova, everything else -> [control_plane]
+#                   | "openstack_only"  canonical UUIDs only, NO control-plane fallback
+#   authorization   = "control_plane"  the control plane still authorizes (recommended)
+#                   | "openstack_only"  THE GATEWAY GRANTS ON NOVA'S ANSWER ALONE
+#
+# ⚠ `authorization = "openstack_only"` is an explicit LABORATORY mode. It
+# requires `allow_any_authenticated_key = true` — a deliberately alarming name
+# for its real meaning: *any key that passes front-leg verification can reach
+# any instance UUID it can guess*, limited only by the application credential's
+# project scope. The gateway logs a warning at startup and another for plain
+# http. Never enable it on a shared or internet-facing gateway; see
+# `docs/known-limitations.md` §9.
+#
+# The example below is the hybrid/recommended shape, commented out. The target
+# host always comes from Nova (never from the username), so this section cannot
+# be used to dial an arbitrary address.
+# [openstack]
+# enabled = true
+# routing = "hybrid"
+# authorization = "control_plane"
+#
+# # --- Keystone v3 (application credential is the recommended auth_method) ---
+# auth_url = "https://keystone.example.internal:5000/v3"
+# application_credential_id = "..."
+# application_credential_secret = "..."   # or _file / $SSHGW_OPENSTACK_APPLICATION_CREDENTIAL_SECRET
+# project_id = "..."                      # token scope = blast-radius gate
+# region = "RegionOne"
+# interface = "public"                    # public | internal | admin
+# # nova_endpoint = "https://nova:8774/v2.1"   # skip catalog discovery (tests / internal clouds)
+# microversion = "2.79"
+#
+# # --- transport / caching (independent of [control_plane]) ------------------
+# timeout = "3s"
+# cache_ttl = "30s"      # instance lookup cache; serving a stale address past
+#                        # this TTL needs fail_open = true (red line 5)
+# fail_open = false
+# verify_tls = true
+# # ca_bundle = "/etc/ssl/private/openstack-ca.pem"
+#
+# # --- address selection -----------------------------------------------------
+# # network = "private"  # required when the instance has several networks
+# address_family = "ipv4" # ipv4 | ipv6 | any
+# prefer = "floating"     # floating | fixed | any
+# on_ambiguous = "reject" # reject (default) | first
+#
+# # --- backend login user (metadata wins, then rules, then this default) -----
+# default_backend_user = "cloud-user"   # required while enabled
+# backend_user_metadata_key = "iris_ssh_user"
+#
+# ssh_port = 22          # every instance's SSH port — instances do not carry one
 
 [limits]
 max_sessions = 10000

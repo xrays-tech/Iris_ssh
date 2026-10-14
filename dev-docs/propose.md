@@ -67,6 +67,22 @@ POST /api/v1/resolve  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA25
 → 404 / 403 / 429
 ```
 
+**修订（plan-openstack，已随 O1..O5 落地）**：上面是默认路径。启用 `[openstack]`
+后，这条解析按 principal 的**形状**分流，其余语义不变：
+
+- `route_for(principal, routing, openstack_enabled)` 是**纯谓词**（无 I/O）：
+  规范小写 v4 实例 UUID → Nova；`routing="hybrid"` 时其余走控制面，
+  `routing="openstack_only"` 时其余**在任何网络调用之前**就拒绝（无控制面回退）。
+- `[control_plane]` 因此在 `openstack_only` 下可整节省略——这是 O3 把
+  `require_control_plane` 换成"按配置构造、缺路由即启动期报错"的由来。
+- 缓存/单飞/熔断的机制照搬：OpenStack 走**独立的一份**（自己的 TTL、自己的熔断），
+  所以 Nova 故障不会打开控制面的熔断，反之亦然。
+- 审计多一个 `resolve_source`（`"control_plane"` / `"openstack"`），指标多
+  `sshgw_openstack_resolve_{ok,err}_total` 与 `_latency_seconds`，两条源的健康度不混。
+- **授权权威默认不变**：`authorization="control_plane"`（默认）时控制面仍是唯一准入
+  决策点，Nova 只承担"UUID → IP + 后端登录用户"这一解析职责；把授权也交给
+  `openstack_only` 是显式实验室模式，见 §3.2 脚注与 plan-openstack §3.5。
+
 ### 3.2 认证与授权的边界（⚠️ 修正 #3：签名验证 vs 指纹校验）
 
 **职责三分，绝不可混淆：**
@@ -74,7 +90,7 @@ POST /api/v1/resolve  {"principal":"alex_host1","client_ip":"..","key_fp":"SHA25
 | 职责 | 承担方 | 机制 |
 |---|---|---|
 | **认证 Authentication**：证明客户端持有私钥 | 网关（russh 协议层） | 验证 USERAUTH_REQUEST 中对 session ID 的签名，伪造签名一律拒绝 |
-| **授权 Authorization**：principal + 指纹能否访问目标 | 控制面 | resolve+authorize API，纯策略决策，**不做任何密码学验证** |
+| **授权 Authorization**：principal + 指纹能否访问目标 | 控制面 | resolve+authorize API，纯策略决策，**不做任何密码学验证**。`[openstack] authorization="openstack_only"`（**实验室模式**，需 `allow_any_authenticated_key=true`）是唯一例外：授权由 Nova 的项目 scope 兜底，见 plan-openstack §3.5 / `docs/known-limitations.md` §9 |
 | 后端认证 | 后端 sshd | 校验网关密钥 / 网关签发的用户证书 |
 
 **russh 回调时序（以引入版本行为为准，Spike #3 固化）：**
