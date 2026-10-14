@@ -17,6 +17,7 @@ pub mod ca;
 pub mod config;
 pub mod error;
 pub mod metrics;
+pub mod openstack;
 pub mod policy;
 pub mod pool;
 pub mod record;

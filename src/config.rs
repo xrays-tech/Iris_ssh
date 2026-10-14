@@ -1342,6 +1342,16 @@ fn validate_openstack(
             }
         }
         OpenStackAuthMethod::Token => {
+            // A static token carries no service catalog, so there is nothing to
+            // discover Nova from: the endpoint has to be stated.
+            if raw.nova_endpoint.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "openstack.nova_endpoint".into(),
+                    reason: "required when auth_method = \"token\": a static token has no \
+                             service catalog, so there is nothing to discover Nova from"
+                        .into(),
+                });
+            }
             if token.is_empty() {
                 return Err(ConfigError::Invalid {
                     field: "openstack.token".into(),
@@ -2449,6 +2459,23 @@ mod tests {
             invalid_field(&toml),
             "openstack.backend_user_map[0].match_name"
         );
+    }
+
+    #[test]
+    fn static_token_auth_needs_an_explicit_nova_endpoint() {
+        // No catalog is available without a Keystone exchange, so the endpoint
+        // cannot be discovered later — reject at boot instead.
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section()
+                .replace("nova_endpoint = \"http://127.0.0.1:8774/v2.1\"\n", "")
+                .replace(
+                    "application_credential_secret = \"s3cr3t\"",
+                    "auth_method = \"token\"\n            token = \"static\""
+                )
+        );
+        assert_eq!(invalid_field(&toml), "openstack.nova_endpoint");
     }
 
     #[test]
