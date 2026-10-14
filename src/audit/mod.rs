@@ -260,6 +260,9 @@ impl Auditor {
             target_host: self.grant.target.host.clone(),
             target_port: self.grant.target.port,
             target_user: self.grant.target.user.clone(),
+            // Stamped by the ResolveRouter at authorization time: which
+            // resolver produced this grant (plan-openstack §3.7).
+            resolve_source: self.grant.resolve_source.as_str().to_owned(),
             auth_kind: self
                 .auth_kind
                 .lock()
@@ -300,6 +303,11 @@ pub struct AuditRecord {
     pub target_host: String,
     pub target_port: u16,
     pub target_user: String,
+    /// Which resolver produced this grant: `"control_plane"` or `"openstack"`.
+    ///
+    /// Added by plan-openstack §3.7; every pre-existing field and its order are
+    /// untouched, so existing consumers only see one extra key.
+    pub resolve_source: String,
     pub command_class: String,
     pub command: Option<String>,
     /// How the session authenticated to the backend: `"agent"` when the end
@@ -443,6 +451,10 @@ mod tests {
         assert_eq!(record.target_host, "10.1.2.3");
         assert_eq!(record.target_port, 22);
         assert_eq!(record.target_user, "root");
+        assert_eq!(
+            record.resolve_source, "control_plane",
+            "the default source, for grants that predate routing"
+        );
         assert_eq!(record.command_class, "scp");
         assert_eq!(record.bytes_up, 2048);
         assert_eq!(record.bytes_down, 4096);
@@ -451,6 +463,30 @@ mod tests {
         let json = record_to_json(&record);
         assert!(json.contains("\"command_class\":\"scp\""));
         assert!(json.contains("\"session_id\""));
+    }
+
+    #[test]
+    fn the_record_says_openstack_produced_the_grant() {
+        // plan-openstack §3.7: an auditor must be able to tell an instance-UUID
+        // grant from a control-plane grant without guessing from the host.
+        let mut grant = test_grant();
+        grant.resolve_source = crate::types::ResolveSource::OpenStack;
+        grant.target.host = "10.0.0.7".into();
+        let auditor = Auditor::new(
+            SessionId::generate(),
+            "198.51.100.2".into(),
+            grant,
+            "ssh-ed25519".into(),
+            Metrics::default(),
+        );
+
+        let record = auditor.finalize(None, None);
+        assert_eq!(record.resolve_source, "openstack");
+        assert_eq!(record.target_host, "10.0.0.7");
+        assert!(
+            record_to_json(&record).contains("\"resolve_source\":\"openstack\""),
+            "the field must survive serialization"
+        );
     }
 
     #[test]

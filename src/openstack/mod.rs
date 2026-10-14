@@ -26,6 +26,8 @@ pub mod nova;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use serde::Deserialize;
 
 use crate::config::{EndpointInterface, OpenStackAuthMethod, OpenStackConfig};
@@ -116,6 +118,11 @@ pub struct OpenStackClient {
     cfg: OpenStackConfig,
     http: reqwest::Client,
     token: Mutex<Option<CachedToken>>,
+    /// Serialises token *refreshes* (not reads): without it, the first N
+    /// concurrent UUID lookups of a cold cache would each POST
+    /// `/v3/auth/tokens` — a Keystone stampede at exactly the moment the
+    /// gateway is most loaded.
+    token_lock: AsyncMutex<()>,
 }
 
 impl OpenStackClient {
@@ -177,6 +184,7 @@ impl OpenStackClient {
             cfg,
             http,
             token: Mutex::new(None),
+            token_lock: AsyncMutex::new(()),
         })
     }
 
@@ -196,8 +204,16 @@ impl OpenStackClient {
         }
     }
 
-    fn invalidate_token(&self) {
-        *self.lock() = None;
+    /// Drop the cached token **only if it is still the one Nova just refused**.
+    ///
+    /// Two sessions can notice a 401 at the same time; the second one to
+    /// arrive must not throw away the fresh token the first one already paid
+    /// for.
+    fn invalidate_token_if(&self, value: &str) {
+        let mut guard = self.lock();
+        if guard.as_ref().is_some_and(|cached| cached.value == value) {
+            *guard = None;
+        }
     }
 
     /// A usable token + Nova base URL, from cache when still valid.
@@ -211,6 +227,12 @@ impl OpenStackClient {
                 nova_base: self.cfg.nova_endpoint.trim_end_matches('/').to_owned(),
             }),
             OpenStackAuthMethod::ApplicationCredential => {
+                if let Some(cached) = self.cached_valid() {
+                    return Ok(cached);
+                }
+                // Single-flight the refresh: exactly one task talks to
+                // Keystone, everybody else waits and then reads the cache.
+                let _refresh = self.token_lock.lock().await;
                 if let Some(cached) = self.cached_valid() {
                     return Ok(cached);
                 }
@@ -304,29 +326,33 @@ impl OpenStackClient {
         }
     }
 
+    /// The `POST {auth_url}/auth/tokens` body — application credentials only.
+    ///
+    /// `auth_method = "token"` never reaches here: [`Self::acquire`] returns the
+    /// static token without contacting Keystone at all (and config validation
+    /// already required an explicit `nova_endpoint` for it, because there is no
+    /// catalog to consult). The dead `token` arm was removed rather than left
+    /// as a trap for whoever next edits this.
     fn auth_body(&self) -> serde_json::Value {
-        match self.cfg.auth_method {
-            OpenStackAuthMethod::Token => serde_json::json!({
-                "auth": { "identity": { "methods": ["token"], "token": { "value": self.cfg.token } } }
-            }),
-            OpenStackAuthMethod::ApplicationCredential => {
-                let identity = serde_json::json!({
-                    "methods": ["application_credential"],
-                    "application_credential": {
-                        "id": self.cfg.application_credential_id,
-                        "secret": self.cfg.application_credential_secret,
-                    }
-                });
-                let mut auth = serde_json::json!({ "identity": identity });
-                // `scope` sits beside `identity` (Keystone v3 shape). It is the
-                // blast-radius gate that limits which instances this gateway can
-                // even see, so it is sent whenever it is configured.
-                if !self.cfg.project_id.is_empty() {
-                    auth["scope"] = serde_json::json!({ "project": { "id": self.cfg.project_id } });
-                }
-                serde_json::json!({ "auth": auth })
+        debug_assert_eq!(
+            self.cfg.auth_method,
+            OpenStackAuthMethod::ApplicationCredential
+        );
+        let identity = serde_json::json!({
+            "methods": ["application_credential"],
+            "application_credential": {
+                "id": self.cfg.application_credential_id,
+                "secret": self.cfg.application_credential_secret,
             }
+        });
+        let mut auth = serde_json::json!({ "identity": identity });
+        // `scope` sits beside `identity` (Keystone v3 shape). It is the
+        // blast-radius gate that limits which instances this gateway can
+        // even see, so it is sent whenever it is configured.
+        if !self.cfg.project_id.is_empty() {
+            auth["scope"] = serde_json::json!({ "project": { "id": self.cfg.project_id } });
         }
+        serde_json::json!({ "auth": auth })
     }
 
     // --- Nova --------------------------------------------------------------
@@ -357,7 +383,7 @@ impl OpenStackClient {
                 // try exactly once more (plan-openstack §3.2).
                 tracing::debug!(target: "openstack", reason = "token_expired", %uuid,
                     "Nova rejected the cached token; refreshing");
-                self.invalidate_token();
+                self.invalidate_token_if(&token.value);
                 token = self.acquire().await?;
                 refreshed = true;
                 continue;
@@ -1399,6 +1425,60 @@ mod tests {
         assert_eq!(
             nova_base_from_catalog(&cfg, &catalog).expect_err("no compute"),
             ControlError::ServerError
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookups_share_a_single_token_fetch() {
+        // Cold-cache stampede: N UUIDs arriving at once must produce ONE
+        // `POST /v3/auth/tokens`, not N. The handler holds the first answer
+        // long enough for the other tasks to arrive while the cache is empty.
+        let base = Arc::new(OnceLock::<String>::new());
+        let base_for_handler = Arc::clone(&base);
+        let server = MockHttp::start(move |request| {
+            let base = base_for_handler.get().cloned().unwrap_or_default();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/auth/tokens") => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    Response::token(
+                        "subject-token",
+                        &token_body("2099-01-01T00:00:00.000000Z", &base),
+                    )
+                }
+                ("GET", path) if path.starts_with("/v2.1/servers/") => Response::json(
+                    200,
+                    &server_json(
+                        r#"{"private":[{"addr":"10.0.0.7","version":4,"OS-EXT-IPS:type":"fixed"}]}"#,
+                    ),
+                ),
+                _ => Response::json(404, "{}"),
+            }
+        });
+        base.set(server.url("")).expect("base url set");
+
+        let cfg = os_config(&urls(base.get().expect("base")));
+        let client = Arc::new(OpenStackClient::new(cfg).expect("client"));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let client = Arc::clone(&client);
+            tasks.push(tokio::spawn(async move {
+                client.resolve(&req(UUID)).await.expect("resolves")
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join");
+        }
+
+        assert_eq!(
+            server.count("/v3/auth/tokens"),
+            1,
+            "the token refresh must be single-flighted"
+        );
+        assert_eq!(
+            server.count(&format!("/v2.1/servers/{UUID}")),
+            8,
+            "each lookup still makes its own Nova request"
         );
     }
 

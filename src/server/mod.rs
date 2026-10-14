@@ -29,12 +29,12 @@ use russh::{Channel, ChannelId, ChannelOpenFailure, Pty};
 
 use crate::audit::{Auditor, CommandInfo};
 use crate::backend::BackendDialer;
-use crate::config::{ControlPlaneConfig, GatewayConfig};
+use crate::config::{GatewayConfig, OpenStackRouting};
 use crate::error::{ConfigError, Error, Result};
 use crate::metrics::Metrics;
 use crate::policy::HostKeyVerifier;
 use crate::relay::{self, SubsystemInterceptor};
-use crate::resolve::{ControlPlaneClient, HttpControlPlane, Resolver};
+use crate::resolve::{ControlPlaneClient, HttpControlPlane, ResolveRoute, ResolveRouter, Resolver};
 use crate::types::{Grant, Principal, SessionId};
 
 /// Atomic-encoded readiness state shared between the drain coordinator and the
@@ -201,7 +201,9 @@ impl SessionRegistry {
 /// Shared state handed to every session.
 pub struct GatewayContext {
     pub config: Arc<GatewayConfig>,
-    pub resolver: Arc<Resolver>,
+    /// Dispatches to one independent [`Resolver`] per source (control plane /
+    /// OpenStack) and stamps `grant.resolve_source` (plan-openstack §3.1).
+    pub router: ResolveRouter,
     pub dialer: Arc<BackendDialer>,
     pub metrics: Metrics,
     pub interceptor: Arc<dyn SubsystemInterceptor>,
@@ -408,32 +410,22 @@ impl GatewayContext {
     /// Every failure here is fatal at startup (fail-closed): a bad host key or
     /// an unsafe credential must prevent the gateway from coming up sick.
     pub fn build(config: GatewayConfig) -> Result<Arc<GatewayContext>> {
-        let cp = Self::require_control_plane(&config)?;
-        let control_plane = HttpControlPlane::new(cp.url.clone(), cp.timeout).map_err(|e| {
-            Error::io(
-                std::io::Error::other(e.to_string()),
-                "building control-plane HTTP client",
-            )
-        })?;
-        Self::build_with_client(config, Arc::new(control_plane))
-    }
-
-    /// The control-plane settings, or a boot error when there are none.
-    ///
-    /// `[control_plane]` became optional so that OpenStack pure mode
-    /// (`routing = "openstack_only"`) can exist without a control plane at all
-    /// (plan-openstack §0-7). A context still has to be built *around* a
-    /// control-plane client in this shape, so its absence is fatal here rather
-    /// than a panic later; the OpenStack router replaces this path.
-    fn require_control_plane(config: &GatewayConfig) -> Result<ControlPlaneConfig> {
-        config.control_plane.clone().ok_or_else(|| {
-            ConfigError::Invalid {
-                field: "control_plane".into(),
-                reason: "this gateway build has no resolver for OpenStack-only routing:                          configure [control_plane] until the OpenStack router is wired"
-                    .into(),
+        // `[control_plane]` is optional: OpenStack pure mode
+        // (`routing = "openstack_only"`) runs with no control plane at all
+        // (plan-openstack §0-7). Only what the config actually carries is built.
+        let control_plane = match config.control_plane.as_ref() {
+            Some(cp) => {
+                let client = HttpControlPlane::new(cp.url.clone(), cp.timeout).map_err(|e| {
+                    Error::io(
+                        std::io::Error::other(e.to_string()),
+                        "building control-plane HTTP client",
+                    )
+                })?;
+                Some(Arc::new(client) as Arc<dyn ControlPlaneClient>)
             }
-            .into()
-        })
+            None => None,
+        };
+        Self::build_with_clients(config, control_plane, None)
     }
 
     /// [`build`] with an injected control-plane client (production uses
@@ -442,6 +434,17 @@ impl GatewayContext {
     pub fn build_with_client(
         config: GatewayConfig,
         control_plane: Arc<dyn ControlPlaneClient>,
+    ) -> Result<Arc<GatewayContext>> {
+        Self::build_with_clients(config, Some(control_plane), None)
+    }
+
+    /// [`build`] with both sources injectable. The OpenStack client is built
+    /// from config when none is supplied, so production goes through this path
+    /// too and tests can assert "no request happened" against a counting fake.
+    pub fn build_with_clients(
+        config: GatewayConfig,
+        control_plane: Option<Arc<dyn ControlPlaneClient>>,
+        openstack_client: Option<Arc<dyn ControlPlaneClient>>,
     ) -> Result<Arc<GatewayContext>> {
         let metrics = Metrics::default();
 
@@ -476,18 +479,89 @@ impl GatewayContext {
             Some(Arc::clone(&ca)),
         ));
 
-        let cp = Self::require_control_plane(&config)?;
-        let resolver = Arc::new(Resolver::new(
-            control_plane,
-            cp.cache_ttl,
-            Duration::from_secs(5), // negative cache
-            Duration::from_secs(1), // transient coalesce
-            cp.cache_ttl_jitter,
-            cp.fail_open,
-            5, // breaker failure threshold
-            cp.timeout * 3,
-            cp.timeout,
-        ));
+        // One independent Resolver per source: separate caches, separate
+        // single-flight, separate circuit breakers (plan-openstack §0-3,
+        // failure-domain isolation). The OpenStack one is tuned from
+        // `[openstack]` alone, never from `[control_plane]`.
+        let openstack_cfg = config.openstack.as_ref();
+        let routing = openstack_cfg
+            .map(|os| os.routing)
+            .unwrap_or(OpenStackRouting::Hybrid);
+        let openstack_enabled = openstack_cfg.is_some();
+        // The control-plane route is live everywhere except pure mode.
+        let control_plane_needed = !openstack_enabled || routing == OpenStackRouting::Hybrid;
+
+        let cp_resolver = match (config.control_plane.as_ref(), control_plane) {
+            (Some(cp_cfg), Some(client)) => Some(Arc::new(Resolver::new(
+                client,
+                cp_cfg.cache_ttl,
+                Duration::from_secs(5), // negative cache
+                Duration::from_secs(1), // transient coalesce
+                cp_cfg.cache_ttl_jitter,
+                cp_cfg.fail_open,
+                5, // breaker failure threshold
+                cp_cfg.timeout * 3,
+                cp_cfg.timeout,
+            ))),
+            _ => None,
+        };
+
+        let openstack_client = match (openstack_cfg, openstack_client) {
+            (Some(_), Some(client)) => Some(client),
+            (Some(os_cfg), None) => {
+                let client =
+                    crate::openstack::OpenStackClient::new(os_cfg.clone()).map_err(|e| {
+                        Error::io(
+                            std::io::Error::other(e.to_string()),
+                            "building the OpenStack client",
+                        )
+                    })?;
+                Some(Arc::new(client) as Arc<dyn ControlPlaneClient>)
+            }
+            (None, _) => None,
+        };
+        let os_resolver = openstack_client.map(|client| {
+            let os_cfg = openstack_cfg.expect("openstack client implies [openstack]");
+            Arc::new(Resolver::new(
+                client,
+                os_cfg.cache_ttl,       // instance-IP cache TTL
+                Duration::from_secs(5), // negative cache (mirrors [control_plane])
+                Duration::from_secs(1), // transient coalesce
+                Duration::from_secs(1), // expiry spread; no config knob
+                os_cfg.fail_open,       // requires host_key_policy = "pinned"
+                5,                      // breaker failure threshold
+                os_cfg.timeout * 3,     // breaker reset
+                os_cfg.timeout,         // per-request timeout
+            )) as Arc<Resolver>
+        });
+
+        let router = ResolveRouter::new(
+            routing,
+            openstack_enabled,
+            cp_resolver,
+            os_resolver,
+            metrics.clone(),
+        );
+        // Belt and braces on top of config validation: a route that could be
+        // taken but has no resolver behind it must stop the boot, loudly.
+        if control_plane_needed && !router.can_serve(ResolveRoute::ControlPlane) {
+            return Err(ConfigError::Invalid {
+                field: "control_plane".into(),
+                reason: "this routing mode still sends principals to the control plane, but no \
+                         control-plane resolver could be built: keep [control_plane] with a \
+                         non-empty url, or set [openstack] routing = \"openstack_only\" to run \
+                         without one"
+                    .into(),
+            }
+            .into());
+        }
+        if openstack_enabled && !router.can_serve(ResolveRoute::OpenStack) {
+            return Err(ConfigError::Invalid {
+                field: "openstack".into(),
+                reason: "[openstack] is enabled but its resolver could not be built".into(),
+            }
+            .into());
+        }
 
         let interceptor: Arc<dyn SubsystemInterceptor> =
             Arc::new(CompositeInterceptor::new(&config, metrics.clone()));
@@ -541,7 +615,7 @@ impl GatewayContext {
 
         Ok(Arc::new(GatewayContext {
             config: Arc::new(config),
-            resolver,
+            router,
             dialer,
             metrics,
             interceptor,
@@ -785,7 +859,7 @@ impl GatewaySession {
         let started = std::time::Instant::now();
         let outcome = self
             .ctx
-            .resolver
+            .router
             .authorize(principal, fingerprint, &self.client_ip)
             .await;
         match &outcome {
@@ -1162,9 +1236,19 @@ impl server::Handler for GatewaySession {
         let fingerprint = public_key
             .fingerprint(russh::keys::HashAlg::Sha256)
             .to_string();
-        // Warm the resolver cache without acting on the answer so the final
+        // Warm the control-plane cache without acting on the answer so the final
         // callback benefits from the warm path.
-        let _ = self.resolve_grant(&principal, &fingerprint).await;
+        //
+        // MUST NOT touch the network on the OpenStack route: this callback runs
+        // *before* the client has proven it holds the private key, so a Nova or
+        // Keystone round trip here would be an unauthenticated oracle (and a
+        // query amplifier) — `route()` is a pure predicate on the username, and
+        // the real lookup happens only in `auth_publickey` /
+        // `auth_openssh_certificate`, after the signature verified
+        // (plan-openstack §3.1 / red line 2).
+        if self.ctx.router.route(principal.as_str()) == ResolveRoute::ControlPlane {
+            let _ = self.resolve_grant(&principal, &fingerprint).await;
+        }
         self.principal = Some(principal);
         Ok(Auth::Accept)
     }
@@ -2820,6 +2904,137 @@ mod tests {
         assert_eq!(
             filtered, allowed,
             "only the allowed frame must survive the inspector"
+        );
+    }
+
+    // ---- plan-openstack O3: router wiring + the hard gates ---------------
+
+    /// A valid **pure-mode** `[openstack]` section: no `[control_plane]` at
+    /// all, endpoints pointed at a black hole (nothing in these tests ever
+    /// contacts them — the question under test is *whether* a request happens).
+    fn openstack_pure_toml(host_key: &str) -> String {
+        format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [{{ path = "{host_key}", state = "active" }}]
+            [backend]
+            host_key_policy = "accept-new"
+            [openstack]
+            enabled = true
+            routing = "openstack_only"
+            authorization = "openstack_only"
+            allow_any_authenticated_key = true
+            auth_url = "http://127.0.0.1:1/v3"
+            nova_endpoint = "http://127.0.0.1:1/v2.1"
+            application_credential_id = "cred-id"
+            application_credential_secret = "cred-secret"
+            default_backend_user = "cloud-user"
+        "#,
+            host_key = host_key
+        )
+    }
+
+    const OS_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn pure_openstack_mode_boots_without_a_control_plane() {
+        // MUST2: `routing = "openstack_only"` used to validate and then refuse
+        // to start. The router replaces the old `require_control_plane` guard,
+        // so pure mode now builds a real context with no `[control_plane]`.
+        let mut keys = TestKeyGuard::new();
+        let host_key = keys.add_key();
+        let config = GatewayConfig::parse(&openstack_pure_toml(&host_key)).unwrap();
+        assert!(
+            config.control_plane.is_none(),
+            "pure mode must not invent a control plane"
+        );
+
+        let ctx = GatewayContext::build(config).expect("pure mode must be startable");
+        assert_eq!(
+            ctx.router.route(OS_UUID),
+            crate::resolve::ResolveRoute::OpenStack
+        );
+        assert_eq!(
+            ctx.router.route("alex_host1"),
+            crate::resolve::ResolveRoute::Reject,
+            "non-UUID principals have no route in pure mode"
+        );
+    }
+
+    /// A control-plane client that only counts how often it was asked.
+    struct CountingResolve {
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl ControlPlaneClient for CountingResolve {
+        fn resolve<'a>(
+            &'a self,
+            _req: &'a crate::types::ResolveRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = std::result::Result<ResolveResponse, ControlError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ok_response())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_offered_probe_never_reaches_the_openstack_route() {
+        // MUST1: `auth_publickey_offered` runs *before* the client has proven
+        // it holds the private key, so on the OpenStack route it may only apply
+        // the shape predicate — a Nova/Keystone round trip there would be an
+        // unauthenticated query amplifier.
+        let mut keys = TestKeyGuard::new();
+        let host_key = keys.add_key();
+        let config = GatewayConfig::parse(&openstack_pure_toml(&host_key)).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let canary = Arc::new(CountingResolve {
+            calls: Arc::clone(&calls),
+        });
+        let ctx = GatewayContext::build_with_clients(
+            config,
+            None,
+            Some(canary as Arc<dyn ControlPlaneClient>),
+        )
+        .expect("context");
+
+        let mut rng = rand::rng();
+        let key =
+            russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+        let public = key.public_key();
+
+        let mut probe = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = probe
+            .auth_publickey_offered(OS_UUID, public)
+            .await
+            .expect("offered never fails hard");
+        assert!(
+            matches!(auth, Auth::Accept),
+            "the probe itself must still be accepted"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "MUST1: zero upstream requests while only the shape was checked"
+        );
+
+        // Negative control: the same principal *does* resolve once russh has
+        // verified a signature — proving the canary can see a call at all.
+        let mut signed = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = signed.auth_publickey(OS_UUID, public).await.expect("auth");
+        assert!(matches!(auth, Auth::Accept));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the real lookup happens in auth_publickey, after the signature"
         );
     }
 }

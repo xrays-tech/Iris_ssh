@@ -245,8 +245,6 @@ pub struct OpenStackConfig {
     /// Token scope. Strongly recommended: it is the blast-radius gate on which
     /// instances this gateway can see at all (plan-openstack §3.2 / R5).
     pub project_id: String,
-    pub user_domain_name: String,
-    pub project_domain_name: String,
     pub region: String,
     pub interface: EndpointInterface,
     /// Explicit Nova base URL; skips catalog lookup (tests / internal clouds).
@@ -295,8 +293,6 @@ impl std::fmt::Debug for OpenStackConfig {
             .field("application_credential_secret", &"<redacted>")
             .field("token", &"<redacted>")
             .field("project_id", &self.project_id)
-            .field("user_domain_name", &self.user_domain_name)
-            .field("project_domain_name", &self.project_domain_name)
             .field("region", &self.region)
             .field("interface", &self.interface)
             .field("nova_endpoint", &self.nova_endpoint)
@@ -622,10 +618,6 @@ struct RawOpenStack {
     token_file: String,
     #[serde(default)]
     project_id: String,
-    #[serde(default = "default_user_domain_name")]
-    user_domain_name: String,
-    #[serde(default = "default_project_domain_name")]
-    project_domain_name: String,
     #[serde(default)]
     region: String,
     #[serde(default = "default_interface")]
@@ -703,12 +695,6 @@ fn default_on_ambiguous() -> String {
     "reject".to_owned()
 }
 
-fn default_user_domain_name() -> String {
-    "Default".to_owned()
-}
-fn default_project_domain_name() -> String {
-    "Default".to_owned()
-}
 fn default_microversion() -> String {
     "2.1".to_owned()
 }
@@ -1039,9 +1025,10 @@ impl GatewayConfig {
         };
 
         // --- [openstack]: instance-UUID routing (plan-openstack §3.6) ------
-        // Enum and combination rules are checked even when the section is
-        // disabled, so a typo or a contradictory pair fails at boot instead of
-        // on the first UUID that ever arrives.
+        // Enum spellings are checked even when the section is disabled (a typo
+        // should fail at boot, not silently disable the feature); `enabled =
+        // false` then turns the whole section off, so no other combination rule
+        // can keep an operator from switching it back off.
         let openstack = validate_openstack(raw.openstack, host_key_policy)?;
 
         // `[control_plane]` is required in every routing mode except the
@@ -1207,7 +1194,15 @@ fn validate_openstack(
     let prefer = parse_prefer(&raw.prefer)?;
     let on_ambiguous = parse_on_ambiguous(&raw.on_ambiguous)?;
 
-    // --- combination rules (always) --------------------------------------
+    // `enabled = false` short-circuits everything below: the section is then
+    // inert, so a leftover `routing`/`authorization` line can never stand in
+    // the way of turning the feature back off (an operator must not have to
+    // remember a second field to disable a resolver).
+    if !raw.enabled {
+        return Ok(None);
+    }
+
+    // --- combination rules (all of them only while the feature is on) -----
     // 1. routing = openstack_only ⇒ authorization = openstack_only.
     //    A "control_plane" authority with no control plane configured would
     //    advertise an authorization source that is never consulted.
@@ -1249,21 +1244,6 @@ fn validate_openstack(
                 .into(),
         });
     }
-    // 4. routing = openstack_only ⇒ enabled (otherwise every principal would be
-    //    routed at a resolver that is switched off).
-    if routing == OpenStackRouting::OpenStackOnly && !raw.enabled {
-        return Err(ConfigError::Invalid {
-            field: "openstack.enabled".into(),
-            reason: "routing = \"openstack_only\" requires enabled = true: with the resolver \
-                     switched off the route would be a dead end"
-                .into(),
-        });
-    }
-
-    if !raw.enabled {
-        return Ok(None);
-    }
-
     // --- enabled: only the pure mode exists until scheme A lands -----------
     if routing != OpenStackRouting::OpenStackOnly {
         return Err(ConfigError::Invalid {
@@ -1468,8 +1448,6 @@ fn validate_openstack(
         application_credential_secret,
         token,
         project_id: raw.project_id.trim().to_owned(),
-        user_domain_name: raw.user_domain_name.trim().to_owned(),
-        project_domain_name: raw.project_domain_name.trim().to_owned(),
         region: raw.region.trim().to_owned(),
         interface,
         nova_endpoint,
@@ -2095,13 +2073,47 @@ mod tests {
     }
 
     #[test]
-    fn openstack_only_routing_requires_enabled() {
+    fn enabled_false_is_an_unconditional_off_switch() {
+        // `enabled = false` must switch the section off *no matter what the
+        // other fields say*: an operator disabling a resolver should never have
+        // to remember to reset `routing`/`authorization` first (the combination
+        // rules below only apply while the feature is on).
         let toml = format!(
             "{}{}",
-            base_without_control_plane(),
+            minimal_toml(),
             openstack_pure_section().replace("enabled = true", "enabled = false")
         );
-        assert_eq!(invalid_field(&toml), "openstack.enabled");
+        let cfg = GatewayConfig::parse(&toml).expect("disabled section parses");
+        assert!(
+            cfg.openstack.is_none(),
+            "the whole [openstack] section must be inert when disabled"
+        );
+
+        // Turning it back on is where the combination rules start to bite
+        // again, so the off switch cannot be hiding a contradictory config.
+        let toml = format!(
+            "{}{}",
+            minimal_toml(),
+            openstack_pure_section()
+                .replace("enabled = true", "enabled = false")
+                .replace("routing = \"openstack_only\"", "routing = \"hybrid\"")
+        );
+        let cfg = GatewayConfig::parse(&toml).expect("still disabled");
+        assert!(cfg.openstack.is_none());
+    }
+
+    #[test]
+    fn enum_typos_are_still_caught_while_disabled() {
+        // The off switch skips the *combination* rules, never the spellings:
+        // a typo should fail at boot instead of silently disabling a resolver.
+        let toml = format!(
+            "{}{}",
+            minimal_toml(),
+            openstack_pure_section()
+                .replace("enabled = true", "enabled = false")
+                .replace("routing = \"openstack_only\"", "routing = \"bogus\"")
+        );
+        assert_eq!(invalid_field(&toml), "openstack.routing");
     }
 
     #[test]

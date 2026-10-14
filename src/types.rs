@@ -86,10 +86,15 @@ impl Principal {
 /// form and the braced form are all rejected — this predicate is about "does the
 /// username *look* like an instance id", not about general UUID parsing.
 ///
-/// Lowercase is required: [`Principal`] rejects uppercase outright, and this
-/// function is also used to validate operator-supplied rules where the same
-/// "OpenStack always prints lowercase" assumption holds
-/// (`uuidgen | tr A-Z a-z`, or the id as returned by the Nova API).
+/// Lowercase is required: [`Principal`] rejects uppercase outright, and every
+/// cloud prints ids in lowercase (`uuidgen | tr A-Z a-z`, or as Nova returns
+/// them), so accepting `550E8400-...` would only widen the predicate for values
+/// no OpenStack emits.
+///
+/// Callers are exactly two: [`crate::resolve::route_for`] (which resolver a
+/// username is sent to) and the Nova URL guard in
+/// [`crate::openstack::OpenStackClient`] (defense in depth before any request
+/// is built). It is deliberately **not** consulted for operator configuration.
 ///
 /// Pure: no configuration, no I/O.
 pub fn is_instance_uuid(raw: &str) -> bool {

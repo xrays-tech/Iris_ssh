@@ -46,6 +46,12 @@ struct MetricsInner {
     resolve_cache_miss_total: AtomicU64,
     resolve_circuit_open_total: AtomicU64,
 
+    // OpenStack-source resolve counters (plan-openstack §3.7): kept separate
+    // from `resolve_ok/err` so the health of the two sources can never be
+    // conflated in an alert.
+    openstack_resolve_ok_total: AtomicU64,
+    openstack_resolve_err_total: AtomicU64,
+
     // relay / flow-control
     window_exhausted_total: AtomicU64,
     backend_dial_ok_total: AtomicU64,
@@ -93,6 +99,8 @@ struct MetricsInner {
 
     // latency histograms
     resolve_latency_us: Histogram,
+    /// Latency of the OpenStack route only (`sshgw_openstack_resolve_latency_seconds`).
+    openstack_resolve_latency_us: Histogram,
     backend_dial_latency_us: Histogram,
 }
 
@@ -256,6 +264,28 @@ impl Metrics {
     pub fn resolve_latency(&self, latency: std::time::Duration) {
         self.inner
             .resolve_latency_us
+            .observe_us(latency.as_micros() as u64);
+    }
+
+    /// A resolution that went through the OpenStack route and succeeded.
+    pub fn openstack_resolve_ok(&self) {
+        self.inner
+            .openstack_resolve_ok_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A resolution that went through the OpenStack route and was refused
+    /// (404, forbidden, no address, ambiguous, or an unreachable Nova).
+    pub fn openstack_resolve_err(&self) {
+        self.inner
+            .openstack_resolve_err_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Latency of the OpenStack route only.
+    pub fn openstack_resolve_latency(&self, latency: std::time::Duration) {
+        self.inner
+            .openstack_resolve_latency_us
             .observe_us(latency.as_micros() as u64);
     }
 
@@ -461,6 +491,16 @@ impl Metrics {
         );
         push_counter(
             &mut out,
+            "sshgw_openstack_resolve_ok_total",
+            &self.inner.openstack_resolve_ok_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_openstack_resolve_err_total",
+            &self.inner.openstack_resolve_err_total,
+        );
+        push_counter(
+            &mut out,
             "sshgw_window_exhausted_total",
             &self.inner.window_exhausted_total,
         );
@@ -557,6 +597,9 @@ impl Metrics {
         self.inner
             .resolve_latency_us
             .render("sshgw_resolve_latency_seconds", &mut out);
+        self.inner
+            .openstack_resolve_latency_us
+            .render("sshgw_openstack_resolve_latency_seconds", &mut out);
         self.inner
             .backend_dial_latency_us
             .render("sshgw_backend_dial_latency_seconds", &mut out);
@@ -655,6 +698,10 @@ mod tests {
         assert!(text.contains("sshgw_auth_offered_total 1"));
         assert!(text.contains("sshgw_auth_accept_total 1"));
         assert!(text.contains("sshgw_resolve_ok_total 1"));
+        // The OpenStack source has its own counters from the first render, so
+        // a dashboard can tell the two resolvers apart (plan-openstack §3.7).
+        assert!(text.contains("sshgw_openstack_resolve_ok_total 0"));
+        assert!(text.contains("sshgw_openstack_resolve_err_total 0"));
         // every non-empty line is `name ... value`
         for line in text.lines() {
             assert!(line.contains(' '), "line malformed: {line:?}");

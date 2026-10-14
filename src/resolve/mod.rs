@@ -27,7 +27,7 @@ use crate::types::{AuthKey, Fingerprint, Grant, Principal, ResolveSource};
 
 pub mod router;
 
-pub use router::{route_for, ResolveRoute};
+pub use router::{route_for, ResolveRoute, ResolveRouter};
 
 /// A fully-validated control-plane target that resolves to the same `Grant`
 /// value as the resolver, used by callers that want the raw resolved grant.
