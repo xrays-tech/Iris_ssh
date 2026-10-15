@@ -113,6 +113,17 @@ ssh_port = 22
              实例并回显 REACHED/yunqing-dev/root**；审计 `resolve_source=openstack
              target_host=172.16.41.62 target_user=root auth_kind=agent
              agent_signatures=1`；resolve_ok=1/err=0。全量 test 258+4、集成 38P/0F/2S。
+2026-10-15  **O6+O7 落地 + 名字路由真机双验**（instance-name 路由 + 解析鲁棒性，
+           plan-openstack 附录 A/B，commits 87f1f4d..b74924a）：
+           - `route_by=["uuid","name"]` 时真机双路都登录成功：`ssh -A e52bce4c…`
+             REACHED（UUID 路由）与 `ssh -A yunqing_dev` REACHED_BY_NAME（名字路由），
+             均 root、审计 target_host=172.16.41.62；metrics by_uuid=1/by_name=1。
+           - 第四个 real-env catch：T_3741 名字清单返回**目录条目**（`{id,links,name}`
+             无 addresses）→ 唯一全等命中后以 show-by-id 精化（commit b74924a）；
+             `reason=no_network` 误报被消除。
+           - O7 四层解析（独立解码/灰度回退/响亮失败/真实 body 语料）落地，
+             `case_openstack_no_address` 的"空 vs 不可用"语义保留。全量 test 282+4、
+             集成 44P/0F/2S，oracle 红线 12 复审 GO。
 ```
 
 ## 6b. 剩余缺口
