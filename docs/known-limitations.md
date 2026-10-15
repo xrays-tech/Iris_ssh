@@ -58,7 +58,7 @@
 
 ## 9. OpenStack 实例 UUID 即路由（方案 B）——已实现，但**只授权实验室/内网 PoC**
 
-- **状态**：plan-openstack 方案 B 已按分层 O1..O5 落地（`routing=openstack_only` + `authorization=openstack_only` + `allow_any_authenticated_key=true`），**默认关闭**：不写 `[openstack]` 节或 `enabled=false` 时，路由谓词对所有 principal 都答"控制面"，行为与旧版一致。用例覆盖 `case_openstack_*` 共 8 个（含 MUST1 预认证零联网 `case_openstack_preauth_no_lookup`）。
+- **状态**：plan-openstack 方案 B 已按分层 O1..O5 落地（`routing=openstack_only` + `authorization=openstack_only` + `allow_any_authenticated_key=true`），**默认关闭**：不写 `[openstack]` 节或 `enabled=false` 时，路由谓词对所有 principal 都答"控制面"，行为与旧版一致。其后 O6（实例名路由，默认关）与 O7（解析鲁棒性）按 appendix A/B 落地。用例覆盖 `case_openstack_*` 共 13 个（含 MUST1 预认证零联网 `case_openstack_preauth_no_lookup`、名字路由三例、wire-shape 两例）。
 - **授权语义（最重要的一条）**：`authorization="openstack_only"` 意味着**没有控制面这道授权**——任何通过前腿验签的密钥，只要知道/猜到实例 UUID，就能登进该实例，范围仅受 application credential 的 project scope 限制。`allow_any_authenticated_key=true` 是刻意刺眼的开关名，启动打 WARN；**禁止**用在共享或公网可达的网关上。缓解手段只有纵深：最小 project scope、`max_auth_attempts` + 负缓存限速枚举、所有失败对客户端同构拒绝、审计记录每次解析。
 - **当前只有纯模式可启用（方案 A 未实现）**：`routing="hybrid"` 与
   `authorization="control_plane"`（控制面授权、Nova 只换地址）都解析得动，但在
@@ -76,5 +76,7 @@
   - metadata 命中但值非法（空/含空白或控制字符）按 `reason=user_map` **告警后跳过并回落默认用户**，而不是当作 `Decode` 硬失败——避免一个脏标签把整批实例锁在门外。
   - `enabled=false` 的短路放在组合规则之前：关掉特性时不必先复位 `routing`/`authorization`；枚举拼写错误仍在校验期报错（拼错不能静默变成"关闭"）。
   - `auth_method="token"` 分支的 `auth_body` 已删除（该枚举值仍可解析，走 token 逃生口）；Keystone token 刷新单飞，401 只失效触发失败的那一个 token。
+- **实例名路由（O6，appendix A，默认关）**：`route_by` 默认 `["uuid"]`，零回归；`route_by = ["uuid","name"]` 才启用。已裁决的边界：UUID 形态永远优先、从不视为名字；名字只作百分号编码的 query 值、绝不进路径（SSRF 面不放松）；Nova 的 `name` 是子串搜索，网关本地全等过滤，0/多全等命中对客户端都等于 404（不猜机器）；名字边界只到"非空、≤255、无控制字符"（是 bound 不是 grammar）。观测靠 `sshgw_openstack_resolve_by_{uuid,name}_total`，**审计记录格式不变、不加字段**。已知代价：实例名不是唯一资源，改名/重名是运维现实，名字路由天然带"重名即拒绝"的可用性成本。
+- **解析鲁棒性（O7，appendix B）**：Nova body 逐字段独立解码（`decode_server`），任一非关键字段的类型漂移（如 T_3741 的 `image: ""`）不再拖垮 `addresses`；`addresses` 的"缺失/空 map（合法 no_address）"与"结构在但读不出（`unparseable`，响亮）"显式区分；解码失败/不可用的 warn 只带 `summarize_body` 结构摘要（keys/类型/网络数/长度），**绝不带 body**；语料固化在 `tests/fixtures/openstack/servers/`（两份真机逐字捕获 + 12 个构造变体，表驱动）。已裁决的偏离：不新增 `SelectionError::Unparseable` 变体（unusable 标志在地址选择之前就地判定并拒绝，加变体是死代码）；`summarize_body` 用 appendix 允许的回退形态（无 sha256——`ring` 非直接依赖，不引新依赖）。
 - **触发条件**（运维说明）：需要在无控制面的内网实验环境里按实例 UUID 直连时启用；生产一律保持 `[openstack]` **默认关（不启用）**，待方案 A（`authorization="control_plane"` 控制面授权）落地后再考虑启用。
-- **处置 / 复审**：启用前逐条确认上面的授权语义；上线看板加 `sshgw_openstack_resolve_err_total` 与 `target=resolve` 的 reason 分布。复审重点：**方案 A（`authorization="control_plane"`）缺位是否可接受——它决定 hybrid 是否该被保留为"解析通过但不可启用"**、方案 B 的授权边界、`match_image` 的去留、以及"缓存 TTL 内不联网"是否与运维预期一致。
+- **处置 / 复审**：启用前逐条确认上面的授权语义；上线看板加 `sshgw_openstack_resolve_err_total`、`sshgw_openstack_resolve_by_{uuid,name}_total` 与 `target=resolve` 的 reason 分布。复审重点：**方案 A（`authorization="control_plane"`）缺位是否可接受——它决定 hybrid 是否该被保留为"解析通过但不可启用"**、方案 B 的授权边界、`match_image` 的去留、"缓存 TTL 内不联网"是否与运维预期一致，以及 O6a/O6b/O7a/O7b 四层（名字路由配置与实现、逐字段解码、响亮摘要）——它们按红线停在本地待 oracle 复审后才推送。

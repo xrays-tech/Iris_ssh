@@ -225,6 +225,7 @@ project_id = "..."                  # scope = 爆炸半径闸门，给最小 pro
 nova_endpoint = "https://nova.../v2.1"
 default_backend_user = "cloud-user"
 ssh_port = 22
+# route_by = ["uuid", "name"]  # 可选：追加 "name" 启用实例名路由（见下）
 ```
 此时 `[control_plane]` 整节可以不写。**启动日志会打两条 WARN**（`allow_any_authenticated_key = true: ... Lab mode only.` 与 `talking to OpenStack over plain http`），看到它们才说明模式确实打开了。
 
@@ -232,6 +233,8 @@ ssh_port = 22
 - 任意通过前腿验签的密钥，只要知道（或猜到）实例 UUID，就能登进该实例，**范围仅受 application credential 的 project 限制**。UUID 不是秘密（日志、对象存储、API 都会泄露），且 Nova 的 404/200 差异构成存在性预言机——所有失败对客户端同构 `Auth::reject()`，缓解靠 `max_auth_attempts` + 负缓存限速，不是靠 UUID 难猜。
 - 目标 host **只能**来自 Nova；`network` 过滤、`on_ambiguous="reject"`（默认）保证不会拨到歧义地址。
 - `fail_open` 默认 `false`：TTL 过期后 Nova 不可达即拒绝，不回落控制面。缓存**在 TTL 之内**是权威的（与控制面路由一致），这不是 fail-open。
+
+**实例名路由（appendix A，默认关）**：`route_by` 默认 `["uuid"]`，现有部署行为不变。写成 `route_by = ["uuid", "name"]` 后，非 UUID principal 在满足实例名边界（非空、≤255、无控制字符）时经 `GET /servers?name=<值>` 解析：名字只作百分号编码的 query 值、绝不进路径；Nova 的 `name` 是**子串**搜索，网关本地做**全等**过滤，0 个或多个全等命中对客户端都等于 404（`ambiguous_name` 只进日志，不猜机器）。UUID 形态永远优先走 UUID 路由、从不视为名字。路由选择的可观测性是 `sshgw_openstack_resolve_by_uuid_total` / `sshgw_openstack_resolve_by_name_total` 两个计数器——**审计记录格式不变**。
 
 **排障**
 | 症状 / 日志关键字 | 含义 | 处置 |
@@ -241,6 +244,10 @@ ssh_port = 22
 | `reason="ambiguous"`（`target=openstack` WARN） | 多网络多地址且未配 `network` | 配 `network = "<name>"`，或确认 `on_ambiguous` |
 | `reason="unavailable"` / `reason="circuit_open"` | Keystone/Nova 不可达或熔断 | 看该源自己的熔断与 `sshgw_openstack_resolve_err_total`；**不会**影响控制面熔断 |
 | 实例达但登录失败 | 后端 `authorized_keys` / 用户不匹配 | 看映射链：metadata 键 → `backend_user_map` → `default_backend_user` |
+| `reason="unparseable"`（`target=openstack` WARN） | 200 body 里 `addresses` 结构读不出（如成了字符串）——**响亮**拒绝，不是 `no_network` | 看同一条日志的 `summary=`（只含 keys/类型/网络数/长度，不含 body）；核对云或前置代理返回的 API 形态 |
+| `reason="decode"`（`target=openstack` WARN） | 200 body 不是 JSON / 不是 server 文档 / 列表里有读不出 `addresses` 的元素 | 同上，`summary=` 给出结构摘要；通常是代理层或 compat 层改写了响应 |
+| `ambiguous_name`（name 路由 WARN） | 多个实例共用同一个名字（全等命中 >1） | 改实例名或改用 UUID 登录；网关按设计不猜机器 |
+| `sshgw_openstack_resolve_by_{uuid,name}_total` | 名字路由的命中分布（appendix A.4） | name 计数在未启用时恒 0；意外增长说明有人在用名字登录 |
 | 探测阶段有 `sshgw_auth_offered_total`、零 Nova 请求 | 预认证探测按设计不联网 | 属预期（MUST1），不是"解析没生效" |
 
 **可观测**：`sshgw_openstack_resolve_{ok,err}_total`、`sshgw_openstack_resolve_latency_seconds`（与既有 `sshgw_resolve_*` 分开，两条源的健康度不可混淆）；审计记录带 `resolve_source="openstack"`；pre-auth 失败没有会话也没有审计记录，只有一条 `target=resolve` 的结构化 WARN（含 principal / client_ip / source / reason）。

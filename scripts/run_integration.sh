@@ -531,6 +531,9 @@ ALL_CASES=(
   case_openstack_name_route
   case_openstack_name_ambiguous
   case_openstack_name_disabled
+  # plan-openstack appendix B (layer O7d): wire-shape robustness.
+  case_openstack_envelope_variants
+  case_openstack_unparseable_loud
 )
 
 resolve_case_path() {

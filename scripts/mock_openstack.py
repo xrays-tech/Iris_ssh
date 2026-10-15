@@ -36,6 +36,8 @@ port from `[openstack] ssh_port`, and every test instance lives on 127.0.0.1):
 Per-server control keys (stripped from the Nova body):
     status   HTTP status to return (default 200)
     delay_ms sleep before answering — used to widen a race window
+    envelope answer `{"server": {…}}` (classic v2 wire format) instead of
+             the flat v2.1 document — for the envelope-robustness case
 
 Self-contained: stdlib only, graceful SIGTERM, `--access-log` for assertions
 that must survive a restart.
@@ -51,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
-CONTROL_KEYS = ("status", "delay_ms")
+CONTROL_KEYS = ("status", "delay_ms", "envelope")
 
 # Headers worth keeping in the log: they are the evidence that the gateway
 # authenticated with a real token and asked for the microversion it claims to.
@@ -178,6 +180,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             body = {k: v for k, v in server.items() if k not in CONTROL_KEYS}
             body.setdefault("id", uuid)
+            if server.get("envelope"):
+                body = {"server": body}
             self._send(200, body)
             return
         self._record()

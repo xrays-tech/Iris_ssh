@@ -139,6 +139,17 @@ timeout = "2s"
 # prefer = "floating"     # floating | fixed | any
 # on_ambiguous = "reject" # reject (default) | first
 #
+# # --- which principal shapes this route accepts -----------------------------
+# # route_by = ["uuid"]  # (default) canonical instance UUID only — existing
+# # # deployments keep resolving exactly as before.
+# # Adding "name" opts into the instance-name route: a non-UUID principal that
+# # satisfies the instance-name bound is resolved via `GET /servers?name=<value>`
+# # (the name is a percent-encoded query value, never path material), and the
+# # local exact-match filter decides the machine — Nova's `name` filter is a
+# # substring search, and two instances sharing a name are refused, not guessed.
+# # UUID-shaped principals always take the UUID path, never the name path.
+# route_by = ["uuid", "name"]
+#
 # # --- backend login user (metadata wins, then rules, then this default) -----
 # default_backend_user = "cloud-user"   # required while enabled
 # backend_user_metadata_key = "iris_ssh_user"
