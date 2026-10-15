@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::config::{AddressFamily, BackendUserRule, IpPrefer, OnAmbiguous};
 
@@ -24,11 +24,36 @@ pub struct NovaAddress {
     pub addr_type: Option<String>,
 }
 
-/// `server.image`: `{"id": "..."}` or `null` for deleted images.
+/// `server.image`: `{"id": "..."}`.
+///
+/// Real clouds also send `null` (deleted image) and the bare empty string `""`
+/// (volume-backed server, or an image that is gone) — see [`image_or_none`].
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct NovaImage {
     #[serde(default)]
     pub id: Option<String>,
+}
+
+/// Accept every form `server.image` takes in the wild, and treat all of them
+/// but the object as "no image".
+///
+/// The reference shape is `{"id": "..."}`; `null` and an absent key already
+/// mean "no image". But a real deployment (project T_3741) answers with the
+/// bare empty string `""`, and that string failed to deserialize into
+/// [`NovaImage`] — which, through the envelope/flat dispatch in
+/// [`ServerResponse`], used to cost the whole lookup. A field this gateway
+/// never acts on must not be able to break address resolution.
+fn image_or_none<'de, D>(deserializer: D) -> Result<Option<NovaImage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|raw| match raw {
+        serde_json::Value::Object(_) => NovaImage::deserialize(raw).ok(),
+        // `""`, a bare id string, a number, an array … — none of these is an
+        // image reference this gateway could use, so none is worth failing on.
+        _ => None,
+    }))
 }
 
 /// The subset of `GET /v2.1/servers/{id}` this gateway uses.
@@ -46,7 +71,7 @@ pub struct NovaServer {
     pub addresses: BTreeMap<String, Vec<NovaAddress>>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "image_or_none")]
     pub image: Option<NovaImage>,
     #[serde(rename = "accessIPv4", default)]
     pub access_ipv4: Option<String>,
@@ -95,13 +120,42 @@ impl NovaServer {
 /// with the misleading `reason="no_network"` — while the very same request via
 /// curl returned the addresses just fine. Accept both shapes so a wire-format
 /// difference can never again masquerade as a configuration error.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
+///
+/// The variant is chosen by **shape** (does the document carry a `server`
+/// key?), not by `#[serde(untagged)]` trial and error. Untagged falls through
+/// to the next variant whenever one fails, and because every field of
+/// [`NovaServer`] is optional, a single field of an unexpected type anywhere
+/// inside an envelope used to "successfully" decode the whole document as an
+/// empty server: the lookup then failed with `no_network` and `networks=[]`
+/// instead of naming the field that broke. That is exactly how a second real
+/// cloud (project T_3741, `"image": ""`) went dark.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerResponse {
     /// `{"server": { … }}` (classic v2 envelope).
     Envelope { server: NovaServer },
     /// `{ … }` (v2.1 flat document).
     Flat(NovaServer),
+}
+
+impl<'de> Deserialize<'de> for ServerResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("server") {
+            // Envelope: decode the nested document *strictly*, so a type
+            // surprise inside it surfaces as a decode failure (loud, logged as
+            // `reason="decode"`) rather than silently emptying `addresses`.
+            Some(inner) => NovaServer::deserialize(inner)
+                .map(|server| ServerResponse::Envelope { server })
+                .map_err(serde::de::Error::custom),
+            // Flat document: no wrapper key in sight.
+            None => NovaServer::deserialize(value)
+                .map(ServerResponse::Flat)
+                .map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 impl ServerResponse {
@@ -921,6 +975,113 @@ mod tests {
             envelope.into_server(),
             flat.into_server(),
             "shape must not affect the parsed server"
+        );
+    }
+
+    /// A **second verbatim** real capture (project T_3741, instance
+    /// `e52bce4c-a98e-4f69-906c-ac6648a2e592`): the same classic v2 envelope,
+    /// but this cloud reports `"image": ""` — the empty-string form Nova emits
+    /// when a server's image is gone (or it was booted from a volume).
+    ///
+    /// That string is not an object, so it fails the `Envelope` variant, and
+    /// serde's untagged fallback then decoded the whole envelope as a *bare*
+    /// server — every field optional, so the decode "succeeded" with an empty
+    /// `addresses` map. The lookup died with `reason="no_network"` and
+    /// `networks=[]` while curl showed a perfectly good 172.16.41.62.
+    const REAL_ENVELOPE_T3741: &str = r#"{"server": {"id": "e52bce4c-a98e-4f69-906c-ac6648a2e592", "name": "yunqing_dev", "status": "ACTIVE", "tenant_id": "6bdb5cae363a4c78b14be43b372d821a", "user_id": "3e7ce6a39c884a88a0381e4bd1f782cc", "metadata": {}, "hostId": "953c9b78d9f046367ca96e475f205e4f45a614f535d445d90ca2acd1", "image": "", "flavor": {"id": "6cda4820-0b3d-499a-b5fb-48cae704a3c8", "links": [{"rel": "bookmark", "href": "http://172.16.29.18:8774/flavors/6cda4820-0b3d-499a-b5fb-48cae704a3c8"}]}, "created": "2026-10-08T03:53:46Z", "updated": "2026-10-08T03:53:57Z", "addresses": {"NET3741": [{"version": 4, "addr": "172.16.41.62", "OS-EXT-IPS:type": "fixed", "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:2e:b6:37"}]}, "accessIPv4": "", "accessIPv6": "", "links": [{"rel": "self", "href": "http://172.16.29.18:8774/v2.1/servers/e52bce4c-a98e-4f69-906c-ac6648a2e592"}, {"rel": "bookmark", "href": "http://172.16.29.18:8774/servers/e52bce4c-a98e-4f69-906c-ac6648a2e592"}], "OS-DCF:diskConfig": "AUTO", "progress": 0, "OS-EXT-AZ:availability_zone": "host52", "config_drive": "True", "key_name": null, "OS-SRV-USG:launched_at": "2026-10-08T03:53:57.000000", "OS-SRV-USG:terminated_at": null, "security_groups": [{"name": "default"}], "OS-EXT-STS:task_state": null, "OS-EXT-STS:vm_state": "active", "OS-EXT-STS:power_state": 1, "os-extended-volumes:volumes_attached": [{"id": "591f37c4-e2fc-4dfe-a51e-65bba0e2f829"}]}}"#;
+
+    /// Regression (caught on a second real cloud): the T_3741 body must decode
+    /// and yield its address — including the `"image": ""` quirk.
+    #[test]
+    fn real_cloud_envelope_with_empty_image_string_decodes_and_selects() {
+        let parsed: ServerResponse =
+            serde_json::from_str(REAL_ENVELOPE_T3741).expect("T_3741 envelope decodes");
+        let server = parsed.into_server();
+
+        assert_eq!(
+            server.id.as_deref(),
+            Some("e52bce4c-a98e-4f69-906c-ac6648a2e592")
+        );
+        assert_eq!(
+            server
+                .addresses
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["NET3741"],
+            "`addresses` must not come back empty (that was the bug)"
+        );
+        assert_eq!(
+            server.image_id(),
+            None,
+            "`image: \"\"` means 'no image', it must not poison the decode"
+        );
+
+        let got = select_address(
+            &server.addresses,
+            &server.access_ips(),
+            &AddressSelection {
+                network: "NET3741",
+                family: AddressFamily::IPv4,
+                prefer: IpPrefer::Fixed,
+                on_ambiguous: OnAmbiguous::Reject,
+            },
+        )
+        .expect("T_3741 instance resolves");
+        assert_eq!(got, "172.16.41.62".parse::<IpAddr>().unwrap());
+    }
+
+    /// `server.image` in every form seen in the wild. Only the object carries
+    /// an id; the rest mean "no image" and must never fail the decode.
+    #[test]
+    fn image_is_accepted_in_every_form_real_clouds_send() {
+        let with_id: NovaServer =
+            serde_json::from_str(r#"{"image":{"id":"img-1"}}"#).expect("object");
+        assert_eq!(with_id.image_id(), Some("img-1"));
+
+        for body in [
+            r#"{"image":null}"#,    // documented "deleted image"
+            r#"{"image":""}"#,      // T_3741: the empty-string form
+            r#"{"image":"img-1"}"#, // a bare string is not an object we model
+            r#"{"image":42}"#,      // … and neither is this
+            r#"{}"#,                // absent key
+        ] {
+            let server: NovaServer =
+                serde_json::from_str(body).unwrap_or_else(|err| panic!("{body}: {err}"));
+            assert_eq!(server.image_id(), None, "{body}");
+        }
+    }
+
+    /// The property the `untagged` dispatch used to break: a type error inside
+    /// an envelope must be a **loud** decode failure, never a silently empty
+    /// server (empty `addresses` read as `no_network` / `networks=[]`).
+    #[test]
+    fn a_type_error_inside_an_envelope_fails_loudly_instead_of_empting_the_server() {
+        let envelope = r#"{"server":{"id":"e52bce4c","addresses":"not-a-map"}}"#;
+        assert!(
+            serde_json::from_str::<ServerResponse>(envelope).is_err(),
+            "a broken inner document must not decode"
+        );
+
+        let flat = r#"{"id":"x","addresses":"not-a-map"}"#;
+        assert!(
+            serde_json::from_str::<ServerResponse>(flat).is_err(),
+            "a broken flat document must not decode either"
+        );
+
+        assert!(
+            serde_json::from_str::<ServerResponse>(r#"{"server":null}"#).is_err(),
+            "a null wrapper is not a server"
+        );
+
+        // An unknown key is still ignored: clouds add fields all the time.
+        let ok = serde_json::from_str::<ServerResponse>(
+            r#"{"server":{"id":"x","brand_new_field":{"a":1},"addresses":{"n":[{"addr":"10.0.0.1"}]}}}"#,
+        )
+        .expect("unknown fields stay harmless");
+        assert_eq!(
+            ok.into_server().addresses["n"][0].addr.as_deref(),
+            Some("10.0.0.1")
         );
     }
 
