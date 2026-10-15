@@ -38,6 +38,9 @@ Per-server control keys (stripped from the Nova body):
     delay_ms sleep before answering — used to widen a race window
     envelope answer `{"server": {…}}` (classic v2 wire format) instead of
              the flat v2.1 document — for the envelope-robustness case
+    slim_list answer the `?name=` list with only `id`/`links`/`name` and no
+             addresses — some real clouds (e.g. T_3741) slim list entries, so
+             the gateway must refine a unique name match with show-by-id
 
 Self-contained: stdlib only, graceful SIGTERM, `--access-log` for assertions
 that must survive a restart.
@@ -53,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
-CONTROL_KEYS = ("status", "delay_ms", "envelope")
+CONTROL_KEYS = ("status", "delay_ms", "envelope", "slim_list")
 
 # Headers worth keeping in the log: they are the evidence that the gateway
 # authenticated with a real token and asked for the microversion it claims to.
@@ -159,6 +162,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(server, dict):
                     continue
                 if needle and needle in str(server.get("name", "")):
+                    if server.get("slim_list"):
+                        # A directory entry only: id/links/name, no addresses.
+                        matched.append(
+                            {"id": uuid, "name": server.get("name"), "links": []}
+                        )
+                        continue
                     body = {k: v for k, v in server.items() if k not in CONTROL_KEYS}
                     body.setdefault("id", uuid)
                     matched.append(body)

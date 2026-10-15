@@ -361,8 +361,11 @@ impl OpenStackClient {
 
     /// `GET {nova}/servers/{uuid}` — the UUID route (show-by-id).
     ///
-    /// The UUID is validated by [`is_instance_uuid`] before it is put in the
-    /// path, and it is the *only* thing appended to the base URL.
+    /// The path segment is never user-controlled here: the UUID route feeds it
+    /// a principal already accepted by [`is_instance_uuid`] in `resolve`, and
+    /// the name-route refinement feeds it an id Nova itself returned in the
+    /// list body (appendix A.3's defence in depth). It is the *only* thing
+    /// appended to the base URL.
     async fn get_server(&self, token: CachedToken, uuid: &str) -> Result<NovaServer, ControlError> {
         let resp = self
             .nova_get(
@@ -476,7 +479,34 @@ impl OpenStackClient {
             }
         };
         match exact_name_match(servers, name) {
-            Ok(server) => Ok(server),
+            Ok(server) => {
+                // Real clouds (observed against T_3741's Nova) answer the
+                // `?name=` list with a *slim* entry — `id`/`links`/`name`,
+                // no addresses at all. The list is a directory; the
+                // authoritative document is show-by-id, so refine once when
+                // the directory entry carries none. The id comes from Nova's
+                // own answer, and `get_server` appends nothing but it to the
+                // base URL (appendix A.3's defence in depth). The guard is a
+                // plain emptiness check, *not* `is_instance_uuid`: a cloud is
+                // free to hand back an id this gateway's UUID shape rejects,
+                // and a valid directory entry must not go undialled over a
+                // formality. Failure stays loud and homogeneous — a 404 or an
+                // undecodable body is `NotFound`/`Decode` either way.
+                if server.addresses.is_empty() {
+                    if let Some(id) = server.id.as_deref().filter(|id| !id.is_empty()) {
+                        tracing::debug!(
+                            target: "openstack",
+                            route_by = "name",
+                            principal = %name,
+                            %id,
+                            "list entry carries no addresses; refining with show-by-id"
+                        );
+                        let token = self.acquire().await?;
+                        return self.get_server(token, id).await;
+                    }
+                }
+                Ok(server)
+            }
             Err(err) => {
                 // Zero matches and "several machines share this name" are both
                 // `not_found` from the outside; only the log distinguishes
@@ -1812,6 +1842,111 @@ mod tests {
         assert!(
             paths.iter().all(|p| !p.contains("?name=")),
             "a UUID must never be looked up by name: {paths:?}"
+        );
+    }
+
+    /// Real-cloud catch (T_3741's Nova): the `?name=` list answers with a
+    /// *slim* entry — `id`/`links`/`name`, no addresses at all. The list is a
+    /// directory, so the gateway must refine the unique match with one
+    /// show-by-id instead of dialing nothing.
+    #[tokio::test]
+    async fn a_slim_list_entry_is_refined_with_show_by_id() {
+        let base = Arc::new(OnceLock::<String>::new());
+        let base_for_handler = Arc::clone(&base);
+        let mock = MockHttp::start(move |request| {
+            let base = base_for_handler.get().cloned().unwrap_or_default();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/auth/tokens") => Response::token(
+                    "subject-token",
+                    &token_body("2099-01-01T00:00:00.000000Z", &base),
+                ),
+                // The slim directory answer, exactly as the real cloud sends
+                // it — including a *non-v4* id (T_3741's e52bce4c…): the
+                // refinement must not gate on a UUID variant bit real Nova
+                // does not promise.
+                ("GET", path) if path.starts_with("/v2.1/servers?") => Response::json(
+                    200,
+                    r#"{"servers":[{"id":"550e8400-e29b-41d4-a716-446655440024","name":"inst-1","links":[]}]}"#,
+                ),
+                ("GET", path) if path.starts_with("/v2.1/servers/") => Response::json(
+                    200,
+                    &server_json(
+                        r#"{"private":[{"addr":"10.0.0.7","version":4,"OS-EXT-IPS:type":"fixed"}]}"#,
+                    ),
+                ),
+                _ => Response::json(404, "{}"),
+            }
+        });
+        base.set(mock.url("")).expect("base url set");
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+
+        let grant = client
+            .resolve(&req("inst-1"))
+            .await
+            .expect("resolves via the refinement");
+
+        assert_eq!(grant.target.host, "10.0.0.7");
+        assert_eq!(grant.target.user, "cloud-user");
+        let paths: Vec<String> = mock.requests().into_iter().map(|r| r.path).collect();
+        assert!(
+            paths.iter().any(|p| p.starts_with("/v2.1/servers?")),
+            "the list lookup happened: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p == "/v2.1/servers/550e8400-e29b-41d4-a716-446655440024"),
+            "and was refined with show-by-id: {paths:?}"
+        );
+    }
+
+    /// The refinement must not demand a UUID-shaped id. Appendix A.3's SSRF
+    /// defence lives in `get_server` appending nothing but the id Nova itself
+    /// returned to the base URL; gating on a form here would leave a valid
+    /// directory entry undialled and resolve to nothing (which, for T_3741's
+    /// slim list, is exactly the `no_network` failure this layer exists to
+    /// stop).
+    #[tokio::test]
+    async fn the_refinement_does_not_demand_a_uuid_shaped_id() {
+        let base = Arc::new(OnceLock::<String>::new());
+        let base_for_handler = Arc::clone(&base);
+        let mock = MockHttp::start(move |request| {
+            let base = base_for_handler.get().cloned().unwrap_or_default();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/auth/tokens") => Response::token(
+                    "subject-token",
+                    &token_body("2099-01-01T00:00:00.000000Z", &base),
+                ),
+                ("GET", path) if path.starts_with("/v2.1/servers?") => Response::json(
+                    200,
+                    r#"{"servers":[{"id":"inst-1-id","name":"inst-1","links":[]}]}"#,
+                ),
+                ("GET", path) if path.starts_with("/v2.1/servers/") => Response::json(
+                    200,
+                    &server_json(
+                        r#"{"private":[{"addr":"10.0.0.7","version":4,"OS-EXT-IPS:type":"fixed"}]}"#,
+                    ),
+                ),
+                _ => Response::json(404, "{}"),
+            }
+        });
+        base.set(mock.url("")).expect("base url set");
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+
+        let grant = client
+            .resolve(&req("inst-1"))
+            .await
+            .expect("a non-UUID directory id still refines");
+
+        assert_eq!(grant.target.host, "10.0.0.7");
+        assert!(
+            mock.requests()
+                .iter()
+                .any(|r| r.path == "/v2.1/servers/inst-1-id"),
+            "the non-UUID id was dialled as-is: {:?}",
+            mock.requests()
         );
     }
 

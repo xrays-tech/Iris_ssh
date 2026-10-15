@@ -534,6 +534,9 @@ ALL_CASES=(
   # plan-openstack appendix B (layer O7d): wire-shape robustness.
   case_openstack_envelope_variants
   case_openstack_unparseable_loud
+  # real-cloud refinement: a `?name=` directory entry without addresses is
+  # refined with one show-by-id (caught against T_3741's Nova).
+  case_openstack_name_slim_list
 )
 
 resolve_case_path() {
