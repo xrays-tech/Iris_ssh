@@ -211,7 +211,7 @@ subtopo_start() {
     local _os_scope=""
     [ "$SUBTOP_OS_SCOPE" = "cross_project" ] && \
       _os_scope="$(printf 'scope = "cross_project"\nauth_method = "password"\nusername = "ops-admin"\npassword = "lab-pw"\n')"
-    _os_toml="$(printf '[openstack]\nenabled = true\nrouting = "openstack_only"\nauthorization = "openstack_only"\nallow_any_authenticated_key = true\nauth_url = "http://127.0.0.1:%s/v3"\nnova_endpoint = "http://127.0.0.1:%s/v2.1"\napplication_credential_id = "cred-id"\napplication_credential_secret = "cred-secret"\nproject_id = "proj-1"\nregion = "RegionOne"\ninterface = "public"\nssh_port = %s\ncache_ttl = "%s"\ntimeout = "%s"\nfail_open = %s\naddress_family = "ipv4"\nprefer = "floating"\non_ambiguous = "%s"\ndefault_backend_user = "%s"\nbackend_user_metadata_key = "%s"\n%s%s%s\n' \
+    _os_toml="$(printf '[openstack]\nenabled = true\nrouting = "openstack_only"\nauthorization = "openstack_only"\nallow_any_authenticated_key = true\nauth_url = "http://127.0.0.1:%s/v3"\nnova_endpoint = "http://127.0.0.1:%s/v2.1"\napplication_credential_id = "cred-id"\napplication_credential_secret = "cred-secret"\nproject_id = "proj-1"\nregion = "RegionOne"\ninterface = "public"\nssh_port = %s\ncache_ttl = "%s"\ntimeout = "%s"\nfail_open = %s\naddress_family = "ipv4"\nprefer = "floating"\non_ambiguous = "%s"\ndefault_backend_user = "%s"\nbackend_user_metadata_key = "%s"\n%s\n%s\n%s\n' \
       "$ST_OS_PORT" "$ST_OS_PORT" "$ST_SSHD_PORT" \
       "$SUBTOP_OS_CACHE_TTL" "$SUBTOP_OS_TIMEOUT" "$SUBTOP_OS_FAIL_OPEN" \
       "$SUBTOP_OS_ON_AMBIGUOUS" "$SUBTOP_OS_DEFAULT_USER" "$SUBTOP_OS_METADATA_KEY" \

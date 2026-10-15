@@ -23,10 +23,9 @@ PRINCIPAL="$UUID"
 openstack_topo_start "$KEYDIR/authorized_keys"
 subtopo_agent_start "$IT_ASSET_DIR/user_ed25519"
 
-rc=0
-run_capture subtopo_ssh_A 'printf SHOULD_NOT_RUN' || rc=$?
-if [ "$rc" -ne 0 ]; then
-  pass "cross-tenant instance refused under the default single_project scope (rc=$rc)"
+run_capture subtopo_ssh_A 'printf SHOULD_NOT_RUN'
+if [ "$RUN_RC" -ne 0 ]; then
+  pass "cross-tenant instance refused under the default single_project scope (rc=$RUN_RC)"
 else
   fail "cross-tenant instance should be invisible to a single-project token"
 fi

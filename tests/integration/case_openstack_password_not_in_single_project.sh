@@ -7,6 +7,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
+. "$HERE/subtopo.sh"   # defines SUBTOPO_GW_BIN with the repo fallback
 
 KEY="$IT_WORK_DIR/os-hostkey2"
 mkdir -p "$IT_WORK_DIR"
@@ -33,7 +34,7 @@ nova_endpoint = "http://127.0.0.1:8774/v2.1"
 default_backend_user = "alex"
 EOF
 rc=0
-"$GW_BIN" --config "$IT_WORK_DIR/bad_password_single.toml" >/dev/null 2>&1 && rc=1 || rc=0
+"$SUBTOPO_GW_BIN" --config "$IT_WORK_DIR/bad_password_single.toml" >/dev/null 2>&1 && rc=1 || rc=0
 if [ "$rc" -eq 0 ]; then
   pass "password auth without cross_project is rejected at startup"
 else

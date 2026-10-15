@@ -27,10 +27,9 @@ PRINCIPAL="dup"
 openstack_topo_start "$KEYDIR/authorized_keys"
 subtopo_agent_start "$IT_ASSET_DIR/user_ed25519"
 
-rc=0
-run_capture subtopo_ssh_A 'printf SHOULD_NOT_RUN' || rc=$?
-if [ "$rc" -ne 0 ]; then
-  pass "cross-project ambiguous name refused (rc=$rc)"
+run_capture subtopo_ssh_A 'printf SHOULD_NOT_RUN'
+if [ "$RUN_RC" -ne 0 ]; then
+  pass "cross-project ambiguous name refused (rc=$RUN_RC)"
 else
   fail "expected refusal for a name shared across projects"
 fi
