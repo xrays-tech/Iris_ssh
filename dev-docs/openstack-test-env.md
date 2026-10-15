@@ -83,4 +83,18 @@ ssh_port = 22
            project T_3746 = a070dab7800e4eff88ad72e11f864471；roles=member,manager,admin,reader；
            catalog compute public RegionOne = http://172.16.29.18:8774/v2.1；
            Nova detail 列出 5 实例（4 ACTIVE）。
+2026-10-15  真实冒烟（本地网关 → 真实 Keystone/Nova，静态 token，openstack_only）：
+           - 抓到并修复真实 bug：本 Nova 返回经典 v2 信封 `{"server":{...}}`，旧代码只认
+             扁平文档 → "成功"解码成空 addresses → `no_network`（commit 2963e76，
+             `ServerResponse` 双形态解码 + 真实 body 回归测试）。
+           - 修复后：UUID d702cf44… 解析成功（审计 resolve_source="openstack"、
+             target_host=172.16.46.25 / user=ubuntu）；后端拨号尝试 172.16.46.25:22
+             **超时＝已知网络限制**（本机到 172.16.46.x:22 不通，非 bug）；
+             未知 UUID 仍拒绝。指标 resolve_ok=1/err=1。
 ```
+
+## 6b. 剩余缺口（真机端到端验证`ssh -A <uuid>`成功登录实例前）
+
+- [ ] 网络：网关所在机器需能到达 `172.16.46.x:22`（当前机器不可达）
+- [ ] 实例登录用户确认 + 测试公钥放入实例 `authorized_keys`（默认按 `ubuntu` 配置）
+- [ ] 实例选定（5 台 ACTIVE 任挑）后做完整登录断言（audit `resolve_source=openstack` + 会话成功）
