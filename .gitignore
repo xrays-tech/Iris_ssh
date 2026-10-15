@@ -15,3 +15,6 @@ __pycache__/
 
 # local OpenStack test credentials (never commit)
 .openstack-test.env
+
+# OpenStack clouds.yaml (contains secrets - never commit)
+dev-docs/clouds.yaml

@@ -91,6 +91,16 @@ ssh_port = 22
              target_host=172.16.46.25 / user=ubuntu）；后端拨号尝试 172.16.46.25:22
              **超时＝已知网络限制**（本机到 172.16.46.x:22 不通，非 bug）；
              未知 UUID 仍拒绝。指标 resolve_ok=1/err=1。
+2026-10-15  application-credential 模式（用户已开启该 API，凭据在 gitignored
+           dev-docs/clouds.yaml，id/secret 已导入 .openstack-test.env）：
+           - 再抓到真实 bug：Keystone 对 app-credential 认证**携带 scope 返回 401**
+             （"Application credentials cannot request a scope"）；客户端 `auth_body`
+             带了 scope → 统一 401。修复：app-cred 认证不再发送 scope（凭据创建时已
+             锁项目；该段是创建时定死的 blast radius）。commit 见下。
+           - 修复后：app-cred + **catalog 发现**（无 nova_endpoint、region=RegionOne，
+             生产推荐形态）解析成功 resolve_source="openstack"→172.16.46.25；
+             后端拨号仍因网络不可达超时。指标 resolve_ok=1/err=1。全量 test 255+4、
+             集成 38P/0F/2S 通过。
 ```
 
 ## 6b. 剩余缺口（真机端到端验证`ssh -A <uuid>`成功登录实例前）
