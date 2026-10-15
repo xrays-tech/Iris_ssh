@@ -1315,3 +1315,58 @@ project_domain_name = "Default"
 3. （次要）**`ambiguous_name_cross_project` 的粒度**：建议按 scope 区分 reason token（本条
    设计）；若认为两 token 冗余，可合并为 `ambiguous_name` + 附加 `scope=` 字段。建议保留独立
    token，排障更直接。
+
+---
+
+# 附录 D — 只取浮动 IP（floating-only address selection）
+
+> 状态：设计（2026-10-15），待实施。**启用前置条件：实例须已关联浮动 IP（Neutron 操作）；未关联前开启会让所有实例解析失败。**
+
+## D.0 需求与现状（已真机验证）
+
+- **运维前提**：仅浮动 IP 可从公网到达实例；fixed（VXLAN 租户网）地址需手工设置网络，不利于网关按需拨号。因此解析实例 IP 时**只能取浮动 IP**。
+- **现状**：现有 `prefer`（默认）是"类型排序 + **无浮动时回退 fixed**"——不满足"只能取浮动 IP"。
+- **真机验证（2026-10-15，只读）**：
+  - T_3741：Nova `addresses` 全 fixed；Neutron `floatingips` **0 个**。
+  - T_3746：4 个浮动 IP，其中 **3 个 `status=DOWN` 未绑定实例端口**；1 个 ACTIVE 绑定到 `192.168.2.123`（非本批 GPU 实例网段）。
+  - ⇒ 当前**所有可路由实例均无关联浮动 IP**；在云侧关联浮动 IP 之前开启 floating-only 会令全部实例 `no_floating` 拒绝。
+
+## D.1 设计：新增"地址种类硬过滤"（默认关=现状零回归）
+
+**配置**：`[openstack] address_kind = "any"（默认）| "floating" | "fixed"`
+
+- `"any"`：与现状**字节等价**（`prefer` 排序 + 现有回退语义，零回归，包括现有 fixed-IP 端到端）。
+- `"floating"`：**只接受 `AddrKind::Floating` 候选**；实例无任何 floating 地址 → 拒绝（独立 reason `no_floating`；客户端恒同构 `NotFound`），**绝不回退 fixed**；多候选仍按 `on_ambiguous` 裁决。
+- `"fixed"`：镜像（只接受 fixed，无 → `no_fixed`；对称实现，成本≈0）。
+
+**正交性**：`address_kind` 是**硬过滤**（进入 `prefer` 排序前按类型过滤）；`prefer` 保留为**同类型内排序**。两者组合语义明确（如 floating-only + prefer=floating 等价；floating-only + prefer=fixed 仍是只取 floating 但 fixed 优先排序无意义——文档说明）。
+
+**实现落点**（`src/openstack/nova.rs` / `src/config.rs` / `src/openstack/mod.rs`）：
+- `AddressSelection` 增 `kind: AddressKind`（`any|floating|fixed`，与现有 `AddrKind` 候选区分开）；
+- `select_address`：在 `network`/family 过滤后、`prefer` 排序前，先按 `kind` 过滤候选；过滤后为空 →
+  - `floating` → `reason="no_floating"`、`fixed` → `reason="no_fixed"`、`any` → 现行为；
+  - 沿用 O7 的"合法空 vs 不可用"判别：无对应类型是**合法空**（响亮 reason），不是 `unparseable`；
+- `OpenStackConfig` + TOML + 枚举校验 + Debug 同步；`config.example.toml` 注释。
+
+## D.2 交互
+
+- `network` / `address_family` / `on_ambiguous` / `scope=cross_project` **全部正交**：floating 过滤后再按这些筛选。
+- ⚠ **`network` 过滤器注意**：浮动 IP 的归属网络是"浮动端口所在网络"（Neutron 关联），通常**与实例 fixed 网络不同名**；若同时配 `network`（如按 fixed 网名 `NET3741`），可能把 floating 候选过滤光 → `no_floating`。文档需提示：floating-only 模式下 `network` 应指向浮动网络名或留空。
+- 日志/审计：`reason` token 进 `target=openstack` 日志；`target.host` 只来自解析；`AuditRecord` 格式不变。
+
+## D.3 测试
+
+- 单元（`nova.rs` 表驱动）：同实例 fixed+floating → floating-only 选 floating；仅 fixed → 拒绝 `no_floating`；floating-only + 多 floating → `on_ambiguous` 生效；`any`（默认）字节不变回归；`fixed` 镜像。
+- 集成：`case_openstack_floating_only`（mock 实例带 floating，拨 floating）、`case_openstack_no_floating_rejected`（仅 fixed → 拒绝、reason=no_floating、0 拨号）、`case_openstack_address_kind_default`（any=现状回归）。
+- 真机：待 T_3746 空闲浮动 IP（DOWN 三枚之一）由云侧 float 到实例端口后验证（**前置条件**）。
+
+## D.4 红线 / DoD
+
+- 默认 `any` = 现状**零回归**（不打断现有 fixed e2e）；
+- `floating` 仅取 floating、无则拒绝、**绝不回落 fixed**；失败对客户端恒同构；
+- `target.host` 只来自解析；日志只摘要不泄 body；不改 audit/agent/app-cred 语义；
+- DoD：配置 + 选择器过滤 + reason token + 3 测试 + docs；实施后经 oracle 红线 12 复审。
+
+## D.5 工作量
+
+S（约 0.5–1 人日 + 复审）：配置枚举/校验、`select_address` 加 kind 过滤、reason token、单测×3、集成×2~3、docs。
