@@ -29,7 +29,7 @@ use russh::{Channel, ChannelId, ChannelOpenFailure, Pty};
 
 use crate::audit::{Auditor, CommandInfo};
 use crate::backend::BackendDialer;
-use crate::config::{GatewayConfig, OpenStackRouting};
+use crate::config::{GatewayConfig, OpenStackRouting, RouteKind};
 use crate::error::{ConfigError, Error, Result};
 use crate::metrics::Metrics;
 use crate::policy::HostKeyVerifier;
@@ -488,6 +488,12 @@ impl GatewayContext {
             .map(|os| os.routing)
             .unwrap_or(OpenStackRouting::Hybrid);
         let openstack_enabled = openstack_cfg.is_some();
+        // `[openstack] route_by` decides which principal shapes the OpenStack
+        // route accepts (default `["uuid"]`, plan-openstack appendix A.1).
+        // Unused while the feature is off, but kept coherent for the router.
+        let route_by = openstack_cfg
+            .map(|os| os.route_by.clone())
+            .unwrap_or_else(|| vec![RouteKind::Uuid]);
         // The control-plane route is live everywhere except pure mode.
         let control_plane_needed = !openstack_enabled || routing == OpenStackRouting::Hybrid;
 
@@ -538,6 +544,7 @@ impl GatewayContext {
         let router = ResolveRouter::new(
             routing,
             openstack_enabled,
+            route_by,
             cp_resolver,
             os_resolver,
             metrics.clone(),

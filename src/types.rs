@@ -111,6 +111,28 @@ pub fn is_instance_uuid(raw: &str) -> bool {
     uuid::Uuid::parse_str(raw).is_ok()
 }
 
+/// A guard for the instance-**name** route: non-empty, ≤255 bytes (Nova's name
+/// limit), no ASCII control characters.
+///
+/// It is deliberately *not* a grammar. By the time a name reaches routing it
+/// has already been through [`Principal::parse`]
+/// (`^[a-z0-9][a-z0-9_-]{0,62}$`), which is the real gate — a name containing
+/// a space, a dot or an uppercase letter is rejected at the front leg and never
+/// arrives here (plan-openstack appendix A.1). This predicate is only a
+/// defence-in-depth bound on the string that is about to become a Nova query
+/// parameter value.
+///
+/// Callers: [`crate::resolve::route_for`] (is this principal eligible for the
+/// name route at all?) and the Nova name lookup in
+/// [`crate::openstack::OpenStackClient`] (belt and braces before the request is
+/// built). [`is_instance_uuid`] always wins: a UUID-shaped principal is never
+/// treated as a name, even when both routes are enabled.
+///
+/// Pure: no configuration, no I/O.
+pub fn is_instance_name(raw: &str) -> bool {
+    !raw.is_empty() && raw.len() <= 255 && !raw.chars().any(char::is_control)
+}
+
 /// Which resolver produced a [`Grant`] (observability only: it never changes
 /// what the grant authorizes).
 ///
@@ -400,6 +422,37 @@ mod tests {
         assert!(!is_instance_uuid("-4710fd67-1d3c-4c3e-9d35-6a5c0a9f"));
         // A 36-char string that is all hex but for the dash positions.
         assert!(!is_instance_uuid("4710fd671d3c4-c3e9d35-6a5c0a9f7d1b"));
+    }
+
+    #[test]
+    fn instance_name_predicate_is_only_a_bound_not_a_grammar() {
+        // Real instance names from the lab, plus the shapes the front-leg
+        // grammar already admits.
+        for good in ["yunqing_dev", "inst-1", "a", "x9y8", "0start", "a_b-c"] {
+            assert!(is_instance_name(good), "{good:?} must be name-shaped");
+        }
+        // The bounds this predicate actually owns.
+        assert!(!is_instance_name(""), "empty is never a name");
+        assert!(
+            !is_instance_name(&"a".repeat(256)),
+            "beyond Nova's 255 limit"
+        );
+        assert!(is_instance_name(&"a".repeat(255)), "exactly 255 is fine");
+        assert!(
+            !is_instance_name("bad\nname"),
+            "no ASCII control characters"
+        );
+        assert!(!is_instance_name("bad\0name"), "NUL included");
+        assert!(!is_instance_name("bad\rname"));
+        // Not a grammar: characters the Principal grammar would already have
+        // rejected are *this* predicate's business only if they are control
+        // characters or the string is empty. A space is not a control char, so
+        // the bound accepts it — the front leg is what refuses it, and that
+        // is by design (plan-openstack appendix A.1).
+        assert!(
+            is_instance_name("has space"),
+            "a space is not a control char"
+        );
     }
 
     #[test]

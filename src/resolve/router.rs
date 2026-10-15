@@ -13,18 +13,19 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::OpenStackRouting;
+use crate::config::{OpenStackRouting, RouteKind};
 use crate::error::ResolveError;
 use crate::metrics::Metrics;
 use crate::resolve::{ResolveResult, Resolver};
-use crate::types::{is_instance_uuid, Principal, ResolveSource};
+use crate::types::{is_instance_name, is_instance_uuid, Principal, ResolveSource};
 
 /// Which resolver a principal is sent to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveRoute {
     /// The existing external control plane (unchanged behaviour).
     ControlPlane,
-    /// OpenStack Nova, keyed by the instance UUID in the username.
+    /// OpenStack Nova, keyed by the instance UUID (or, when the name route is
+    /// enabled, the instance name) in the username.
     OpenStack,
     /// No route at all: reject before any network call is made.
     Reject,
@@ -36,31 +37,42 @@ pub enum ResolveRoute {
 /// or `enabled = false`; in that case the answer is *always* the control plane,
 /// which is how "default off" stays byte-for-byte compatible with the previous
 /// behaviour (plan-openstack §5.2 red line 8).
+///
+/// `route_by` is the validated `[openstack] route_by` list; its default
+/// `["uuid"]` reproduces the pre-name-routing behaviour exactly
+/// (plan-openstack appendix A.1). Two rules govern the name route:
+///
+/// 1. **UUID shape always wins.** A canonical UUID is never considered as a
+///    name, so an instance whose name happens to look like an id cannot create
+///    ambiguity.
+/// 2. **Name is opt-in.** Without `RouteKind::Name` in `route_by`, a
+///    non-UUID principal takes the routing mode's ordinary answer
+///    (`ControlPlane` in hybrid, `Reject` in `openstack_only`) and no request
+///    is ever made.
 pub fn route_for(
     principal: &str,
     routing: OpenStackRouting,
     openstack_enabled: bool,
+    route_by: &[RouteKind],
 ) -> ResolveRoute {
     if !openstack_enabled {
         return ResolveRoute::ControlPlane;
     }
-    let is_uuid = is_instance_uuid(principal);
-    match routing {
-        OpenStackRouting::Hybrid => {
-            if is_uuid {
-                ResolveRoute::OpenStack
-            } else {
-                ResolveRoute::ControlPlane
-            }
-        }
-        OpenStackRouting::OpenStackOnly => {
-            if is_uuid {
-                ResolveRoute::OpenStack
-            } else {
-                ResolveRoute::Reject
-            }
-        }
+    let fallthrough = match routing {
+        OpenStackRouting::Hybrid => ResolveRoute::ControlPlane,
+        OpenStackRouting::OpenStackOnly => ResolveRoute::Reject,
+    };
+    if is_instance_uuid(principal) {
+        return if route_by.contains(&RouteKind::Uuid) {
+            ResolveRoute::OpenStack
+        } else {
+            fallthrough
+        };
     }
+    if route_by.contains(&RouteKind::Name) && is_instance_name(principal) {
+        return ResolveRoute::OpenStack;
+    }
+    fallthrough
 }
 
 #[cfg(test)]
@@ -68,32 +80,48 @@ mod tests {
     use super::*;
 
     const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    /// The `[openstack] route_by` default: only the UUID route exists.
+    const UUID_ONLY: &[RouteKind] = &[RouteKind::Uuid];
+    /// `route_by = ["uuid", "name"]`.
+    const BOTH: &[RouteKind] = &[RouteKind::Uuid, RouteKind::Name];
+    /// `route_by = ["name"]` (unusual, but legal).
+    const NAME_ONLY: &[RouteKind] = &[RouteKind::Name];
 
     #[test]
     fn disabled_feature_always_routes_to_the_control_plane() {
         // Even a UUID-shaped principal must not move while the feature is off.
         for routing in [OpenStackRouting::Hybrid, OpenStackRouting::OpenStackOnly] {
-            assert_eq!(route_for(UUID, routing, false), ResolveRoute::ControlPlane);
-            assert_eq!(
-                route_for("alex_host1", routing, false),
-                ResolveRoute::ControlPlane
-            );
+            for route_by in [UUID_ONLY, BOTH] {
+                assert_eq!(
+                    route_for(UUID, routing, false, route_by),
+                    ResolveRoute::ControlPlane
+                );
+                assert_eq!(
+                    route_for("alex_host1", routing, false, route_by),
+                    ResolveRoute::ControlPlane
+                );
+            }
         }
     }
 
     #[test]
     fn hybrid_splits_by_shape() {
         assert_eq!(
-            route_for(UUID, OpenStackRouting::Hybrid, true),
+            route_for(UUID, OpenStackRouting::Hybrid, true, UUID_ONLY),
             ResolveRoute::OpenStack
         );
         assert_eq!(
-            route_for("alex_host1", OpenStackRouting::Hybrid, true),
+            route_for("alex_host1", OpenStackRouting::Hybrid, true, UUID_ONLY),
             ResolveRoute::ControlPlane
         );
         // Near-misses stay on the control plane.
         assert_eq!(
-            route_for("550e8400-e29b-41d4-a716", OpenStackRouting::Hybrid, true),
+            route_for(
+                "550e8400-e29b-41d4-a716",
+                OpenStackRouting::Hybrid,
+                true,
+                UUID_ONLY
+            ),
             ResolveRoute::ControlPlane
         );
     }
@@ -101,7 +129,7 @@ mod tests {
     #[test]
     fn openstack_only_rejects_non_uuids_without_falling_back() {
         assert_eq!(
-            route_for(UUID, OpenStackRouting::OpenStackOnly, true),
+            route_for(UUID, OpenStackRouting::OpenStackOnly, true, UUID_ONLY),
             ResolveRoute::OpenStack
         );
         for principal in [
@@ -110,9 +138,76 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440000-extra",
         ] {
             assert_eq!(
-                route_for(principal, OpenStackRouting::OpenStackOnly, true),
+                route_for(principal, OpenStackRouting::OpenStackOnly, true, UUID_ONLY),
                 ResolveRoute::Reject,
                 "{principal:?} must not fall back to the control plane"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_route_by_is_uuid_only_so_names_stay_unrouted() {
+        // Red line 1: with the default, a name principal must behave exactly
+        // as it did before the name route existed.
+        assert_eq!(
+            route_for(
+                "yunqing_dev",
+                OpenStackRouting::OpenStackOnly,
+                true,
+                UUID_ONLY
+            ),
+            ResolveRoute::Reject
+        );
+        assert_eq!(
+            route_for("yunqing_dev", OpenStackRouting::Hybrid, true, UUID_ONLY),
+            ResolveRoute::ControlPlane
+        );
+        // Explicit `route_by = ["name"]` alone also routes a UUID nowhere.
+        assert_eq!(
+            route_for(UUID, OpenStackRouting::OpenStackOnly, true, NAME_ONLY),
+            ResolveRoute::Reject
+        );
+    }
+
+    #[test]
+    fn enabling_the_name_route_covers_names_but_never_changes_the_uuid_arm() {
+        for routing in [OpenStackRouting::Hybrid, OpenStackRouting::OpenStackOnly] {
+            for name in ["yunqing_dev", "inst-1", "a"] {
+                assert_eq!(
+                    route_for(name, routing, true, BOTH),
+                    ResolveRoute::OpenStack,
+                    "{name:?} must route to OpenStack when the name route is on"
+                );
+            }
+            // UUID shape still wins and still needs the uuid arm.
+            assert_eq!(
+                route_for(UUID, routing, true, BOTH),
+                ResolveRoute::OpenStack
+            );
+            assert_eq!(
+                route_for(UUID, routing, true, NAME_ONLY),
+                match routing {
+                    OpenStackRouting::Hybrid => ResolveRoute::ControlPlane,
+                    OpenStackRouting::OpenStackOnly => ResolveRoute::Reject,
+                },
+                "a UUID must never be treated as a name"
+            );
+            // Nothing else sneaks through: the front-leg grammar would have
+            // refused these, but the predicate is the second gate.
+            assert_eq!(
+                route_for("", routing, true, BOTH),
+                match routing {
+                    OpenStackRouting::Hybrid => ResolveRoute::ControlPlane,
+                    OpenStackRouting::OpenStackOnly => ResolveRoute::Reject,
+                }
+            );
+            assert_eq!(
+                route_for("bad\nname", routing, true, BOTH),
+                match routing {
+                    OpenStackRouting::Hybrid => ResolveRoute::ControlPlane,
+                    OpenStackRouting::OpenStackOnly => ResolveRoute::Reject,
+                },
+                "control characters are never a name"
             );
         }
     }
@@ -135,6 +230,9 @@ mod tests {
 pub struct ResolveRouter {
     routing: OpenStackRouting,
     openstack_enabled: bool,
+    /// `[openstack] route_by`: which principal shapes the OpenStack route
+    /// accepts (default `["uuid"]`, plan-openstack appendix A.1).
+    route_by: Vec<RouteKind>,
     control_plane: Option<Arc<Resolver>>,
     openstack: Option<Arc<Resolver>>,
     metrics: Metrics,
@@ -143,9 +241,14 @@ pub struct ResolveRouter {
 impl ResolveRouter {
     /// Assemble the router. `control_plane` is `None` only in OpenStack pure
     /// mode, `openstack` only when `[openstack]` is absent or disabled.
+    ///
+    /// `route_by` is the validated `[openstack] route_by`; the gateway passes
+    /// the configured list (which defaults to `["uuid"]`), tests may pass
+    /// whatever they are asserting.
     pub fn new(
         routing: OpenStackRouting,
         openstack_enabled: bool,
+        route_by: Vec<RouteKind>,
         control_plane: Option<Arc<Resolver>>,
         openstack: Option<Arc<Resolver>>,
         metrics: Metrics,
@@ -153,6 +256,7 @@ impl ResolveRouter {
         ResolveRouter {
             routing,
             openstack_enabled,
+            route_by,
             control_plane,
             openstack,
             metrics,
@@ -163,7 +267,12 @@ impl ResolveRouter {
     /// pre-authentication `auth_publickey_offered` probe (MUST: that phase
     /// must never reach the network).
     pub fn route(&self, principal: &str) -> ResolveRoute {
-        route_for(principal, self.routing, self.openstack_enabled)
+        route_for(
+            principal,
+            self.routing,
+            self.openstack_enabled,
+            &self.route_by,
+        )
     }
 
     /// Whether `route` can be served by the resolvers actually configured.
@@ -218,11 +327,14 @@ impl ResolveRouter {
             ResolveRoute::Reject => Err(ResolveError::Unrouted {
                 principal: principal.as_str().to_owned(),
                 reason: if self.openstack_enabled {
-                    "openstack_only routing accepts canonical instance UUIDs only"
+                    let routes: Vec<&str> = self.route_by.iter().map(|k| k.as_str()).collect();
+                    format!(
+                        "openstack_only routing accepts {} principals only",
+                        routes.join("/")
+                    )
                 } else {
-                    "no route configured for this principal"
-                }
-                .to_owned(),
+                    "no route configured for this principal".to_owned()
+                },
             }),
         };
 
@@ -363,7 +475,16 @@ mod router_dispatch_tests {
         cp: Option<Arc<Resolver>>,
         os: Option<Arc<Resolver>>,
     ) -> ResolveRouter {
-        ResolveRouter::new(routing, enabled, cp, os, Metrics::default())
+        // Every existing router test asserts the UUID route; the name route
+        // gets its own test with its own router.
+        ResolveRouter::new(
+            routing,
+            enabled,
+            vec![RouteKind::Uuid],
+            cp,
+            os,
+            Metrics::default(),
+        )
     }
 
     #[tokio::test]
@@ -390,6 +511,51 @@ mod router_dispatch_tests {
             0,
             "control plane untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn a_name_resolves_through_openstack_only_when_the_name_route_is_on() {
+        // Appendix A.1: the name route is opt-in, and opting in must not
+        // change the UUID arm or the control-plane arm.
+        let (os, os_calls) = resolver(CountingClient::new(true), 5);
+        let (cp, cp_calls) = resolver(CountingClient::new(true), 5);
+        let both = ResolveRouter::new(
+            OpenStackRouting::OpenStackOnly,
+            true,
+            vec![RouteKind::Uuid, RouteKind::Name],
+            Some(cp),
+            Some(os),
+            Metrics::default(),
+        );
+
+        let grant = both
+            .authorize(
+                &Principal::parse("yunqing_dev").unwrap(),
+                "SHA256:fp",
+                "127.0.0.1",
+            )
+            .await
+            .expect("a name resolves when the route is enabled");
+        assert_eq!(grant.resolve_source, ResolveSource::OpenStack);
+        assert_eq!(os_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cp_calls.load(Ordering::SeqCst), 0);
+
+        // The default router (uuid only) refuses the same name with zero
+        // upstream traffic — MUST1 holds for names too.
+        let (os2, os2_calls) = resolver(CountingClient::new(true), 5);
+        let (cp2, cp2_calls) = resolver(CountingClient::new(true), 5);
+        let uuid_only = router(OpenStackRouting::OpenStackOnly, true, Some(cp2), Some(os2));
+        let err = uuid_only
+            .authorize(
+                &Principal::parse("yunqing_dev").unwrap(),
+                "SHA256:fp",
+                "127.0.0.1",
+            )
+            .await
+            .expect_err("name routing is off by default");
+        assert!(matches!(err, ResolveError::Unrouted { .. }));
+        assert_eq!(os2_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cp2_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

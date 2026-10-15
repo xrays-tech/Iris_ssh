@@ -158,6 +158,39 @@ pub enum OpenStackAuthorization {
     OpenStackOnly,
 }
 
+/// Which shapes of principal the OpenStack route will accept
+/// (plan-openstack appendix A.1).
+///
+/// Configured as `[openstack] route_by = [...]`; the default is `["uuid"]`,
+/// which is byte-for-byte the behaviour that existed before name routing
+/// landed. UUID-shaped principals always take the UUID route when it is
+/// enabled — a name is never consulted for them, so "an instance whose name
+/// happens to look like a UUID" cannot create ambiguity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    /// Canonical instance UUID, resolved by `GET /servers/{id}`.
+    Uuid,
+    /// Instance name, resolved by `GET /servers?name=` with a local
+    /// exact-match filter (Nova's filter is a substring/RE search).
+    Name,
+}
+
+impl RouteKind {
+    /// The stable token used in `[openstack] route_by` and in log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteKind::Uuid => "uuid",
+            RouteKind::Name => "name",
+        }
+    }
+}
+
+impl std::fmt::Display for RouteKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Keystone v3 authentication method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenStackAuthMethod {
@@ -231,6 +264,9 @@ pub struct OpenStackConfig {
     pub routing: OpenStackRouting,
     pub authorization: OpenStackAuthorization,
     pub allow_any_authenticated_key: bool,
+    /// Which principal shapes this route accepts. Default `["uuid"]`; adding
+    /// `"name"` opts in to instance-name routing (plan-openstack appendix A.1).
+    pub route_by: Vec<RouteKind>,
 
     // --- Keystone v3 -----------------------------------------------------
     pub auth_url: String,
@@ -287,6 +323,7 @@ impl std::fmt::Debug for OpenStackConfig {
                 "allow_any_authenticated_key",
                 &self.allow_any_authenticated_key,
             )
+            .field("route_by", &self.route_by)
             .field("auth_url", &self.auth_url)
             .field("auth_method", &self.auth_method)
             .field("application_credential_id", &self.application_credential_id)
@@ -600,6 +637,8 @@ struct RawOpenStack {
     authorization: String,
     #[serde(default)]
     allow_any_authenticated_key: bool,
+    #[serde(default = "default_route_by")]
+    route_by: Vec<String>,
 
     // Keystone
     #[serde(default)]
@@ -678,6 +717,11 @@ fn default_routing() -> String {
 }
 fn default_authorization() -> String {
     "control_plane".to_owned()
+}
+fn default_route_by() -> Vec<String> {
+    // Conservative: only the UUID route exists unless an operator names the
+    // name route explicitly (plan-openstack appendix A.1).
+    vec!["uuid".to_owned()]
 }
 fn default_auth_method() -> String {
     "application_credential".to_owned()
@@ -1193,6 +1237,10 @@ fn validate_openstack(
     let address_family = parse_address_family(&raw.address_family)?;
     let prefer = parse_prefer(&raw.prefer)?;
     let on_ambiguous = parse_on_ambiguous(&raw.on_ambiguous)?;
+    // Parsed before the `enabled = false` short-circuit, exactly like the
+    // enums above: a typo in a line the operator did write must fail the boot
+    // rather than lie in wait until the feature is switched on.
+    let route_by = parse_route_by(&raw.route_by)?;
 
     // `enabled = false` short-circuits everything below: the section is then
     // inert, so a leftover `routing`/`authorization` line can never stand in
@@ -1442,6 +1490,7 @@ fn validate_openstack(
         routing,
         authorization,
         allow_any_authenticated_key: raw.allow_any_authenticated_key,
+        route_by,
         auth_url,
         auth_method,
         application_credential_id,
@@ -1653,6 +1702,38 @@ fn parse_on_ambiguous(value: &str) -> std::result::Result<OnAmbiguous, ConfigErr
             "\"reject\" or \"first\"",
         )),
     }
+}
+
+/// Parse `[openstack] route_by`: a non-empty list of `"uuid"` / `"name"`.
+///
+/// Duplicates are dropped (order preserved, so the log token is stable) and an
+/// unknown value names the field. Empty is an error rather than a silent
+/// "route nothing": an operator who writes the line wants *some* route.
+fn parse_route_by(values: &[String]) -> std::result::Result<Vec<RouteKind>, ConfigError> {
+    if values.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "openstack.route_by".into(),
+            reason: "must list at least one route: \"uuid\" and/or \"name\"".into(),
+        });
+    }
+    let mut out: Vec<RouteKind> = Vec::with_capacity(values.len());
+    for value in values {
+        let kind = match value.trim() {
+            "uuid" => RouteKind::Uuid,
+            "name" => RouteKind::Name,
+            other => {
+                return Err(enum_error(
+                    "openstack.route_by",
+                    other,
+                    "\"uuid\" or \"name\"",
+                ));
+            }
+        };
+        if !out.contains(&kind) {
+            out.push(kind);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2034,6 +2115,9 @@ mod tests {
         assert_eq!(os.address_family, AddressFamily::IPv4);
         assert_eq!(os.prefer, IpPrefer::Floating);
         assert_eq!(os.on_ambiguous, OnAmbiguous::Reject);
+        // Conservative default: only the UUID route, byte-for-byte the
+        // pre-name-routing behaviour (plan-openstack appendix A.1).
+        assert_eq!(os.route_by, vec![RouteKind::Uuid]);
         assert_eq!(os.ssh_port, 22);
         assert!(!os.fail_open);
         assert!(os.verify_tls);
@@ -2046,6 +2130,48 @@ mod tests {
         let cfg = GatewayConfig::parse(&toml).expect("both sections may coexist");
         assert!(cfg.control_plane.is_some(), "an unused CP is tolerated");
         assert!(cfg.openstack.is_some());
+    }
+
+    #[test]
+    fn route_by_parses_deduplicates_and_preserves_order() {
+        let toml = format!(
+            "{}\n            route_by = [\"name\", \"uuid\", \"name\"]\n",
+            openstack_pure_section()
+        );
+        let toml = format!("{}{}", base_without_control_plane(), toml);
+        let os = GatewayConfig::parse(&toml)
+            .expect("valid route_by")
+            .openstack
+            .expect("openstack");
+        assert_eq!(os.route_by, vec![RouteKind::Name, RouteKind::Uuid]);
+        // The log token for each kind is stable and lowercase.
+        assert_eq!(os.route_by[0].as_str(), "name");
+        assert_eq!(os.route_by[1].to_string(), "uuid");
+    }
+
+    #[test]
+    fn route_by_rejects_unknown_values_and_the_empty_list() {
+        let unknown = format!(
+            "{}\n            route_by = [\"uuid\", \"bogus\"]\n",
+            openstack_pure_section()
+        );
+        let unknown = format!("{}{}", base_without_control_plane(), unknown);
+        assert_eq!(invalid_field(&unknown), "openstack.route_by");
+
+        let empty = format!("{}\n            route_by = []\n", openstack_pure_section());
+        let empty = format!("{}{}", base_without_control_plane(), empty);
+        assert_eq!(invalid_field(&empty), "openstack.route_by");
+    }
+
+    #[test]
+    fn route_by_is_still_validated_while_the_feature_is_disabled() {
+        // A typo in a line the operator *did* write must fail the boot whether
+        // or not the feature is currently on — same rule as `routing`.
+        let toml = format!(
+            "{}\n            [openstack]\n            enabled = false\n            route_by = [\"nope\"]\n",
+            base_without_control_plane()
+        );
+        assert_eq!(invalid_field(&toml), "openstack.route_by");
     }
 
     #[test]
