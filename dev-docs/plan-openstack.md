@@ -605,3 +605,405 @@ recording = false
   只走 agent 穿透。
 - 若采纳方案 A，`ResolveResponse` 可新增可选 `route`/`openstack_instance` 字段；
   现有 serde 默认容忍未知字段（`src/types.rs:157-165`），向前兼容。
+
+---
+
+# 附录 A/B — Instance-Name 路由 + 解析鲁棒性（O6 / O7）
+
+> 状态：设计附录，可实施。基线 `c0eb19a`。三项 real-env 抓包教训直接驱动本附录：
+> v2 信封（`2963e76`）、application-credential scope（`9df7766`/`e68572e`）、
+> `image: ""` untagged 回退（`0f30b01`）。本附录**只做** `src/openstack/*` +
+> `src/config.rs` + `src/resolve/*` + harness/文档；**不改** Keystone 认证语义
+> （含 app-cred scope）、agent 拨号路径、`AuditRecord` 字段格式。
+
+## 附录 0 — 现状锚点（本附录引用的实现点）
+
+- `OpenStackClient::resolve_inner`（`src/openstack/mod.rs:502-611`）：
+  `is_instance_uuid` 守卫 → `get_server` → `select_address` → `map_backend_user`。
+- `OpenStackClient::get_server`（`src/openstack/mod.rs:361-452`）：`GET {nova}/servers/{uuid}`
+  + 401 单次刷新重试，解码用 `ServerResponse`。
+- `ServerResponse`/`NovaServer`/`NovaImage`/`image_or_none`/`candidates`/`select_address`
+  （`src/openstack/nova.rs:15-330`）。
+- 路由：`route_for`（`src/resolve/router.rs:39-64`）、`ResolveRouter::route/authorize`
+  （`src/resolve/router.rs:165-259`）、`ResolveRoute{ControlPlane,OpenStack,Reject}`。
+- 前腿门禁：`auth_publickey_offered` 只在 `route()==ControlPlane` 时联网
+  （`src/server/mod.rs:1249-1251`）。
+- 配置：`OpenStackConfig`（`src/config.rs:230-281`）、`RawOpenStack`（`src/config.rs:597-672`）、
+  `validate_openstack`（`src/config.rs:1189-1492`）、`parse_*`（`src/config.rs:1593-1678`）。
+- 观测量：`resolve_source` + `sshgw_openstack_resolve_{ok,err}_total`（O3）。
+- `Principal` 语法 `^[a-z0-9][a-z0-9_-]{0,62}$`（`src/types.rs:28-62`）——**名字路由的硬边界**（见 A.1）。
+
+---
+
+## A. Instance-Name 路由（O6）
+
+### A.1 路由谓词与配置
+
+**硬约束先说**：SSH 用户名在前腿已由 `Principal::parse` 收敛为
+`^[a-z0-9][a-z0-9_-]{0,62}$`（`src/types.rs:28-62`）。因此**可被路由的"实例名"
+只能是这个文法内的名字**（如真机 T_3741 的 `yunqing_dev` 合法；含大写/点/空格的
+名字在前腿就被 `InvalidPrincipal` 拒绝，根本到不了路由）。OpenSSH 客户端侧同样不
+接受空格用户名。结论：**"名字可含空格"不影响本网关**——名字一律经前腿文法过滤，
+Nova `?name=` 只用 URL 编码作为查询参数值（见 A.3）。不为此放宽 `Principal`。
+
+**新谓词**（`src/types.rs`，与 `is_instance_uuid` 并列）：
+```rust
+/// A guard for the name route: non-empty, ≤255 bytes (Nova's name limit),
+/// no ASCII control characters. It is *not* a grammar — the Principal grammar
+/// already ran — only a defence-in-depth bound before the string becomes a
+/// query parameter value.
+pub fn is_instance_name(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 255
+        && !raw.chars().any(char::is_control)
+}
+```
+注意：`is_instance_uuid` 优先。`route_by=["uuid","name"]` 时，UUID 形态的 principal
+永远走 show-by-id，绝不当名字（避免"名字恰好像 UUID"的歧义）。
+
+**配置**（`src/config.rs`）：
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind { Uuid, Name }
+```
+- `RawOpenStack` 增 `#[serde(default = "default_route_by")] route_by: Vec<String>`
+  （`default_route_by = ["uuid"]`）。
+- `OpenStackConfig` 增 `pub route_by: Vec<RouteKind>`（`Debug` 同步）。
+- 新 `parse_route_by(&[String]) -> Result<Vec<RouteKind>, ConfigError>`：
+  `"uuid"`/`"name"` 合法；未知值报 `openstack.route_by`；去重；空数组报错。
+- 组合校验：若 `route_by` 含 `Name`，其余约束不变（仍受 `enabled`/`routing`/
+  `authorization`/危险开关管辖）。
+- **默认保守**：默认 `["uuid"]` ⇒ 与现状**字节级不变**（红线 1）。要名字路由必须显式
+  `route_by = ["uuid", "name"]`。备选（默认两者皆可）被否：会改变 `enabled=true` 时
+  非 UUID 的行为，违反仓库"默认关/不回归"惯例；且 name 路由的枚举面更大，应显式开启。
+
+**接线**（`src/resolve/router.rs`）：
+- `route_for(principal, routing, openstack_enabled, route_by)` 增参：
+  - `routing=openstack_only`：`is_uuid && has(Uuid)` → `OpenStack`；
+    `is_name(principal) && has(Name) && !is_uuid` → `OpenStack`；否则 `Reject`。
+  - `routing=hybrid`（当前不可启用，仍实现）：非 UUID 且 `has(Name)` → `OpenStack`，
+    否则 `ControlPlane`。
+- `ResolveRouter` 增 `route_by: Vec<RouteKind>`；`route()` 透传。`ResolveRoute`
+  **不新增变体**（UUID 与 name 都归 `OpenStack`；具体走 show 还是 list 由
+  `OpenStackClient` 按形状决定，与今天的"defence-in-depth 形状守卫"一致）。
+- `GatewayContext::build_with_clients`（`src/server/mod.rs:434-565`）把
+  `os_cfg.route_by` 传给 `ResolveRouter::new`。
+- `auth_publickey_offered` 门禁**无需改动**：`route()` 覆盖两种 OpenStack 形态，
+  名字 principal 仍 `!= ControlPlane` ⇒ 不联网（MUST1 保持）。
+
+### A.2 按名字解析（Nova list）
+
+`src/openstack/nova.rs`：
+```rust
+/// `GET /v2.1/servers?name=<name>` body. Real clouds wrap in `{"servers":[…]}`;
+/// accept a bare array too. Elements are bare server documents (not enveloped).
+pub struct ServerList { pub servers: Vec<NovaServer> }
+
+/// Exact-match filter. Nova's `?name=` is a *substring/RE search*, so this MUST
+/// re-filter to equality; 0 → NotFound, >1 (names are not unique in OpenStack)
+/// → AmbiguousName. Never guess.
+pub enum NameLookupError { NotFound, AmbiguousName, Decode }
+pub fn exact_name_match(servers: Vec<NovaServer>, name: &str)
+    -> Result<NovaServer, NameLookupError>;
+```
+
+`src/openstack/mod.rs` — `OpenStackClient::find_server_by_name(token, name)`：
+- URL：`GET {nova_base}/servers`，查询用 **reqwest 编码**：
+  `.query(&[("name", name)])`（绝不手工拼 path/query；见 SA）。
+- 401 单次刷新重试语义与 `get_server` 相同——**把这段重试抽成共享助手**（见 A.4）。
+- 解码 `ServerList`（同样经 B 的宽容解码，见 B.3）。
+- `exact_name_match` → 0/多/唯一；多 → `reason=ambiguous_name` → `ControlError::NotFound`。
+- 拿到唯一 server 后，**复用** 现有 `select_address` + `map_backend_user` + policy 组装
+  （把 `resolve_inner` 尾部抽成 `fn build_response(&self, server) -> Result<ResolveResponse, ControlError>`，
+  uuid/name 两条路径共用）。
+
+**Nova `?name=` 语义核实方式**：官方 API-ref 记 `name` 为过滤参数；实现为**正则
+搜索**（`GET /servers?name=^foo$` 可用）。因此：真机验证两条——(1)
+`GET /servers?name=yunqing_dev` 的返回是否含子串命中；(2) 同名多实例是否都返回。
+无论哪种，网关**都在本地做全等过滤**并拒绝多命中，所以 Nova 语义是"搜索"还是
+"精确"都不改变网关行为，只影响网络返回量。
+
+### A.3 SSRF / 存在性
+
+- name **只**作为查询参数值经 reqwest 编码；架构上无法进入 host/path。仍加
+  `is_instance_name` 守卫（非空/≤255/无控制字符）作为纵深。
+- 单测断言：名字含 `&`/`=`/`/`/`..`/空格 时，请求路径恒为 `/servers`，注入串只
+  出现在 `name=` 的值里且被百分号编码（用 B 的 mock/`Request` 记录断言）。
+- 存在性预言机：name 的 0/多/唯一、404、不可达**一律**对客户端 `Auth::reject`（同构），
+  细节只进 `target=openstack` 日志（`reason=not_found|ambiguous_name|unparseable|...`）。
+  与 UUID 同等，不新增泄露面（保留既有 timing 残余）。
+
+### A.4 缓存 / 指标 / 日志
+
+- **缓存键不变**：`Resolver` 以 `(principal, fingerprint)` 为键（`src/resolve/*`）；
+  name 与 uuid 都以 principal 字符串为键，天然覆盖，无需改动。
+- **抽共享 Nova 请求助手**：`async fn nova_get(&self, path: &str, query: Option<&str>)
+  -> Result<Bytes, ControlError>`，内含 401 单次刷新 + `send()` 的连接重试；`get_server`
+  与 `find_server_by_name` 都调它，避免复制重试循环（也避免两处语义漂移）。
+- **日志**：在 `resolve_inner`/`get_server`/`find_server_by_name` 的
+  `target=openstack` 行加 `route_by = "uuid" | "name"`（与 `uuid`/`reason` 并列）。
+- **指标**：可选新增 `sshgw_openstack_resolve_by_uuid_total` /
+  `sshgw_openstack_resolve_by_name_total`（低基数），或复用现有 `ok/err` 不细分。
+  建议加，便于真机按名字路由的命中率观测。**审计格式不变**（`AuditRecord` 不加字段；
+  需要区分时看 `resolve_source="openstack"` + `target_host`）。
+- 后台拨号与 agent 流程**零改动**：`Target` 结构与 `policy.agent_forwarding=true` 不变。
+
+### A.5 真机衔接
+
+- T_3741 实例名 `yunqing_dev`（`src/openstack/nova.rs:991` 的真实抓包）可作
+  `ssh -A yunqing_dev@<gw>` 的真机验证目标；真机脚本记录在
+  `dev-docs/openstack-test-env.md`。
+
+---
+
+## B. 解析鲁棒性（O7，核心）
+
+### B.1 分层架构
+
+```
+GET /servers[/{id}]  →  reqwest  →  serde_json::Value
+        │
+        ├─(1) 形态判定：value.get("server") 存在？  → envelope | flat
+        │         （0f30b01 已改为按形状分派，保持；不再用 untagged 试错）
+        │
+        ├─(2) 字段级容错：decode_server() 逐字段独立提取，任一非关键字段
+        │         null/缺失/空串/类型漂移都不拖垮整个文档
+        │
+        ├─(3) 灰度回退：类型化提取失败或 addresses 结构可疑时，
+        │         用结构化宽松提取 walk 出 addresses（多形态/IPv6/type 缺失）
+        │
+        └─(4) 失败响亮：仍不可用 → reason="unparseable" + 结构摘要（非全文）
+```
+
+### B.2 字段级容错（逐字段梳理）
+
+`NovaServer` 关键字段 vs 非关键字段（`src/openstack/nova.rs:15-80`）：
+
+| 字段 | 角色 | 真实变体 | 处理 |
+|---|---|---|---|
+| `addresses` | **关键** | map / `null` / 缺失 / 非 map（串/数组）/ 空 map / 多网络 / IPv6 / entry 缺 `OS-EXT-IPS:type` | 宽松提取（B.3），产出 `usable` 标志；不可用→unparseable，空→no_address |
+| `name` | 关键 | 缺失 / `null` / 非串 | 缺失→`""`（仅用于 map 规则）；非串→宽容丢弃 |
+| `id` | 关键 | 缺失 | 缺失不影响拨号；仅日志 |
+| `image` | 非关键 | object / `null` / `""` / bare string / 数字 / 数组 | 已由 `image_or_none`（`nova.rs:46-57`）宽容；保持 |
+| `metadata` | 非关键 | `{}` / `null` / 值含非字符串（数字/布尔） | 宽松：null→空；标量→字符串化；非标量→丢弃 |
+| `accessIPv4`/`accessIPv6` | 非关键 | `""` / `null` / 数字 | 宽松：非串→None |
+| `flavor`/`links`/`security_groups`/... | 忽略 | 任意 | 不解析 |
+
+实现：**弃用运行时 `#[derive(Deserialize)]` 对 `NovaServer` 的整文档解码**，改为
+从 `serde_json::Value` 手写提取，逐字段独立、绝不因单字段失败而整体失败：
+
+```rust
+pub struct ServerView {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub addresses: BTreeMap<String, Vec<NovaAddress>>,
+    pub metadata: BTreeMap<String, String>,
+    pub image_id: Option<String>,
+    pub access_ips: Vec<IpAddr>,
+}
+
+pub struct DecodeOutcome {
+    pub view: ServerView,
+    /// 结构可疑（addresses 存在但不可解析）——调用方据此判 unparseable。
+    pub addresses_present_but_unusable: bool,
+    /// 非致命畸形，供 warn 日志（如 image 是串）。
+    pub notes: Vec<&'static str>,
+}
+
+pub enum DecodeError { NotAnObject, /* 极少见：根不是对象 */ }
+
+pub fn decode_server(value: &serde_json::Value) -> Result<DecodeOutcome, DecodeError>;
+```
+
+`decode_server` 内部：`value.get("server").unwrap_or(value)` 取有效对象；逐字段调
+`string_from_value` / `u8_from_value` / `metadata_from_value` / `image_id_from_value`
+/ `access_ips_from_value` / `addr_map_from_value`。每个助手对"意外的类型"返回默认值
+并记 `notes`，**不返回 Err**（仅根非对象才 Err）。`ServerResponse`（envelope/flat
+分派）保留为"形态判定"的单一入口，但委托 `decode_server` 完成字段提取。
+
+### B.3 灰度回退（lenient extraction）
+
+`addr_map_from_value`——按形状探测，兼容真实多形态：
+- `null` / 缺失 → `{}`，`present=false`。
+- 空 map `{}` → `{}`，`present=true`，`unusable=false`（合法无机地址 → no_address）。
+- map（正常 `{net: [ {addr,version,type}, … ]}`）：
+  - 每个 entry：优先对象取 `addr`/`version`/`OS-EXT-IPS:type`；**兼容** entry 是
+    `{"addr": …}` 无 type/version、或 entry 本身是裸字符串 IP（极端防御）。
+  - map 有 ≥1 entry 但解析后 0 个可用 IP → `present=true, unusable=true`（不静默清空）。
+- 非 map（串/数组/数字/布尔）→ `present=true, unusable=true`。
+- （可选）单对象形式 `{net: {addr:…}}` 当作单元素列表。
+- 地址字面量交给 `candidates` 现有的 `IpAddr::parse` 过滤（`nova.rs:223-248`），
+  **信字面量不信 `version` 字段**（IPv6 自动成立）。
+
+`resolve_inner` 决策：
+```
+decode_server → Err | addresses_present_but_unusable
+        → reason="unparseable"，ControlError::NotFound（同构）
+        → select_address 照常（genuinely empty → reason="no_address"）
+```
+
+### B.4 失败响亮（不泄 body）
+
+`src/openstack/nova.rs`：
+```rust
+/// A structural summary safe to log: top-level keys, whether a `server` key is
+/// present, the JSON type of `addresses`, the number of networks, byte length,
+/// and a short digest. Never the body (may carry tenant/secret-adjacent data).
+pub fn summarize_body(value: &serde_json::Value, raw_len: usize) -> String;
+```
+输出形如
+`keys=[id,name,addresses,image,...] has_server=true addresses=object networks=0 len=412 sha256=ab12cd34ef56`。
+`sha256` 用 `ring`（已有依赖）或 std 无 hash 时退化为 `raw_len` + 前若干 key；
+**不引新依赖**（如需 sha 用 `ring::digest`，russh 已带 `ring`）。
+调用点：`get_server`/`find_server_by_name` 解码失败的 `reason="decode"` 与地址不可用的
+`reason="unparseable"` 两条 warn，附 `summary`。**客户端恒同构拒绝**。
+
+### B.5 独立解码（架构级）
+
+- `addresses`/`name`/`metadata`/`image`/`accessIP*` **各自独立提取**，任一畸形不再
+  连坐（对 `0f30b01` 那类问题的架构级解决：不是再补一个特例字段，而是消除"一个字段
+  拖垮整个 decode"的可能）。
+- 关键字段 `addresses` 的"空"与"不可用"**显式区分**：空 → `no_address`（合法），
+  不可用（结构存在但提取不出）→ `unparseable`（响亮）。这是 2963e76/0f30b01 两个
+  "静默变空、误报 no_network"事故的直接对治。
+
+### B.6 真实 body 语料与回归夹具
+
+**组织方式**：新建 `tests/fixtures/openstack/servers/`，每个抓包一份**逐字 JSON**文件，
+测试用 `include_str!("../../tests/fixtures/openstack/servers/<f>.json")` 载入（编译期、
+无需运行时 IO），由一个**表驱动测试**遍历：
+```rust
+struct Fixture { name: &'static str, body: &'static str,
+                 expect: Expect,   // Resolve(ip) | NoAddress | Unparseable
+                 route_by: &'static [RouteKind] }
+const FIXTURES: &[Fixture] = &[ … ];
+```
+现有三个 inline const（`nova.rs:836` `REAL_ENVELOPE`、`:991` `REAL_ENVELOPE_T3741`、
+mock flat）迁入该目录；**逐字保留**（含 `image: ""`）。
+
+固化语料：
+- `d702cf44_envelope.json`（T_3746 信封）→ `Resolve(172.16.46.25)`。
+- `e52bce4c_envelope_image_empty.json`（T_3741 信封 + `image:""`）→
+  `Resolve(172.16.41.62)`，`image_id=None`。
+- `flat_variant.json`（v2.1 扁平）→ `Resolve`。
+- 新增变体：`addresses` 缺失 / `null` / 非 map（串）/ 空 map / 双网络 / IPv6 /
+  entry 缺 `type` / `metadata:null` / `metadata` 值非串 / `image` 裸串 / 根非对象。
+- 每个变体在 `Fixture.expect` 里写明**预期结果**，让"响亮 vs 静默"成为可回归的断言。
+
+### B.7 红线段（B）
+
+1. **不回归**：默认配置（`route_by=["uuid"]`, `enabled=false`）路径行为不变。
+2. **不掩盖上游故障**：`transport`/`5xx`/`401` 映射照旧（`mod.rs:410-449`）；宽松解析
+   只作用于 **200 的 body 形状**，绝不对网络错误做"重试/兜底"。
+3. **失败对客户端恒同构**：`unparseable`/`um` 全部 `ControlError::NotFound`。
+4. **`target.host` 只来自解析结果**；name 只作查询参数值；SSRF 面不放松。
+5. **日志不泄 body 全文**：只记 `summarize_body`。
+6. **无无限重试**：只保留既有"连接失败单次重试 + 401 单次刷新"。
+7. **不改** Keystone 认证（app-cred scope 行为）、agent 拨号、`AuditRecord` 格式。
+
+---
+
+## C. 测试方案（O6+O7）
+
+### C.1 单元（Rust）
+- **A**：`is_instance_name`（空/超长/控制字符/正常）；`parse_route_by`（合法/未知/重复/
+  空）；`route_for` 四象限（uuid×name × routing）× `route_by` 组合；`exact_name_match`
+  （0/1/多，含 Nova 子串命中被本地过滤掉）；`find_server_by_name` URL 编码注入用例
+  （名字含 `&`/`=`/`/`/`..`/空格 → path 恒 `/servers`）。
+- **B**：`decode_server` 字段矩阵（B.2 表）；`addr_map_from_value` 各形态；`summarize_body`
+  产出不含 body；`ServerList` 解码（信封数组 / 裸数组 / 元素含 `image:""`）。
+- 表驱动 fixtures（B.6）。
+
+### C.2 集成（黑盒，复用 agent/OpenStack 拓扑）
+- `scripts/mock_openstack.py`：`do_GET` 增 `GET /v2.1/servers?name=<name>` 分支——
+  `urllib.parse` 解析 query，返回 `{"servers":[…]}`；**按 Nova 语义做子串匹配**（便于
+  测"本地全等过滤"与"多命中"）；rules 支持多实例按名索引；非 UUID list 请求 404 归
+  既有行为。
+- `tests/integration/subtopo.sh`：增 `SUBTOP_OS_ROUTE_BY`（渲染 `route_by = [...]`），
+  rules 支持 `name` 字段（已支持）。
+- 新用例：
+  - `case_openstack_name_route` — `ssh -A <name>@gw` 命中 list → 会话成功；审计
+    `resolve_source=openstack`；日志 `route_by=name`。
+  - `case_openstack_name_ambiguous` — list 返回多个同名（含子串）→ 本地全等后仍 >1
+    → 拒绝，`reason=ambiguous_name`，无审计。
+  - `case_openstack_name_disabled` — `route_by=["uuid"]`（默认）下非 UUID 名字 →
+    `reason=unrouted`、0 Nova 请求（回归红线 1）。
+  - `case_openstack_envelope_variants` — mock 返回信封 + `image:""` 实例 → 会话成功
+    （把 2963e76/0f30b01 变成黑盒回归）。
+  - `case_openstack_unparseable_loud` — mock 返回 `addresses="not-a-map"` → 客户端同构
+    拒绝，网关日志 `reason=unparseable` + summary；不泄 body。
+- 回归：现有 38 case 全绿（默认 `route_by=["uuid"]` 且 mock list 分支不影响旧路径）。
+
+### C.3 真机
+- T_3741 `yunqing_dev`：`ssh -A yunqing_dev@<gw>` 端到端；记录到
+  `dev-docs/openstack-test-env.md`。
+
+---
+
+## D. DoD / 分层提交 / 工作量
+
+### D.1 分层提交（沿用 O 系列，@oracle 复审）
+- **O6**（Instance-Name 路由）
+  - **O6a**（纯新增，默认关）：`is_instance_name`、`RouteKind`、`route_by` 配置 +
+  校验、`route_for` 增参、`ResolveRouter` 透传、server 接线；单测。默认 `["uuid"]`，
+  零行为变化。
+  - **O6b**（安全审查点）：`ServerList`/`exact_name_match`、`find_server_by_name`、
+  共享 `nova_get` 401 助手、`build_response` 抽取；单测（含编码注入）。
+  - **O6c**：mock list 分支 + subtopo `route_by` + 4 个 name 用例 + 真机 T_3741。
+  - **O6d**：docs（config.example `route_by`、ops-runbook §5.8、known-limitations §9、
+  propose §3.1、plan 标注）。
+- **O7**（解析鲁棒性）
+  - **O7a**（安全/正确性审查点）：`decode_server`/`ServerView`/字段助手 + 独立解码。
+  - **O7b**：`addr_map_from_value` 灰度回退 + `unparseable` 响亮 + `summarize_body`。
+  - **O7c**：fixtures 目录 + 表驱动测试（三个真机抓包迁入 + 新增变体）。
+  - **O7d**：mock 变体 + `case_openstack_envelope_variants` / `case_openstack_unparseable_loud` + docs。
+- **红线 12（复审门禁）**：O6a/O6b 与 O7a/O7b 的 diff 合并前必须经 @oracle 复审
+  （安全面：SSRF/编码/歧义/同构失败；正确性面：独立解码/响亮失败）。
+
+### D.2 DoD
+- O6+O7 落地；C.1 单测全绿；C.2 新用例 + 现有 38 case 全绿；`fmt`/`clippy -D warnings`/
+  `test`/`build --release`/`run_integration.sh` 全绿；`enabled=false` 与默认
+  `route_by=["uuid"]` 行为不变；真机 T_3741 name 路由通过；docs 更新；O6a/b、O7a/b
+  经 @oracle 复审。
+
+### D.3 本次**不改**
+- Keystone 认证（app-cred scope 行为，`9df7766`）；agent 拨号与签名面；
+  `AuditRecord` 字段格式（仅加日志字段/可选指标）；`direct-tcpip`/policy 语义。
+
+### D.4 工作量
+| 阶段 | 内容 | 估时 |
+|---|---|---|
+| O6a | 谓词/配置/路由接线 + 单测 | 0.5–1 天 |
+| O6b | name list 解码 + 共享 Nova 助手 + 单测 | 1–1.5 天 |
+| O6c | mock/subtopo + 4 用例 + 真机 | 1–1.5 天 |
+| O6d | docs | 0.5 天 |
+| O7a/b | decode_server + 灰度回退 + 响亮失败 + 单测 | 1.5–2 天 |
+| O7c/d | fixtures + 变体用例 + docs | 1–1.5 天 |
+| **合计** | | **~5.5–8 人日 + 复审** |
+
+### D.5 风险
+| # | 风险 | 严重度 | 缓解 |
+|---|---|---|---|
+| R11 | name 路由扩大枚举面 | 中 | 默认关（`route_by=["uuid"]`）、同构失败、负缓存、`max_auth_attempts` |
+| R12 | 同名多实例误连 | 高 | 本地全等过滤 + >1 → `ambiguous_name` 拒绝，绝不猜 |
+| R13 | 宽松解析掩盖真故障 | 中 | 只对 200 body；关键字段显式 `usable`；`unparseable` 响亮；红线段 B.7 |
+| R14 | 编码注入 | 高 | reqwest `.query()` + `is_instance_name` 守卫 + 注入单测 |
+| R15 | 日志泄 body | 中 | 只记 `summarize_body` |
+| R16 | fixtures 与实现漂移 | 低 | 逐字抓包 + 表驱动 expect 断言 |
+
+---
+
+## E. 给 fixer 的分层实施清单
+
+1. **O6a** `types.rs:is_instance_name` + `config.rs:RouteKind/route_by/parse_route_by/校验/Debug`
+   + `router.rs:route_for(+route_by)/ResolveRouter` + `server/mod.rs` 传参；单测。
+2. **O6b** `nova.rs:ServerList/exact_name_match` + `mod.rs:find_server_by_name/nova_get/
+   build_response`；单测（含编码注入、多命中）。
+3. **O6c** `mock_openstack.py` list 分支 + `subtopo.sh:SUBTOP_OS_ROUTE_BY` +
+   `case_openstack_name_{route,ambiguous,disabled}` + 真机 T_3741。
+4. **O6d** docs（config.example / ops-runbook §5.8 / known-limitations §9 / propose §3.1 / 本文件标注）。
+5. **O7a** `nova.rs:ServerView/DecodeOutcome/decode_server` + 字段助手 + `ServerResponse` 委托；单测字段矩阵。
+6. **O7b** `addr_map_from_value` 灰度回退 + `unparseable` + `summarize_body`；单测。
+7. **O7c** `tests/fixtures/openstack/servers/*`（迁入 3 抓包 + 新变体）+ 表驱动测试。
+8. **O7d** mock 变体 + `case_openstack_envelope_variants` / `case_openstack_unparseable_loud` + docs。
+9. **提交前门禁**：`fmt`/`clippy`/`test`/`release`/`run_integration.sh`；O6a/O6b/O7a/O7b 经 @oracle 复审。
