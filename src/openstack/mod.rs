@@ -229,7 +229,9 @@ impl OpenStackClient {
                 expires_at: None,
                 nova_base: self.cfg.nova_endpoint.trim_end_matches('/').to_owned(),
             }),
-            OpenStackAuthMethod::ApplicationCredential => {
+            // Both of these mint a token at Keystone and cache it: the only
+            // difference is the request body (appendix C.2.3).
+            OpenStackAuthMethod::ApplicationCredential | OpenStackAuthMethod::Password => {
                 if let Some(cached) = self.cached_valid() {
                     return Ok(cached);
                 }
@@ -303,7 +305,11 @@ impl OpenStackClient {
                     target: "openstack",
                     reason = "forbidden",
                     status = resp.status().as_u16(),
-                    "Keystone refused the application credential"
+                    // The wording follows the method so a password-mode 403
+                    // does not read as an application-credential problem.
+                    // The credential itself is never logged.
+                    method = %self.credential_label(),
+                    "Keystone refused the credential"
                 );
                 Err(ControlError::Forbidden)
             }
@@ -329,7 +335,16 @@ impl OpenStackClient {
         }
     }
 
-    /// The `POST {auth_url}/auth/tokens` body — application credentials only.
+    /// A short, loggable name for whichever credential this config uses.
+    fn credential_label(&self) -> &'static str {
+        match self.cfg.auth_method {
+            OpenStackAuthMethod::ApplicationCredential => "application_credential",
+            OpenStackAuthMethod::Token => "token",
+            OpenStackAuthMethod::Password => "password",
+        }
+    }
+
+    /// The `POST {auth_url}/auth/tokens` body — whatever mints a token.
     ///
     /// `auth_method = "token"` never reaches here: [`Self::acquire`] returns the
     /// static token without contacting Keystone at all (and config validation
@@ -337,24 +352,66 @@ impl OpenStackClient {
     /// catalog to consult). The dead `token` arm was removed rather than left
     /// as a trap for whoever next edits this.
     fn auth_body(&self) -> serde_json::Value {
-        debug_assert_eq!(
-            self.cfg.auth_method,
-            OpenStackAuthMethod::ApplicationCredential
-        );
-        let identity = serde_json::json!({
-            "methods": ["application_credential"],
-            "application_credential": {
-                "id": self.cfg.application_credential_id,
-                "secret": self.cfg.application_credential_secret,
+        match self.cfg.auth_method {
+            OpenStackAuthMethod::Token => {
+                debug_assert!(false, "a static token never contacts Keystone");
+                serde_json::Value::Null
             }
-        });
-        // No `scope` is sent: an application credential is already scoped to
-        // the project it was created in — that scope *is* the blast radius,
-        // fixed at credential creation, so a request-time scope adds nothing.
-        // Keystone also *rejects* an explicit scope on this method with a 401
-        // ("Application credentials cannot request a scope" — observed on the
-        // real Keystone v3.14; the in-repo mock never enforced the rule).
-        serde_json::json!({ "auth": { "identity": identity } })
+            OpenStackAuthMethod::ApplicationCredential => {
+                let identity = serde_json::json!({
+                    "methods": ["application_credential"],
+                    "application_credential": {
+                        "id": self.cfg.application_credential_id,
+                        "secret": self.cfg.application_credential_secret,
+                    }
+                });
+                // No `scope` is sent: an application credential is already scoped to
+                // the project it was created in — that scope *is* the blast radius,
+                // fixed at credential creation, so a request-time scope adds nothing.
+                // Keystone also *rejects* an explicit scope on this method with a 401
+                // ("Application credentials cannot request a scope" — observed on the
+                // real Keystone v3.14; the in-repo mock never enforced the rule).
+                serde_json::json!({ "auth": { "identity": identity } })
+            }
+            OpenStackAuthMethod::Password => {
+                // Password auth *needs* the scope in the request: the token is
+                // minted for one project's roles, and on this platform a
+                // domain- or system-scoped request is refused with a 401
+                // (measured; appendix C.0). The project is therefore a real
+                // input, not a hint.
+                let user_domain = if self.cfg.user_domain_name.is_empty() {
+                    "Default"
+                } else {
+                    self.cfg.user_domain_name.as_str()
+                };
+                let identity = serde_json::json!({
+                    "methods": ["password"],
+                    "password": {
+                        "user": {
+                            "name": self.cfg.username,
+                            "domain": { "name": user_domain },
+                            "password": self.cfg.password,
+                        }
+                    }
+                });
+                let scope = if !self.cfg.project_id.is_empty() {
+                    serde_json::json!({ "project": { "id": self.cfg.project_id } })
+                } else {
+                    let project_domain = if self.cfg.project_domain_name.is_empty() {
+                        "Default"
+                    } else {
+                        self.cfg.project_domain_name.as_str()
+                    };
+                    serde_json::json!({
+                        "project": {
+                            "name": self.cfg.project_name,
+                            "domain": { "name": project_domain },
+                        }
+                    })
+                };
+                serde_json::json!({ "auth": { "identity": identity, "scope": scope } })
+            }
+        }
     }
 
     // --- Nova --------------------------------------------------------------
@@ -1252,6 +1309,113 @@ mod tests {
             client_ip: "198.51.100.9".to_owned(),
             key_fp: "SHA256:fp".to_owned(),
         }
+    }
+
+    /// The password-mode section, with endpoints pointed at a dummy host.
+    ///
+    /// `scope` is spelled out because the coupling is a hard rule (appendix
+    /// C.1): password auth exists only for the cross-project lab mode.
+    fn password_section(extra: &str) -> String {
+        format!(
+            "{}\nscope = \"cross_project\"\n{}",
+            urls("http://127.0.0.1:8774"),
+            extra
+        )
+    }
+
+    /// The Keystone request bodies the gateway can send, by method.
+    #[test]
+    fn the_password_auth_body_carries_the_identity_and_a_project_scope() {
+        let os = os_config(&password_section(
+            r#"
+            auth_method = "password"
+            username = "ops-admin"
+            password = "hunter2"
+            project_id = "proj-1"
+            "#,
+        ));
+        assert_eq!(os.auth_method, OpenStackAuthMethod::Password);
+        assert_eq!(os.scope, crate::config::OpenStackScope::CrossProject);
+        assert_eq!(os.username, "ops-admin");
+        assert_eq!(os.password, "hunter2");
+
+        let client = OpenStackClient::new(os).expect("client");
+        let body = client.auth_body();
+        let auth = &body["auth"];
+        assert_eq!(auth["identity"]["methods"], serde_json::json!(["password"]));
+        assert_eq!(auth["identity"]["password"]["user"]["name"], "ops-admin");
+        assert_eq!(
+            auth["identity"]["password"]["user"]["domain"]["name"], "Default",
+            "an empty user_domain_name falls back to Keystone's default"
+        );
+        assert_eq!(auth["identity"]["password"]["user"]["password"], "hunter2");
+        // The id form of the scope wins when both are present.
+        assert_eq!(auth["scope"]["project"]["id"], "proj-1");
+        assert!(
+            auth["scope"]["project"].get("name").is_none(),
+            "an id-scoped request must not also carry a name"
+        );
+    }
+
+    #[test]
+    fn the_password_scope_falls_back_to_the_project_name_form() {
+        let os = os_config(&password_section(
+            r#"
+            auth_method = "password"
+            username = "ops-admin"
+            password = "hunter2"
+            project_name = "ops"
+            project_domain_name = "lab"
+            user_domain_name = "staff"
+            "#,
+        ));
+        let client = OpenStackClient::new(os).expect("client");
+        let body = client.auth_body();
+        let auth = &body["auth"];
+        assert_eq!(
+            auth["scope"]["project"]["name"], "ops",
+            "no project_id means the name form is the scope"
+        );
+        assert_eq!(auth["scope"]["project"]["domain"]["name"], "lab");
+        assert_eq!(
+            auth["identity"]["password"]["user"]["domain"]["name"],
+            "staff"
+        );
+    }
+
+    #[test]
+    fn the_application_credential_body_still_sends_no_scope() {
+        // Keystone rejects an explicit scope on this method (401, measured on
+        // v3.14), and the credential is already project-scoped by construction.
+        let client =
+            OpenStackClient::new(os_config(&urls("http://127.0.0.1:8774"))).expect("client");
+        let body = client.auth_body();
+        assert_eq!(
+            body["auth"]["identity"]["methods"],
+            serde_json::json!(["application_credential"])
+        );
+        assert!(
+            body["auth"].get("scope").is_none(),
+            "an application credential must not request a scope: {body}"
+        );
+    }
+
+    #[test]
+    fn the_password_never_reaches_the_log() {
+        let os = os_config(&password_section(
+            r#"
+            auth_method = "password"
+            username = "ops-admin"
+            password = "hunter2"
+            project_id = "proj-1"
+            "#,
+        ));
+        let rendered = format!("{os:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the password must be redacted: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
     }
 
     /// A mock that issues tokens and serves one instance with a single address.

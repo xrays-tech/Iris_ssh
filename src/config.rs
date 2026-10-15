@@ -191,6 +191,42 @@ impl std::fmt::Display for RouteKind {
     }
 }
 
+/// Which Nova visibility the token gets (plan-openstack appendix C.1).
+///
+/// Configured as `[openstack] scope`; the default is `single_project`, which is
+/// byte-for-byte the behaviour that existed before this knob. It is a separate
+/// switch rather than a side effect of `auth_method` so it can be audited,
+/// validated and warned about on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenStackScope {
+    /// Nova sees only the instances of the token's own project. The default,
+    /// and the only mode in which `auth_method = "application_credential"` or
+    /// `"token"` is accepted.
+    #[default]
+    SingleProject,
+    /// **Lab mode**: ask Nova for every tenant the token's roles allow
+    /// (`all_tenants=1`), so an instance can be reached by id or name without
+    /// naming its project. Requires `auth_method = "password"` (an application
+    /// credential is project-fixed, and a static token expires).
+    CrossProject,
+}
+
+impl OpenStackScope {
+    /// The stable token used in `[openstack] scope` and in log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpenStackScope::SingleProject => "single_project",
+            OpenStackScope::CrossProject => "cross_project",
+        }
+    }
+}
+
+impl std::fmt::Display for OpenStackScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Keystone v3 authentication method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenStackAuthMethod {
@@ -198,6 +234,10 @@ pub enum OpenStackAuthMethod {
     ApplicationCredential,
     /// Escape hatch for tests / short-lived tooling: a pre-issued `X-Auth-Token`.
     Token,
+    /// Username + password, exchanged for a project-scoped token. Accepted only
+    /// with `scope = "cross_project"` (plan-openstack appendix C.2): it is the
+    /// one way to get a token whose roles span more than one project.
+    Password,
 }
 
 /// Which endpoint interface to pick from the service catalog.
@@ -267,6 +307,9 @@ pub struct OpenStackConfig {
     /// Which principal shapes this route accepts. Default `["uuid"]`; adding
     /// `"name"` opts in to instance-name routing (plan-openstack appendix A.1).
     pub route_by: Vec<RouteKind>,
+    /// Nova visibility: the token's own project (default) or every tenant the
+    /// token's roles allow (plan-openstack appendix C.1).
+    pub scope: OpenStackScope,
 
     // --- Keystone v3 -----------------------------------------------------
     pub auth_url: String,
@@ -278,8 +321,23 @@ pub struct OpenStackConfig {
     /// Resolved the same way from `token_file` → `token` →
     /// `$SSHGW_OPENSTACK_TOKEN`; only used with `auth_method = "token"`.
     pub token: String,
-    /// Token scope. Strongly recommended: it is the blast-radius gate on which
-    /// instances this gateway can see at all (plan-openstack §3.2 / R5).
+    /// Only used with `auth_method = "password"`; resolved from
+    /// `password_file` → `password` → `$SSHGW_OPENSTACK_PASSWORD`.
+    pub password: String,
+    /// Only used with `auth_method = "password"`.
+    pub username: String,
+    /// Domain of the password user. Empty falls back to `"Default"` at
+    /// auth-body time (Keystone's own default).
+    pub user_domain_name: String,
+    /// Project *name* form of the auth scope; used when `project_id` is empty.
+    pub project_name: String,
+    /// Domain of `project_name`. Empty falls back to `"Default"`.
+    pub project_domain_name: String,
+    /// Auth scope: the project whose roles grant the token. Under
+    /// `scope = "single_project"` it is also the visibility boundary; under
+    /// `scope = "cross_project"` it is only where the roles come from, and
+    /// Nova visibility is decided by `all_tenants` + the platform's Nova
+    /// policy (appendix C.1).
     pub project_id: String,
     pub region: String,
     pub interface: EndpointInterface,
@@ -324,11 +382,17 @@ impl std::fmt::Debug for OpenStackConfig {
                 &self.allow_any_authenticated_key,
             )
             .field("route_by", &self.route_by)
+            .field("scope", &self.scope)
             .field("auth_url", &self.auth_url)
             .field("auth_method", &self.auth_method)
             .field("application_credential_id", &self.application_credential_id)
             .field("application_credential_secret", &"<redacted>")
             .field("token", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("username", &self.username)
+            .field("user_domain_name", &self.user_domain_name)
+            .field("project_name", &self.project_name)
+            .field("project_domain_name", &self.project_domain_name)
             .field("project_id", &self.project_id)
             .field("region", &self.region)
             .field("interface", &self.interface)
@@ -639,6 +703,8 @@ struct RawOpenStack {
     allow_any_authenticated_key: bool,
     #[serde(default = "default_route_by")]
     route_by: Vec<String>,
+    #[serde(default = "default_scope")]
+    scope: String,
 
     // Keystone
     #[serde(default)]
@@ -655,6 +721,18 @@ struct RawOpenStack {
     token: String,
     #[serde(default)]
     token_file: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    password_file: String,
+    #[serde(default)]
+    user_domain_name: String,
+    #[serde(default)]
+    project_name: String,
+    #[serde(default)]
+    project_domain_name: String,
     #[serde(default)]
     project_id: String,
     #[serde(default)]
@@ -722,6 +800,11 @@ fn default_route_by() -> Vec<String> {
     // Conservative: only the UUID route exists unless an operator names the
     // name route explicitly (plan-openstack appendix A.1).
     vec!["uuid".to_owned()]
+}
+fn default_scope() -> String {
+    // Conservative: the token's own project, which is everything that existed
+    // before this knob (plan-openstack appendix C.1).
+    "single_project".to_owned()
 }
 fn default_auth_method() -> String {
     "application_credential".to_owned()
@@ -1241,6 +1324,7 @@ fn validate_openstack(
     // enums above: a typo in a line the operator did write must fail the boot
     // rather than lie in wait until the feature is switched on.
     let route_by = parse_route_by(&raw.route_by)?;
+    let scope = parse_scope(&raw.scope)?;
 
     // `enabled = false` short-circuits everything below: the section is then
     // inert, so a leftover `routing`/`authorization` line can never stand in
@@ -1350,6 +1434,67 @@ fn validate_openstack(
         &raw.token,
         std::env::var("SSHGW_OPENSTACK_TOKEN").ok().as_deref(),
     )?;
+    let password = resolve_secret(
+        "openstack.password_file",
+        &raw.password_file,
+        &raw.password,
+        std::env::var("SSHGW_OPENSTACK_PASSWORD").ok().as_deref(),
+    )?;
+    // --- scope / auth_method coupling (plan-openstack appendix C.1) --------
+    // Checked *before* the per-method requirements: a config that contradicts
+    // itself should be told the contradiction, not whichever field happens to
+    // be validated first. `cross_project` exists to widen Nova's visibility
+    // past one project, and on this platform that is only reachable with a
+    // *project-scoped admin token*: an application credential is locked to the
+    // project it was created in, and a static token expires (unsuitable for a
+    // long-lived config).
+    match (scope, auth_method) {
+        (OpenStackScope::CrossProject, OpenStackAuthMethod::ApplicationCredential) => {
+            return Err(ConfigError::Invalid {
+                field: "openstack.auth_method".into(),
+                reason: "cross_project needs auth_method = \"password\": application \
+                         credentials are project-fixed at creation time, so they cannot \
+                         see instances outside their own project (plan-openstack appendix C)"
+                    .into(),
+            });
+        }
+        (OpenStackScope::CrossProject, OpenStackAuthMethod::Token) => {
+            return Err(ConfigError::Invalid {
+                field: "openstack.auth_method".into(),
+                reason: "cross_project needs auth_method = \"password\": a static token \
+                         expires, so it cannot back a long-lived config, and this is a \
+                         standing gateway, not a one-shot tool"
+                    .into(),
+            });
+        }
+        (OpenStackScope::SingleProject, OpenStackAuthMethod::Password) => {
+            // Deliberately refused (appendix C.8 decision ①): password auth is
+            // the *cross-project* mechanism, and keeping it out of the default
+            // mode keeps the safer app-credential/token pair as the only
+            // options for the common case.
+            return Err(ConfigError::Invalid {
+                field: "openstack.auth_method".into(),
+                reason: "auth_method = \"password\" requires scope = \"cross_project\": \
+                         single_project uses application credentials or a static token, \
+                         which are both safer (no password on disk, smaller blast radius)"
+                    .into(),
+            });
+        }
+        _ => {}
+    }
+    if scope == OpenStackScope::CrossProject {
+        // Loud by design (appendix C.4 red line 2): this mode widens Nova's
+        // visibility to whatever the token's roles allow, which on a permissive
+        // cloud means *every* project.
+        tracing::warn!(
+            target: "openstack",
+            reason = "cross_project_lab_mode",
+            project_id = %raw.project_id.trim(),
+            "scope = \"cross_project\": this is a LAB mode — Nova is asked for \
+             all_tenants, so the gateway can see (and dial) instances in every \
+             project the credential's roles allow. Do not enable on a public cloud."
+        );
+    }
     match auth_method {
         OpenStackAuthMethod::ApplicationCredential => {
             if application_credential_id.is_empty() {
@@ -1386,6 +1531,36 @@ fn validate_openstack(
                     reason: "required when auth_method = \"token\": set the literal value, \
                              openstack.token_file, or the SSHGW_OPENSTACK_TOKEN environment \
                              variable"
+                        .into(),
+                });
+            }
+        }
+        OpenStackAuthMethod::Password => {
+            if raw.username.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "openstack.username".into(),
+                    reason: "must not be empty when auth_method = \"password\"".into(),
+                });
+            }
+            // The password may legitimately be empty (a lab account with no
+            // password is a real thing), so it is a WARN, not a hard error —
+            // but say so loudly, because a typo'd env var looks identical.
+            if password.is_empty() {
+                tracing::warn!(
+                    target: "openstack",
+                    reason = "empty_password",
+                    "auth_method = \"password\" with an empty password: check \
+                     SSHGW_OPENSTACK_PASSWORD / openstack.password_file"
+                );
+            }
+            // The scope needs *some* project: an id is the most precise form,
+            // but a name works too (Keystone resolves it inside the domain).
+            if raw.project_id.trim().is_empty() && raw.project_name.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "openstack.project_id".into(),
+                    reason: "required when auth_method = \"password\": set project_id (or \
+                             project_name + project_domain_name) to the project whose roles \
+                             should scope the token"
                         .into(),
                 });
             }
@@ -1491,11 +1666,17 @@ fn validate_openstack(
         authorization,
         allow_any_authenticated_key: raw.allow_any_authenticated_key,
         route_by,
+        scope,
         auth_url,
         auth_method,
         application_credential_id,
         application_credential_secret,
         token,
+        password,
+        username: raw.username.trim().to_owned(),
+        user_domain_name: raw.user_domain_name.trim().to_owned(),
+        project_name: raw.project_name.trim().to_owned(),
+        project_domain_name: raw.project_domain_name.trim().to_owned(),
         project_id: raw.project_id.trim().to_owned(),
         region: raw.region.trim().to_owned(),
         interface,
@@ -1645,10 +1826,23 @@ fn parse_auth_method(value: &str) -> std::result::Result<OpenStackAuthMethod, Co
     match value.trim() {
         "application_credential" => Ok(OpenStackAuthMethod::ApplicationCredential),
         "token" => Ok(OpenStackAuthMethod::Token),
+        "password" => Ok(OpenStackAuthMethod::Password),
         other => Err(enum_error(
             "openstack.auth_method",
             other,
-            "\"application_credential\" or \"token\"",
+            "\"application_credential\", \"token\" or \"password\"",
+        )),
+    }
+}
+
+fn parse_scope(value: &str) -> std::result::Result<OpenStackScope, ConfigError> {
+    match value.trim() {
+        "single_project" => Ok(OpenStackScope::SingleProject),
+        "cross_project" => Ok(OpenStackScope::CrossProject),
+        other => Err(enum_error(
+            "openstack.scope",
+            other,
+            "\"single_project\" or \"cross_project\"",
         )),
     }
 }
@@ -2174,6 +2368,143 @@ mod tests {
         assert_eq!(invalid_field(&toml), "openstack.route_by");
     }
 
+    /// A cross-project section: password auth, an explicit project scope, and
+    /// the danger flag that pure mode already demands.
+    fn cross_project_section() -> String {
+        format!(
+            "{}{}\n            scope = \"cross_project\"\n            auth_method = \"password\"\n            username = \"admin-user\"\n            password = \"s3cr3t\"\n            project_id = \"proj-1\"\n",
+            base_without_control_plane(),
+            openstack_pure_section()
+        )
+    }
+
+    #[test]
+    fn scope_defaults_to_single_project_and_parses_both_values() {
+        let toml = format!(
+            "{}{}",
+            base_without_control_plane(),
+            openstack_pure_section()
+        );
+        let os = GatewayConfig::parse(&toml)
+            .expect("valid config")
+            .openstack
+            .expect("openstack configured");
+        assert_eq!(os.scope, OpenStackScope::SingleProject);
+        assert_eq!(os.scope.as_str(), "single_project");
+        assert_eq!(os.scope.to_string(), "single_project");
+
+        let toml = cross_project_section();
+        let os = GatewayConfig::parse(&toml)
+            .expect("valid cross_project config")
+            .openstack
+            .expect("openstack configured");
+        assert_eq!(os.scope, OpenStackScope::CrossProject);
+        assert_eq!(os.scope.as_str(), "cross_project");
+    }
+
+    #[test]
+    fn scope_rejects_unknown_values_and_is_checked_while_disabled() {
+        let toml = format!(
+            "{}\n            scope = \"everywhere\"\n",
+            openstack_pure_section()
+        );
+        let toml = format!("{}{}", base_without_control_plane(), toml);
+        assert_eq!(invalid_field(&toml), "openstack.scope");
+
+        // Same rule as `route_by`: a typo fails the boot even when the
+        // section is switched off, so it cannot lie in wait.
+        let toml = format!(
+            "{}\n            [openstack]\n            enabled = false\n            scope = \"everywhere\"\n",
+            base_without_control_plane()
+        );
+        assert_eq!(invalid_field(&toml), "openstack.scope");
+    }
+
+    #[test]
+    fn cross_project_requires_password_auth() {
+        // An application credential is project-fixed; a static token expires.
+        // Both are refused at boot rather than 403-ing on the first login.
+        let appcred = cross_project_section().replace(
+            "auth_method = \"password\"",
+            "auth_method = \"application_credential\"",
+        );
+        let appcred = appcred.replace(
+            "username = \"admin-user\"\n            password = \"s3cr3t\"\n",
+            "",
+        );
+        assert_eq!(invalid_field(&appcred), "openstack.auth_method");
+
+        let token = cross_project_section()
+            .replace("auth_method = \"password\"", "auth_method = \"token\"")
+            .replace(
+                "username = \"admin-user\"\n            password = \"s3cr3t\"\n",
+                "",
+            );
+        assert_eq!(invalid_field(&token), "openstack.auth_method");
+    }
+
+    #[test]
+    fn password_auth_is_refused_outside_cross_project() {
+        // Appendix C.8 decision ①: password is the cross-project mechanism and
+        // stays out of the default mode, so single_project keeps its two
+        // safer options.
+        let toml = openstack_pure_section()
+            .replace(
+                "application_credential_id = \"appcred-id\"\n            application_credential_secret = \"s3cr3t\"\n",
+                "auth_method = \"password\"\n            username = \"u\"\n            password = \"p\"\n            project_id = \"proj-1\"\n",
+            );
+        let toml = format!("{}{}", base_without_control_plane(), toml);
+        assert_eq!(invalid_field(&toml), "openstack.auth_method");
+    }
+
+    #[test]
+    fn password_auth_needs_a_username_and_a_project_scope() {
+        let no_user = cross_project_section().replace("username = \"admin-user\"\n", "");
+        assert_eq!(invalid_field(&no_user), "openstack.username");
+
+        // Neither an id nor a name form: nothing to scope the token to.
+        let no_project = cross_project_section().replace("project_id = \"proj-1\"\n", "");
+        assert_eq!(invalid_field(&no_project), "openstack.project_id");
+
+        // The name form is a valid scope on its own.
+        let by_name = cross_project_section().replace(
+            "project_id = \"proj-1\"\n",
+            "project_name = \"ops\"\n            project_domain_name = \"Default\"\n",
+        );
+        GatewayConfig::parse(&by_name).expect("project_name is a valid scope");
+    }
+
+    #[test]
+    fn the_password_is_redacted_and_injectable_from_the_environment() {
+        let toml = cross_project_section();
+        let os = GatewayConfig::parse(&toml)
+            .expect("valid config")
+            .openstack
+            .expect("openstack configured");
+        assert_eq!(os.password, "s3cr3t");
+        let rendered = format!("{os:?}");
+        assert!(
+            !rendered.contains("s3cr3t"),
+            "the password must be redacted from Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+
+        // env injection (the usual no-secret-in-the-file path)
+        let toml = cross_project_section().replace("password = \"s3cr3t\"\n", "");
+        let prev = std::env::var("SSHGW_OPENSTACK_PASSWORD").ok();
+        // SAFETY: the test restores the value (or clears it) before returning.
+        unsafe { std::env::set_var("SSHGW_OPENSTACK_PASSWORD", "from-env") };
+        let os = GatewayConfig::parse(&toml)
+            .expect("env-injected password parses")
+            .openstack
+            .expect("openstack configured");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("SSHGW_OPENSTACK_PASSWORD", v) },
+            None => unsafe { std::env::remove_var("SSHGW_OPENSTACK_PASSWORD") },
+        }
+        assert_eq!(os.password, "from-env");
+    }
+
     #[test]
     fn non_pure_modes_still_require_a_control_plane() {
         // Section present but disabled: no route exists, so the control plane
@@ -2349,7 +2680,8 @@ mod tests {
             ),
             (
                 "auth_url = \"https://keystone.example.internal:5000/v3\"",
-                "auth_url = \"https://keystone.example.internal:5000/v3\"\n            auth_method = \"password\"",
+                // "password" is a real method (appendix C.2); use an unknown one.
+                "auth_url = \"https://keystone.example.internal:5000/v3\"\n            auth_method = \"bogus\"",
                 "openstack.auth_method",
             ),
             (
