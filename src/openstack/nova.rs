@@ -168,6 +168,78 @@ impl ServerResponse {
     }
 }
 
+/// The body of `GET /v2.1/servers?name=…` (plan-openstack appendix A.2).
+///
+/// The documented shape is `{"servers":[ … ]}`; some API-compat layers answer
+/// with a bare array instead. Elements are *bare* server documents — never
+/// enveloped — so each one is decoded by the same rules as a single-server
+/// body. A 200 whose body is neither shape is a decode failure, never an
+/// empty list: "zero instances" and "a body we could not read" must not look
+/// the same to the caller.
+pub struct ServerList {
+    pub servers: Vec<NovaServer>,
+}
+
+impl<'de> Deserialize<'de> for ServerList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let array = value.get("servers").unwrap_or(&value);
+        let servers = Vec::<NovaServer>::deserialize(array).map_err(serde::de::Error::custom)?;
+        Ok(ServerList { servers })
+    }
+}
+
+/// Why a `?name=` lookup did not yield exactly one instance
+/// (plan-openstack appendix A.2 / R12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameLookupError {
+    /// No server's name equalled the principal.
+    NotFound,
+    /// More than one server carries that exact name. Nova's filter is a
+    /// substring/RE search and instance names are *not* unique, so proceeding
+    /// would mean guessing which machine to dial.
+    AmbiguousName,
+}
+
+impl NameLookupError {
+    /// Stable reason token for logs (never shown to the client).
+    pub fn reason(self) -> &'static str {
+        match self {
+            NameLookupError::NotFound => "not_found",
+            NameLookupError::AmbiguousName => "ambiguous_name",
+        }
+    }
+}
+
+/// Exact-match filter over a `?name=` result.
+///
+/// Nova implements `name` as a *substring / regular-expression* search, so the
+/// list it returns for `yunqing_dev` can contain `yunqing_dev-2` (and for a
+/// plain name can contain anything whose name contains it). Only a
+/// byte-for-byte equality counts as "this instance"; everything else is a
+/// different machine wearing a similar name.
+///
+/// Zero matches → [`NameLookupError::NotFound`]; more than one →
+/// [`NameLookupError::AmbiguousName`]. Never guess: two machines sharing a name
+/// is common enough in rented GPU fleets that picking the first would be a
+/// silent wrong-machine connection.
+pub fn exact_name_match(
+    servers: Vec<NovaServer>,
+    name: &str,
+) -> Result<NovaServer, NameLookupError> {
+    let mut hits = servers
+        .into_iter()
+        .filter(|server| server.name.as_deref() == Some(name));
+    let first = hits.next().ok_or(NameLookupError::NotFound)?;
+    if hits.next().is_some() {
+        return Err(NameLookupError::AmbiguousName);
+    }
+    Ok(first)
+}
+
 /// Why an address could not be selected. Logged as `reason=...` and mapped to
 /// a client-facing `ControlError::NotFound` so every refusal is identical from
 /// the outside (plan-openstack §3.5).
@@ -1082,6 +1154,64 @@ mod tests {
         assert_eq!(
             ok.into_server().addresses["n"][0].addr.as_deref(),
             Some("10.0.0.1")
+        );
+    }
+
+    // --- name lookup (appendix A.2) ---------------------------------------
+
+    fn servers_from(json: &str) -> Vec<NovaServer> {
+        serde_json::from_str::<ServerList>(json)
+            .expect("list decodes")
+            .servers
+    }
+
+    #[test]
+    fn server_list_accepts_both_wire_shapes_and_never_fails_silently() {
+        // The documented shape.
+        assert_eq!(
+            servers_from(r#"{"servers":[{"name":"a"},{"name":"b"}]}"#).len(),
+            2
+        );
+        // A bare array, as some API-compat layers answer.
+        assert_eq!(servers_from(r#"[{"name":"a"}]"#).len(), 1);
+        // A 200 whose body is neither shape is a *decode failure*, never an
+        // empty list: "no instances" and "unreadable body" must not look alike.
+        assert!(serde_json::from_str::<ServerList>(r#"{"error":{"code":404}}"#).is_err());
+        assert!(serde_json::from_str::<ServerList>(r#"{"servers":"not-an-array"}"#).is_err());
+    }
+
+    #[test]
+    fn exact_name_match_filters_substring_hits_and_refuses_ambiguity() {
+        // What Nova actually returns for `?name=web`: a substring superset.
+        let servers = servers_from(
+            r#"{"servers":[
+                {"name":"web","addresses":{"private":[{"addr":"10.0.0.1"}]}},
+                {"name":"web-2","addresses":{"private":[{"addr":"10.0.0.2"}]}},
+                {"name":"db","addresses":{"private":[{"addr":"10.0.0.3"}]}}
+            ]}"#,
+        );
+        let hit = exact_name_match(servers, "web").expect("exactly one exact hit");
+        assert_eq!(hit.name.as_deref(), Some("web"));
+
+        // Substring hits are different machines: NotFound, not "close enough".
+        let servers = servers_from(r#"{"servers":[{"name":"web-2"}]}"#);
+        assert_eq!(
+            exact_name_match(servers, "web").unwrap_err(),
+            NameLookupError::NotFound
+        );
+
+        // Two exact hits: refuse rather than guess (R12).
+        let servers = servers_from(r#"{"servers":[{"name":"web"},{"name":"web"}]}"#);
+        assert_eq!(
+            exact_name_match(servers, "web").unwrap_err(),
+            NameLookupError::AmbiguousName
+        );
+
+        // A document with no `name` at all can never match a name lookup.
+        let servers = servers_from(r#"{"servers":[{}]}"#);
+        assert_eq!(
+            exact_name_match(servers, "web").unwrap_err(),
+            NameLookupError::NotFound
         );
     }
 

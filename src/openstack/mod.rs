@@ -30,13 +30,15 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use serde::Deserialize;
 
-use crate::config::{EndpointInterface, OpenStackAuthMethod, OpenStackConfig};
+use crate::config::{EndpointInterface, OpenStackAuthMethod, OpenStackConfig, RouteKind};
 use crate::resolve::ControlError;
-use crate::types::{is_instance_uuid, Policy, ResolveRequest, ResolveResponse, Target};
+use crate::types::{
+    is_instance_name, is_instance_uuid, Policy, ResolveRequest, ResolveResponse, Target,
+};
 
 use nova::{
-    map_backend_user, select_address, AddressSelection, NovaServer, ServerResponse, UserMapping,
-    UserSource,
+    exact_name_match, map_backend_user, select_address, AddressSelection, NovaServer, ServerList,
+    ServerResponse, UserMapping, UserSource,
 };
 
 /// Refresh a token this long before its advertised expiry: a token that dies
@@ -357,23 +359,122 @@ impl OpenStackClient {
 
     // --- Nova --------------------------------------------------------------
 
-    /// `GET {nova}/servers/{uuid}`, retrying a single 401 with a fresh token.
-    async fn get_server(
+    /// `GET {nova}/servers/{uuid}` — the UUID route (show-by-id).
+    ///
+    /// The UUID is validated by [`is_instance_uuid`] before it is put in the
+    /// path, and it is the *only* thing appended to the base URL.
+    async fn get_server(&self, token: CachedToken, uuid: &str) -> Result<NovaServer, ControlError> {
+        let resp = self
+            .nova_get(
+                token,
+                &format!("/servers/{uuid}"),
+                None,
+                RouteKind::Uuid,
+                uuid,
+            )
+            .await?;
+        match resp.json::<ServerResponse>().await {
+            // Both wire shapes are accepted: the flat v2.1 document and the
+            // classic `{"server": {…}}` envelope (see [`ServerResponse`]) — an
+            // envelope decoded as a bare server silently loses `addresses`,
+            // which turned into a `no_network` refusal against a real cloud.
+            Ok(server) => Ok(server.into_server()),
+            Err(_) => {
+                tracing::warn!(
+                    target: "openstack",
+                    reason = "decode",
+                    route_by = "uuid",
+                    %uuid,
+                    "Nova server response could not be decoded"
+                );
+                Err(ControlError::Decode)
+            }
+        }
+    }
+
+    /// `GET {nova}/servers?name={name}` — the name route (list + local filter).
+    ///
+    /// The name is handed to reqwest as a **query value**, never concatenated
+    /// into the path, so it cannot become a path segment, a second parameter
+    /// or a host (appendix A.3). Nova's `name` filter is a substring / regular
+    /// expression search, so the local exact-match filter is what actually
+    /// decides which machine this is — and refuses when the answer is not
+    /// exactly one instance.
+    async fn find_server_by_name(
+        &self,
+        token: CachedToken,
+        name: &str,
+    ) -> Result<NovaServer, ControlError> {
+        let resp = self
+            .nova_get(
+                token,
+                "/servers",
+                Some(("name", name)),
+                RouteKind::Name,
+                name,
+            )
+            .await?;
+        let list = match resp.json::<ServerList>().await {
+            Ok(list) => list,
+            Err(_) => {
+                tracing::warn!(
+                    target: "openstack",
+                    reason = "decode",
+                    route_by = "name",
+                    principal = %name,
+                    "Nova server-list response could not be decoded"
+                );
+                return Err(ControlError::Decode);
+            }
+        };
+        match exact_name_match(list.servers, name) {
+            Ok(server) => Ok(server),
+            Err(err) => {
+                // Zero matches and "several machines share this name" are both
+                // `not_found` from the outside; only the log distinguishes
+                // them, so a name guesser learns nothing (appendix A.3).
+                tracing::warn!(
+                    target: "openstack",
+                    reason = err.reason(),
+                    route_by = "name",
+                    principal = %name,
+                    "name lookup did not yield exactly one instance"
+                );
+                Err(ControlError::NotFound)
+            }
+        }
+    }
+
+    /// One Nova `GET`, with the shared "refresh the token once on 401" and
+    /// "retry once on a connect failure" semantics (plan-openstack §3.2).
+    ///
+    /// `path` is always built by this module from a validated UUID or the
+    /// literal `/servers`; `query` is handed to reqwest, which percent-encodes
+    /// it. A user-controlled string therefore never becomes part of a path.
+    async fn nova_get(
         &self,
         mut token: CachedToken,
-        uuid: &str,
-    ) -> Result<NovaServer, ControlError> {
+        path: &str,
+        query: Option<(&str, &str)>,
+        route_by: RouteKind,
+        principal: &str,
+    ) -> Result<reqwest::Response, ControlError> {
         let mut refreshed = false;
         loop {
-            let url = format!("{}/servers/{}", token.nova_base, uuid);
+            let url = format!("{}{}", token.nova_base, path);
             let microversion = self.cfg.microversion.as_str();
             let resp = self
                 .send(|| {
-                    self.http
+                    let request = self
+                        .http
                         .get(&url)
                         .header("X-Auth-Token", token.value.as_str())
                         .header("OpenStack-API-Version", format!("compute {microversion}"))
-                        .header("X-OpenStack-Nova-API-Version", microversion)
+                        .header("X-OpenStack-Nova-API-Version", microversion);
+                    match query {
+                        Some((key, value)) => request.query(&[(key, value)]),
+                        None => request,
+                    }
                 })
                 .await?;
 
@@ -381,8 +482,13 @@ impl OpenStackClient {
             if status == 401 && !refreshed {
                 // The cached token died under us: drop it, take a new one, and
                 // try exactly once more (plan-openstack §3.2).
-                tracing::debug!(target: "openstack", reason = "token_expired", %uuid,
-                    "Nova rejected the cached token; refreshing");
+                tracing::debug!(
+                    target: "openstack",
+                    reason = "token_expired",
+                    route_by = route_by.as_str(),
+                    principal,
+                    "Nova rejected the cached token; refreshing"
+                );
                 self.invalidate_token_if(&token.value);
                 token = self.acquire().await?;
                 refreshed = true;
@@ -390,29 +496,14 @@ impl OpenStackClient {
             }
 
             return match status {
-                200 => match resp.json::<ServerResponse>().await {
-                    // Both wire shapes are accepted: the flat v2.1 document and
-                    // the classic `{"server": {…}}` envelope (see
-                    // [`ServerResponse`]) — an envelope decoded as a bare
-                    // server silently loses `addresses`, which turned into a
-                    // `no_network` refusal against a real cloud.
-                    Ok(server) => Ok(server.into_server()),
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "openstack",
-                            reason = "decode",
-                            %uuid,
-                            "Nova server response could not be decoded"
-                        );
-                        Err(ControlError::Decode)
-                    }
-                },
+                200 => Ok(resp),
                 404 => {
                     tracing::warn!(
                         target: "openstack",
                         reason = "not_found",
-                        %uuid,
-                        "no such instance (or not visible to this application credential)"
+                        route_by = route_by.as_str(),
+                        principal,
+                        "no such instance (or not visible to this credential)"
                     );
                     Err(ControlError::NotFound)
                 }
@@ -420,7 +511,8 @@ impl OpenStackClient {
                     tracing::warn!(
                         target: "openstack",
                         reason = "forbidden",
-                        %uuid,
+                        route_by = route_by.as_str(),
+                        principal,
                         status,
                         "Nova refused the token"
                     );
@@ -431,7 +523,8 @@ impl OpenStackClient {
                     tracing::warn!(
                         target: "openstack",
                         reason = "nova_5xx",
-                        %uuid,
+                        route_by = route_by.as_str(),
+                        principal,
                         status,
                         "Nova is unhealthy"
                     );
@@ -441,7 +534,8 @@ impl OpenStackClient {
                     tracing::warn!(
                         target: "openstack",
                         reason = "unexpected_status",
-                        %uuid,
+                        route_by = route_by.as_str(),
+                        principal,
                         status,
                         "unexpected Nova status"
                     );
@@ -503,34 +597,70 @@ impl OpenStackClient {
         &self,
         req: &ResolveRequest,
     ) -> std::result::Result<ResolveResponse, ControlError> {
-        let uuid = req.principal.as_str();
+        let principal = req.principal.as_str();
 
-        // Defence in depth (plan-openstack §3.5 red line 3): this string is the
-        // *only* thing appended to the Nova base URL, so it must be a canonical
-        // UUID — never a host, a path segment or a query. Rejecting here means
-        // even a wiring mistake upstream cannot turn the gateway into an SSRF
-        // proxy.
-        if !is_instance_uuid(uuid) {
+        // Defence in depth (plan-openstack §3.5 red line 3 / appendix A.3):
+        // this string is the *only* user-controlled input this client sends to
+        // Nova — as a path segment (a canonical UUID) or as the value of the
+        // `name` query parameter — so it has to be a shape this route accepts.
+        // Rejecting here means even a wiring mistake upstream cannot turn the
+        // gateway into an SSRF proxy.
+        //
+        // UUID shape always wins and is never treated as a name: an instance
+        // whose *name* looks like an id must not create ambiguity.
+        let is_uuid = is_instance_uuid(principal);
+        let route = if is_uuid && self.cfg.route_by.contains(&RouteKind::Uuid) {
+            RouteKind::Uuid
+        } else if !is_uuid
+            && self.cfg.route_by.contains(&RouteKind::Name)
+            && is_instance_name(principal)
+        {
+            RouteKind::Name
+        } else {
             tracing::warn!(
                 target: "openstack",
-                principal = uuid,
+                principal,
                 client_ip = %req.client_ip,
-                reason = "not_a_uuid",
-                "refusing to query Nova for a non-UUID principal"
+                reason = "not_routable",
+                route_by = ?self.cfg.route_by,
+                "refusing to query Nova for a principal this route does not accept"
             );
             return Err(ControlError::NotFound);
-        }
+        };
         tracing::debug!(
             target: "openstack",
-            %uuid,
+            principal,
+            route_by = route.as_str(),
             client_ip = %req.client_ip,
             key_fp = %req.key_fp,
             "resolving instance address"
         );
 
-        let token = self.acquire().await?;
-        let server = self.get_server(token, uuid).await?;
+        let server = match route {
+            RouteKind::Uuid => {
+                let token = self.acquire().await?;
+                self.get_server(token, principal).await?
+            }
+            RouteKind::Name => {
+                let token = self.acquire().await?;
+                self.find_server_by_name(token, principal).await?
+            }
+        };
+        self.build_response(server, principal, route)
+    }
 
+    /// Select the address and the backend user from an already-fetched server,
+    /// and assemble the grant.
+    ///
+    /// Shared by the UUID and the name route (appendix A.2): once the instance
+    /// document is in hand, nothing about the two routes differs, so the
+    /// address-selection, user-mapping and policy rules cannot drift apart.
+    fn build_response(
+        &self,
+        server: NovaServer,
+        principal: &str,
+        route: RouteKind,
+    ) -> std::result::Result<ResolveResponse, ControlError> {
         let selection = AddressSelection {
             network: &self.cfg.network,
             family: self.cfg.address_family,
@@ -548,7 +678,8 @@ impl OpenStackClient {
             let networks: Vec<&str> = server.addresses.keys().map(String::as_str).collect();
             tracing::warn!(
                 target: "openstack",
-                %uuid,
+                principal,
+                route_by = route.as_str(),
                 reason = err.reason(),
                 configured_network = %self.cfg.network,
                 networks = ?networks,
@@ -572,7 +703,8 @@ impl OpenStackClient {
         if let Some(rejected) = &choice.rejected_metadata {
             tracing::warn!(
                 target: "openstack",
-                %uuid,
+                principal,
+                route_by = route.as_str(),
                 reason = "user_map",
                 value = %rejected,
                 "instance metadata carries an unusable backend login user; \
@@ -581,7 +713,8 @@ impl OpenStackClient {
         }
         tracing::debug!(
             target: "openstack",
-            %uuid,
+            principal,
+            route_by = route.as_str(),
             %addr,
             user = %choice.user,
             source = choice.source.as_str(),
@@ -1056,6 +1189,93 @@ mod tests {
         (server, base)
     }
 
+    /// Decode a query value the way form-encoding does: `%XX` escapes, plus a
+    /// literal `+` for a space (reqwest's `.query()` uses
+    /// `application/x-www-form-urlencoded`). Only used by tests to read back
+    /// what the gateway sent.
+    fn percent_decode(raw: &str) -> String {
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'+' {
+                out.push(b' ');
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or_default();
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Parse the `name` out of a recorded `/servers?name=…` request target.
+    fn name_query_of(path: &str) -> Option<String> {
+        let (_, query) = path.split_once('?')?;
+        let mut name = None;
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("name=") {
+                name = Some(percent_decode(value));
+            }
+        }
+        name
+    }
+
+    /// A mock that issues tokens and serves the **name** route:
+    /// `GET /v2.1/servers?name=…` performs a Nova-style *substring* search over
+    /// `instances` (a JSON array of bare server documents, no envelope), so
+    /// the local exact-match filter is what these tests actually exercise.
+    fn keystone_and_nova_list(
+        expires_at: String,
+        instances: &'static str,
+    ) -> (MockHttp, Arc<OnceLock<String>>) {
+        let base = Arc::new(OnceLock::<String>::new());
+        let base_for_handler = Arc::clone(&base);
+        let server = MockHttp::start(move |request| {
+            let base = base_for_handler.get().cloned().unwrap_or_default();
+            let method = request.method.as_str();
+            let path = request.path.as_str();
+            if method == "POST" && path == "/v3/auth/tokens" {
+                return Response::token("subject-token", &token_body(&expires_at, &base));
+            }
+            if method == "GET" && path.starts_with("/v2.1/servers?") {
+                let needle = name_query_of(path).unwrap_or_default();
+                let all: Vec<serde_json::Value> =
+                    serde_json::from_str(instances).expect("instance fixtures");
+                let matched: Vec<&serde_json::Value> = all
+                    .iter()
+                    .filter(|server| {
+                        server["name"]
+                            .as_str()
+                            .is_some_and(|name| name.contains(&needle))
+                    })
+                    .collect();
+                return Response::json(200, &serde_json::json!({ "servers": matched }).to_string());
+            }
+            if method == "GET" && path.starts_with("/v2.1/servers/") {
+                return Response::json(200, "{}");
+            }
+            Response::json(404, "{}")
+        });
+        base.set(server.url("")).expect("base url set");
+        (server, base)
+    }
+
+    /// Two instances: the one the tests resolve by name, and a longer name that
+    /// Nova's substring filter would also return for a prefix query.
+    const NAME_INSTANCES: &str = r#"[
+        {"id":"i-1","name":"inst-1","addresses":{"private":[{"addr":"10.0.0.7","version":4,"OS-EXT-IPS:type":"fixed"}]},"metadata":{},"image":{"id":"img-1"}},
+        {"id":"i-2","name":"inst-1-shadow","addresses":{"private":[{"addr":"10.0.0.9","version":4,"OS-EXT-IPS:type":"fixed"}]},"metadata":{},"image":{"id":"img-1"}}
+    ]"#;
+
     // ------------------------------------------------------------------
     // Tests.
     // ------------------------------------------------------------------
@@ -1359,6 +1579,181 @@ mod tests {
         assert!(
             mock.requests().is_empty(),
             "no request at all: the username must never become part of a URL"
+        );
+    }
+
+    // --- instance-name routing (appendix A.2 / A.3) -----------------------
+
+    /// A config with the name route opted in (`route_by = ["uuid","name"]`).
+    fn os_config_with_names(base: &str) -> OpenStackConfig {
+        os_config(&format!(
+            "{urls}\nroute_by = [\"uuid\", \"name\"]",
+            urls = urls(base)
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_name_resolves_through_the_list_endpoint_when_opted_in() {
+        let (mock, base) =
+            keystone_and_nova_list("2099-01-01T00:00:00.000000Z".to_owned(), NAME_INSTANCES);
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+
+        let grant = client
+            .resolve(&req("inst-1"))
+            .await
+            .expect("resolves by name");
+
+        // Nova's substring search also returned `inst-1-shadow`; the local
+        // exact-match filter is what chose this machine.
+        assert_eq!(grant.target.host, "10.0.0.7");
+        assert_eq!(grant.target.port, 22);
+        assert_eq!(grant.target.user, "cloud-user");
+
+        let lists: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with("/v2.1/servers?name="))
+            .collect();
+        assert_eq!(lists.len(), 1, "one list lookup, got {lists:?}");
+        assert_eq!(lists[0].path, "/v2.1/servers?name=inst-1");
+        assert!(
+            mock.requests()
+                .iter()
+                .all(|r| !r.path.contains("/servers/i-")),
+            "the name route must never fall back to show-by-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_instances_with_the_same_name_are_refused_rather_than_guessed() {
+        let instances = r#"[
+            {"id":"i-1","name":"twin","addresses":{"private":[{"addr":"10.0.0.7","version":4}]}},
+            {"id":"i-2","name":"twin","addresses":{"private":[{"addr":"10.0.0.8","version":4}]}}
+        ]"#;
+        let (mock, base) =
+            keystone_and_nova_list("2099-01-01T00:00:00.000000Z".to_owned(), instances);
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+
+        let err = client.resolve(&req("twin")).await.expect_err("ambiguous");
+        assert_eq!(err, ControlError::NotFound, "indistinguishable from 404");
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|r| r.path.starts_with("/v2.1/servers?name="))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_never_reaches_any_network_while_the_route_is_off() {
+        let (mock, base) =
+            keystone_and_nova_list("2099-01-01T00:00:00.000000Z".to_owned(), NAME_INSTANCES);
+        let base = base.get().expect("base").clone();
+        // Default `route_by = ["uuid"]`: this is the pre-O6b world.
+        let client = OpenStackClient::new(os_config(&urls(&base))).expect("client");
+
+        let err = client
+            .resolve(&req("inst-1"))
+            .await
+            .expect_err("not routed");
+        assert_eq!(err, ControlError::NotFound);
+        assert!(
+            mock.requests().is_empty(),
+            "no Keystone and no Nova traffic for a name while the route is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_is_only_ever_a_percent_encoded_query_value() {
+        // Appendix A.3: whatever the principal contains, the request path is
+        // `/servers` and the name is a single encoded parameter value.
+        let (mock, base) =
+            keystone_and_nova_list("2099-01-01T00:00:00.000000Z".to_owned(), NAME_INSTANCES);
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+
+        for name in ["a&b=c", "x/y", "../etc", "has space", "q?w=1", "%2e%2e"] {
+            let err = client
+                .resolve(&req(name))
+                .await
+                .expect_err("no such instance");
+            assert_eq!(err, ControlError::NotFound, "{name}");
+        }
+
+        let lists: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with("/v2.1/servers?"))
+            .collect();
+        assert_eq!(lists.len(), 6, "one lookup per principal: {lists:?}");
+        for request in &lists {
+            let (path, query) = request.path.split_once('?').expect("has a query");
+            assert_eq!(path, "/v2.1/servers", "the name never touches the path");
+            let params: Vec<&str> = query.split('&').collect();
+            assert_eq!(params.len(), 1, "exactly one parameter: {query:?}");
+            let value = params[0].strip_prefix("name=").expect("the name param");
+            assert!(
+                !value.contains(' ') && !value.contains('&') && !value.contains('/'),
+                "reserved characters must be encoded: {value:?}"
+            );
+            // The gateway round-trips the name faithfully, whatever it escaped.
+            let decoded = name_query_of(&request.path).unwrap_or_default();
+            assert!(
+                ["a&b=c", "x/y", "../etc", "has space", "q?w=1", "%2e%2e"]
+                    .contains(&decoded.as_str()),
+                "decoded name must survive: {decoded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn names_the_bound_rejects_never_become_requests() {
+        // `is_instance_name`: empty, over-long, or carrying control characters.
+        let (mock, base) =
+            keystone_and_nova_list("2099-01-01T00:00:00.000000Z".to_owned(), NAME_INSTANCES);
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+
+        let over_long = "a".repeat(256);
+        for name in ["", "bad\nname", "nul\0byte", over_long.as_str()] {
+            let err = client.resolve(&req(name)).await.expect_err("refused");
+            assert_eq!(err, ControlError::NotFound, "{name:?}");
+        }
+        assert!(
+            mock.requests().is_empty(),
+            "the guard fires before any request is built"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_uuid_still_uses_show_by_id_when_both_routes_are_on() {
+        // UUID shape always wins: it is never treated as a name.
+        let (mock, base) =
+            keystone_and_nova_list("2099-01-01T00:00:00.000000Z".to_owned(), NAME_INSTANCES);
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+
+        let err = client
+            .resolve(&req(UUID))
+            .await
+            .expect_err("not in the fixture");
+        assert_eq!(err, ControlError::NotFound);
+        let requests = mock.requests();
+        let paths: Vec<&str> = requests
+            .iter()
+            .map(|r| r.path.as_str())
+            .filter(|p| p.contains("/servers"))
+            .collect();
+        assert!(
+            paths.contains(&format!("/v2.1/servers/{UUID}").as_str()),
+            "show-by-id for a UUID, got {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains("?name=")),
+            "a UUID must never be looked up by name: {paths:?}"
         );
     }
 

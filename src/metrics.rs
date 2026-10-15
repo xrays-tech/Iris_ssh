@@ -51,6 +51,10 @@ struct MetricsInner {
     // conflated in an alert.
     openstack_resolve_ok_total: AtomicU64,
     openstack_resolve_err_total: AtomicU64,
+    // Which principal shape the successful OpenStack lookups used
+    // (appendix A.4). Low cardinality by construction: exactly two values.
+    openstack_resolve_by_uuid_total: AtomicU64,
+    openstack_resolve_by_name_total: AtomicU64,
 
     // relay / flow-control
     window_exhausted_total: AtomicU64,
@@ -282,6 +286,22 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A successful OpenStack lookup whose principal was a canonical instance
+    /// UUID (appendix A.4).
+    pub fn openstack_resolve_by_uuid(&self) {
+        self.inner
+            .openstack_resolve_by_uuid_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A successful OpenStack lookup whose principal was an instance *name*
+    /// (appendix A.4). Zero while `route_by` is at its default.
+    pub fn openstack_resolve_by_name(&self) {
+        self.inner
+            .openstack_resolve_by_name_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Latency of the OpenStack route only.
     pub fn openstack_resolve_latency(&self, latency: std::time::Duration) {
         self.inner
@@ -498,6 +518,16 @@ impl Metrics {
             &mut out,
             "sshgw_openstack_resolve_err_total",
             &self.inner.openstack_resolve_err_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_openstack_resolve_by_uuid_total",
+            &self.inner.openstack_resolve_by_uuid_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_openstack_resolve_by_name_total",
+            &self.inner.openstack_resolve_by_name_total,
         );
         push_counter(
             &mut out,

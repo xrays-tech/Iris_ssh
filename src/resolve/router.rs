@@ -361,6 +361,16 @@ impl ResolveRouter {
 
         match outcome {
             Ok(mut grant) => {
+                if source == ResolveSource::OpenStack {
+                    // Appendix A.4: which principal shape the OpenStack route
+                    // actually served, so the name route's hit rate is visible
+                    // without touching the audit record's format.
+                    if is_instance_uuid(principal.as_str()) {
+                        self.metrics.openstack_resolve_by_uuid();
+                    } else {
+                        self.metrics.openstack_resolve_by_name();
+                    }
+                }
                 // The router is the only component that knows which resolver
                 // answered, so the stamp happens here and only here.
                 grant.resolve_source = source;
@@ -519,13 +529,14 @@ mod router_dispatch_tests {
         // change the UUID arm or the control-plane arm.
         let (os, os_calls) = resolver(CountingClient::new(true), 5);
         let (cp, cp_calls) = resolver(CountingClient::new(true), 5);
+        let metrics = Metrics::default();
         let both = ResolveRouter::new(
             OpenStackRouting::OpenStackOnly,
             true,
             vec![RouteKind::Uuid, RouteKind::Name],
             Some(cp),
             Some(os),
-            Metrics::default(),
+            metrics.clone(),
         );
 
         let grant = both
@@ -539,6 +550,18 @@ mod router_dispatch_tests {
         assert_eq!(grant.resolve_source, ResolveSource::OpenStack);
         assert_eq!(os_calls.load(Ordering::SeqCst), 1);
         assert_eq!(cp_calls.load(Ordering::SeqCst), 0);
+
+        // Appendix A.4: the by-route counters expose which arm served the
+        // lookup, without touching AuditRecord's shape.
+        let text = metrics.render_prometheus();
+        assert!(
+            text.contains("sshgw_openstack_resolve_by_name_total 1"),
+            "exactly the name arm fired:\n{text}"
+        );
+        assert!(
+            text.contains("sshgw_openstack_resolve_by_uuid_total 0"),
+            "the uuid arm did not:\n{text}"
+        );
 
         // The default router (uuid only) refuses the same name with zero
         // upstream traffic — MUST1 holds for names too.
@@ -562,7 +585,15 @@ mod router_dispatch_tests {
     async fn a_uuid_resolves_through_openstack_and_is_stamped() {
         let (os, os_calls) = resolver(CountingClient::new(true), 5);
         let (cp, cp_calls) = resolver(CountingClient::new(true), 5);
-        let router = router(OpenStackRouting::OpenStackOnly, true, Some(cp), Some(os));
+        let metrics = Metrics::default();
+        let router = ResolveRouter::new(
+            OpenStackRouting::OpenStackOnly,
+            true,
+            vec![RouteKind::Uuid, RouteKind::Name],
+            Some(cp),
+            Some(os),
+            metrics.clone(),
+        );
 
         let grant = router
             .authorize(&Principal::parse(UUID).unwrap(), "SHA256:fp", "127.0.0.1")
@@ -580,6 +611,17 @@ mod router_dispatch_tests {
             cp_calls.load(Ordering::SeqCst),
             0,
             "the control plane must not see OpenStack traffic"
+        );
+
+        // UUID shape still takes the uuid arm even with the name route on.
+        let text = metrics.render_prometheus();
+        assert!(
+            text.contains("sshgw_openstack_resolve_by_uuid_total 1"),
+            "the uuid arm fired:\n{text}"
+        );
+        assert!(
+            text.contains("sshgw_openstack_resolve_by_name_total 0"),
+            "a UUID is never treated as a name:\n{text}"
         );
     }
 
