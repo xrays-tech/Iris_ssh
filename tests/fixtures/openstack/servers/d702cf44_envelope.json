@@ -1,0 +1,72 @@
+{
+        "server": {
+            "id": "d702cf44-7c17-4410-8ac0-6bd3727fe081",
+            "name": "gpu-f3a3f738-d26f-402d-a986-ac7b90394ac9",
+            "status": "ACTIVE",
+            "tenant_id": "a070dab7800e4eff88ad72e11f864471",
+            "user_id": "9e8501ed43644dda92541ebe5f195444",
+            "metadata": {},
+            "hostId": "0238b0cb597c849d040c308f3d94c6636b10e741a04df8a8e32c8d00",
+            "image": {
+                "id": "dcbd8815-cb87-4a26-a5b4-992e45269c26",
+                "links": [
+                    {
+                        "rel": "bookmark",
+                        "href": "http://172.16.29.18:8774/images/dcbd8815-cb87-4a26-a5b4-992e45269c26"
+                    }
+                ]
+            },
+            "flavor": {
+                "id": "903648e3-bf5d-4800-a8fe-e19dc85c61c3",
+                "links": [
+                    {
+                        "rel": "bookmark",
+                        "href": "http://172.16.29.18:8774/flavors/903648e3-bf5d-4800-a8fe-e19dc85c61c3"
+                    }
+                ]
+            },
+            "created": "2026-10-12T06:27:57Z",
+            "updated": "2026-10-12T06:28:17Z",
+            "addresses": {
+                "NET3746": [
+                    {
+                        "version": 4,
+                        "addr": "172.16.46.25",
+                        "OS-EXT-IPS:type": "fixed",
+                        "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:18:27:7a"
+                    }
+                ]
+            },
+            "accessIPv4": "",
+            "accessIPv6": "",
+            "links": [
+                {
+                    "rel": "self",
+                    "href": "http://172.16.29.18:8774/v2.1/servers/d702cf44-7c17-4410-8ac0-6bd3727fe081"
+                },
+                {
+                    "rel": "bookmark",
+                    "href": "http://172.16.29.18:8774/servers/d702cf44-7c17-4410-8ac0-6bd3727fe081"
+                }
+            ],
+            "OS-DCF:diskConfig": "MANUAL",
+            "progress": 0,
+            "OS-EXT-AZ:availability_zone": "GPU_4090_Renting",
+            "config_drive": "True",
+            "key_name": "rental-e9fbcd0c-5099-4831-a6d0-99eeeb41ca88",
+            "OS-SRV-USG:launched_at": "2026-10-12T06:28:17.000000",
+            "OS-SRV-USG:terminated_at": null,
+            "security_groups": [
+                {
+                    "name": "default"
+                }
+            ],
+            "OS-EXT-SRV-ATTR:host": "host91",
+            "OS-EXT-SRV-ATTR:instance_name": "instance-00000a1a",
+            "OS-EXT-SRV-ATTR:hypervisor_hostname": "host91",
+            "OS-EXT-STS:task_state": null,
+            "OS-EXT-STS:vm_state": "active",
+            "OS-EXT-STS:power_state": 1,
+            "os-extended-volumes:volumes_attached": []
+        }
+    }

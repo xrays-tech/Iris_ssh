@@ -1,0 +1,14 @@
+{
+  "id": "v-v6",
+  "name": "v6-only",
+  "addresses": {
+    "v6": [
+      {
+        "addr": "2001:db8::7",
+        "version": 6,
+        "OS-EXT-IPS:type": "fixed"
+      }
+    ]
+  },
+  "metadata": {}
+}

@@ -1,0 +1,14 @@
+{
+  "id": "v-image-str",
+  "name": "image-str",
+  "addresses": {
+    "private": [
+      {
+        "addr": "10.0.0.9",
+        "version": 4
+      }
+    ]
+  },
+  "metadata": {},
+  "image": "img-1"
+}

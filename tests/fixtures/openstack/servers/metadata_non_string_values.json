@@ -1,0 +1,20 @@
+{
+  "id": "v-meta-mix",
+  "name": "meta-mix",
+  "addresses": {
+    "private": [
+      {
+        "addr": "10.0.0.8",
+        "version": 4
+      }
+    ]
+  },
+  "metadata": {
+    "iris_ssh_user": "alice",
+    "restarts": 3,
+    "retired": true
+  },
+  "image": {
+    "id": "img-1"
+  }
+}

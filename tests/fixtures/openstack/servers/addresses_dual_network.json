@@ -1,0 +1,21 @@
+{
+  "id": "v-dual",
+  "name": "dual-net",
+  "addresses": {
+    "private": [
+      {
+        "addr": "10.0.0.1",
+        "version": 4,
+        "OS-EXT-IPS:type": "fixed"
+      }
+    ],
+    "mgmt": [
+      {
+        "addr": "10.9.9.1",
+        "version": 4,
+        "OS-EXT-IPS:type": "fixed"
+      }
+    ]
+  },
+  "metadata": {}
+}

@@ -1171,84 +1171,15 @@ mod tests {
 
     /// A **verbatim** `GET /v2.1/servers/{id}` body captured from a real
     /// deployment (`nova_endpoint = 172.16.29.18:8774/v2.1`, instance
-    /// `d702cf44-7c17-4410-8ac0-6bd3727fe081`, network `NET3746`).
+    /// `d702cf44-7c17-4410-8ac0-6bd3727fe081`, network `NET3746`), kept as a
+    /// file under `tests/fixtures/openstack/servers/` (appendix B.6).
     ///
     /// Note the shape: the resource is wrapped in `{"server": …}`. That is
     /// what the live cloud returned for the *same* request the gateway sends,
     /// and it is why the gateway refused with `reason="no_network"` while
     /// curl showed a perfectly good address.
-    const REAL_ENVELOPE: &str = r#"{
-        "server": {
-            "id": "d702cf44-7c17-4410-8ac0-6bd3727fe081",
-            "name": "gpu-f3a3f738-d26f-402d-a986-ac7b90394ac9",
-            "status": "ACTIVE",
-            "tenant_id": "a070dab7800e4eff88ad72e11f864471",
-            "user_id": "9e8501ed43644dda92541ebe5f195444",
-            "metadata": {},
-            "hostId": "0238b0cb597c849d040c308f3d94c6636b10e741a04df8a8e32c8d00",
-            "image": {
-                "id": "dcbd8815-cb87-4a26-a5b4-992e45269c26",
-                "links": [
-                    {
-                        "rel": "bookmark",
-                        "href": "http://172.16.29.18:8774/images/dcbd8815-cb87-4a26-a5b4-992e45269c26"
-                    }
-                ]
-            },
-            "flavor": {
-                "id": "903648e3-bf5d-4800-a8fe-e19dc85c61c3",
-                "links": [
-                    {
-                        "rel": "bookmark",
-                        "href": "http://172.16.29.18:8774/flavors/903648e3-bf5d-4800-a8fe-e19dc85c61c3"
-                    }
-                ]
-            },
-            "created": "2026-10-12T06:27:57Z",
-            "updated": "2026-10-12T06:28:17Z",
-            "addresses": {
-                "NET3746": [
-                    {
-                        "version": 4,
-                        "addr": "172.16.46.25",
-                        "OS-EXT-IPS:type": "fixed",
-                        "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:18:27:7a"
-                    }
-                ]
-            },
-            "accessIPv4": "",
-            "accessIPv6": "",
-            "links": [
-                {
-                    "rel": "self",
-                    "href": "http://172.16.29.18:8774/v2.1/servers/d702cf44-7c17-4410-8ac0-6bd3727fe081"
-                },
-                {
-                    "rel": "bookmark",
-                    "href": "http://172.16.29.18:8774/servers/d702cf44-7c17-4410-8ac0-6bd3727fe081"
-                }
-            ],
-            "OS-DCF:diskConfig": "MANUAL",
-            "progress": 0,
-            "OS-EXT-AZ:availability_zone": "GPU_4090_Renting",
-            "config_drive": "True",
-            "key_name": "rental-e9fbcd0c-5099-4831-a6d0-99eeeb41ca88",
-            "OS-SRV-USG:launched_at": "2026-10-12T06:28:17.000000",
-            "OS-SRV-USG:terminated_at": null,
-            "security_groups": [
-                {
-                    "name": "default"
-                }
-            ],
-            "OS-EXT-SRV-ATTR:host": "host91",
-            "OS-EXT-SRV-ATTR:instance_name": "instance-00000a1a",
-            "OS-EXT-SRV-ATTR:hypervisor_hostname": "host91",
-            "OS-EXT-STS:task_state": null,
-            "OS-EXT-STS:vm_state": "active",
-            "OS-EXT-STS:power_state": 1,
-            "os-extended-volumes:volumes_attached": []
-        }
-    }"#;
+    const REAL_ENVELOPE: &str =
+        include_str!("../../tests/fixtures/openstack/servers/d702cf44_envelope.json");
 
     /// The real-cloud catch, as a regression test: an enveloped body must
     /// decode *and* yield the address, with the configured network matching.
@@ -1332,7 +1263,8 @@ mod tests {
     /// server — every field optional, so the decode "succeeded" with an empty
     /// `addresses` map. The lookup died with `reason="no_network"` and
     /// `networks=[]` while curl showed a perfectly good 172.16.41.62.
-    const REAL_ENVELOPE_T3741: &str = r#"{"server": {"id": "e52bce4c-a98e-4f69-906c-ac6648a2e592", "name": "yunqing_dev", "status": "ACTIVE", "tenant_id": "6bdb5cae363a4c78b14be43b372d821a", "user_id": "3e7ce6a39c884a88a0381e4bd1f782cc", "metadata": {}, "hostId": "953c9b78d9f046367ca96e475f205e4f45a614f535d445d90ca2acd1", "image": "", "flavor": {"id": "6cda4820-0b3d-499a-b5fb-48cae704a3c8", "links": [{"rel": "bookmark", "href": "http://172.16.29.18:8774/flavors/6cda4820-0b3d-499a-b5fb-48cae704a3c8"}]}, "created": "2026-10-08T03:53:46Z", "updated": "2026-10-08T03:53:57Z", "addresses": {"NET3741": [{"version": 4, "addr": "172.16.41.62", "OS-EXT-IPS:type": "fixed", "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:2e:b6:37"}]}, "accessIPv4": "", "accessIPv6": "", "links": [{"rel": "self", "href": "http://172.16.29.18:8774/v2.1/servers/e52bce4c-a98e-4f69-906c-ac6648a2e592"}, {"rel": "bookmark", "href": "http://172.16.29.18:8774/servers/e52bce4c-a98e-4f69-906c-ac6648a2e592"}], "OS-DCF:diskConfig": "AUTO", "progress": 0, "OS-EXT-AZ:availability_zone": "host52", "config_drive": "True", "key_name": null, "OS-SRV-USG:launched_at": "2026-10-08T03:53:57.000000", "OS-SRV-USG:terminated_at": null, "security_groups": [{"name": "default"}], "OS-EXT-STS:task_state": null, "OS-EXT-STS:vm_state": "active", "OS-EXT-STS:power_state": 1, "os-extended-volumes:volumes_attached": [{"id": "591f37c4-e2fc-4dfe-a51e-65bba0e2f829"}]}}"#;
+    const REAL_ENVELOPE_T3741: &str =
+        include_str!("../../tests/fixtures/openstack/servers/e52bce4c_envelope_image_empty.json");
 
     /// Regression (caught on a second real cloud): the T_3741 body must decode
     /// and yield its address — including the `"image": ""` quirk.
@@ -1677,6 +1609,194 @@ mod tests {
         assert!(summary.contains("k11"), "{summary}");
         assert!(!summary.contains("k19"), "{summary}");
         assert!(summary.contains('…'), "{summary}");
+    }
+
+    // --- captured bodies as compile-time fixtures (appendix B.6) ----------
+
+    /// What a fixture body must produce end-to-end, so "loud vs silently
+    /// empty" is a regression assertion rather than a code-reading exercise.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expect {
+        /// Decodes and selects this exact address.
+        Resolve(&'static str),
+        /// Decodes, and the instance genuinely has no dialable address.
+        NoAddress,
+        /// `addresses` is present but unreadable — refused loudly.
+        Unparseable,
+        /// Not a server document at all — a decode failure.
+        DecodeError,
+    }
+
+    /// One body (a verbatim capture or a constructed variant) and the
+    /// selection knobs it is written for: `network` is the configured
+    /// `[openstack] network`; every fixture is deterministic under
+    /// `family = any`, `prefer = floating`, `on_ambiguous = "reject"`.
+    struct Fixture {
+        name: &'static str,
+        body: &'static str,
+        network: &'static str,
+        expect: Expect,
+    }
+
+    /// The fixture corpus (appendix B.6). The two real captures live in
+    /// `tests/fixtures/openstack/servers/` verbatim (including T_3741's
+    /// `image: ""`); the constructed variants freeze each shape the lenient
+    /// extractor must — or must not — accept.
+    const FIXTURES: &[Fixture] = &[
+        Fixture {
+            name: "d702cf44_envelope",
+            body: include_str!("../../tests/fixtures/openstack/servers/d702cf44_envelope.json"),
+            network: "NET3746",
+            expect: Expect::Resolve("172.16.46.25"),
+        },
+        Fixture {
+            name: "e52bce4c_envelope_image_empty",
+            body: include_str!(
+                "../../tests/fixtures/openstack/servers/e52bce4c_envelope_image_empty.json"
+            ),
+            network: "NET3741",
+            expect: Expect::Resolve("172.16.41.62"),
+        },
+        Fixture {
+            name: "flat_variant",
+            body: include_str!("../../tests/fixtures/openstack/servers/flat_variant.json"),
+            network: "private",
+            expect: Expect::Resolve("10.0.0.7"),
+        },
+        Fixture {
+            name: "addresses_missing",
+            body: include_str!("../../tests/fixtures/openstack/servers/addresses_missing.json"),
+            network: "",
+            expect: Expect::NoAddress,
+        },
+        Fixture {
+            name: "addresses_null",
+            body: include_str!("../../tests/fixtures/openstack/servers/addresses_null.json"),
+            network: "",
+            expect: Expect::NoAddress,
+        },
+        Fixture {
+            name: "addresses_string",
+            body: include_str!("../../tests/fixtures/openstack/servers/addresses_string.json"),
+            network: "",
+            expect: Expect::Unparseable,
+        },
+        Fixture {
+            name: "addresses_empty_map",
+            body: include_str!("../../tests/fixtures/openstack/servers/addresses_empty_map.json"),
+            network: "",
+            expect: Expect::NoAddress,
+        },
+        Fixture {
+            name: "addresses_dual_network",
+            body: include_str!(
+                "../../tests/fixtures/openstack/servers/addresses_dual_network.json"
+            ),
+            network: "private",
+            expect: Expect::Resolve("10.0.0.1"),
+        },
+        Fixture {
+            name: "addresses_ipv6",
+            body: include_str!("../../tests/fixtures/openstack/servers/addresses_ipv6.json"),
+            network: "",
+            expect: Expect::Resolve("2001:db8::7"),
+        },
+        Fixture {
+            name: "entry_missing_type",
+            body: include_str!("../../tests/fixtures/openstack/servers/entry_missing_type.json"),
+            network: "private",
+            expect: Expect::Resolve("10.0.0.5"),
+        },
+        Fixture {
+            name: "metadata_null",
+            body: include_str!("../../tests/fixtures/openstack/servers/metadata_null.json"),
+            network: "private",
+            expect: Expect::Resolve("10.0.0.6"),
+        },
+        Fixture {
+            name: "metadata_non_string_values",
+            body: include_str!(
+                "../../tests/fixtures/openstack/servers/metadata_non_string_values.json"
+            ),
+            network: "private",
+            expect: Expect::Resolve("10.0.0.8"),
+        },
+        Fixture {
+            name: "image_bare_string",
+            body: include_str!("../../tests/fixtures/openstack/servers/image_bare_string.json"),
+            network: "private",
+            expect: Expect::Resolve("10.0.0.9"),
+        },
+        Fixture {
+            name: "root_not_object",
+            body: include_str!("../../tests/fixtures/openstack/servers/root_not_object.json"),
+            network: "",
+            expect: Expect::DecodeError,
+        },
+    ];
+
+    /// Walk the whole corpus: every body must decode and select exactly what
+    /// its fixture says — a captured address, a legal `no_address`, a loud
+    /// `unparseable`, or a decode failure. Nothing may "succeed" with an
+    /// empty answer the fixture did not ask for.
+    #[test]
+    fn fixture_bodies_behave_exactly_as_the_corpus_documents() {
+        for fixture in FIXTURES {
+            let value: serde_json::Value = serde_json::from_str(fixture.body)
+                .unwrap_or_else(|err| panic!("{}: not valid JSON: {err}", fixture.name));
+
+            let outcome = match decode_server(&value) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    assert_eq!(
+                        fixture.expect,
+                        Expect::DecodeError,
+                        "{}: unexpected decode failure: {err}",
+                        fixture.name
+                    );
+                    continue;
+                }
+            };
+
+            if fixture.expect == Expect::Unparseable {
+                assert!(
+                    outcome.addresses_present_but_unusable,
+                    "{}: an unreadable addresses shape must be flagged loudly",
+                    fixture.name
+                );
+                continue;
+            }
+            assert!(
+                !outcome.addresses_present_but_unusable,
+                "{}: a readable body must not be flagged unusable",
+                fixture.name
+            );
+
+            let got = select_address(
+                &outcome.view.addresses,
+                &outcome.view.access_ips(),
+                &selection(
+                    fixture.network,
+                    AddressFamily::Any,
+                    IpPrefer::Floating,
+                    OnAmbiguous::Reject,
+                ),
+            );
+            match (fixture.expect, got) {
+                (Expect::Resolve(want), Ok(got)) => {
+                    assert_eq!(
+                        got,
+                        want.parse::<IpAddr>().expect("fixture ip"),
+                        "{}",
+                        fixture.name
+                    );
+                }
+                (Expect::NoAddress, Err(SelectionError::NoAddress)) => {}
+                (expected, other) => {
+                    panic!("{}: expected {expected:?}, got {other:?}", fixture.name)
+                }
+            }
+        }
     }
 
     // --- name lookup (appendix A.2) ---------------------------------------

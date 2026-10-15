@@ -1,0 +1,16 @@
+{
+  "id": "v-meta-null",
+  "name": "meta-null",
+  "addresses": {
+    "private": [
+      {
+        "addr": "10.0.0.6",
+        "version": 4
+      }
+    ]
+  },
+  "metadata": null,
+  "image": {
+    "id": "img-1"
+  }
+}
