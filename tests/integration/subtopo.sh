@@ -108,6 +108,11 @@ SUBTOP_OS_TIMEOUT="${SUBTOP_OS_TIMEOUT:-3s}"
 SUBTOP_OS_FAIL_OPEN="${SUBTOP_OS_FAIL_OPEN:-false}"
 # Extra `[openstack]` lines a case may need (e.g. network = "private").
 SUBTOP_OS_EXTRA="${SUBTOP_OS_EXTRA:-}"
+# `[openstack] scope` — empty = single_project (default, all existing cases);
+# "cross_project" renders scope + auth_method="password" so the gateway asks
+# Nova with `all_tenants=1` (plan-openstack appendix C). The mock never checks
+# the password, so a placeholder value is fine.
+SUBTOP_OS_SCOPE="${SUBTOP_OS_SCOPE:-}"
 
 # toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
 toml_arr() {
@@ -199,11 +204,18 @@ subtopo_start() {
     # must keep resolving UUIDs alone (appendix A.1).
     local _os_route_by=""
     [ -n "$SUBTOP_OS_ROUTE_BY" ] && _os_route_by="$(printf 'route_by = %s\n' "$(toml_arr "$SUBTOP_OS_ROUTE_BY")")"
-    _os_toml="$(printf '[openstack]\nenabled = true\nrouting = "openstack_only"\nauthorization = "openstack_only"\nallow_any_authenticated_key = true\nauth_url = "http://127.0.0.1:%s/v3"\nnova_endpoint = "http://127.0.0.1:%s/v2.1"\napplication_credential_id = "cred-id"\napplication_credential_secret = "cred-secret"\nproject_id = "proj-1"\nregion = "RegionOne"\ninterface = "public"\nssh_port = %s\ncache_ttl = "%s"\ntimeout = "%s"\nfail_open = %s\naddress_family = "ipv4"\nprefer = "floating"\non_ambiguous = "%s"\ndefault_backend_user = "%s"\nbackend_user_metadata_key = "%s"\n%s%s\n' \
+    # Appendix C: `scope = "cross_project"` is the only lab shape that needs a
+    # password credential (an application credential cannot span projects) and
+    # makes the gateway ask Nova with `all_tenants=1`. The mock never checks
+    # the password, so a placeholder is fine.
+    local _os_scope=""
+    [ "$SUBTOP_OS_SCOPE" = "cross_project" ] && \
+      _os_scope="$(printf 'scope = "cross_project"\nauth_method = "password"\nusername = "ops-admin"\npassword = "lab-pw"\n')"
+    _os_toml="$(printf '[openstack]\nenabled = true\nrouting = "openstack_only"\nauthorization = "openstack_only"\nallow_any_authenticated_key = true\nauth_url = "http://127.0.0.1:%s/v3"\nnova_endpoint = "http://127.0.0.1:%s/v2.1"\napplication_credential_id = "cred-id"\napplication_credential_secret = "cred-secret"\nproject_id = "proj-1"\nregion = "RegionOne"\ninterface = "public"\nssh_port = %s\ncache_ttl = "%s"\ntimeout = "%s"\nfail_open = %s\naddress_family = "ipv4"\nprefer = "floating"\non_ambiguous = "%s"\ndefault_backend_user = "%s"\nbackend_user_metadata_key = "%s"\n%s%s%s\n' \
       "$ST_OS_PORT" "$ST_OS_PORT" "$ST_SSHD_PORT" \
       "$SUBTOP_OS_CACHE_TTL" "$SUBTOP_OS_TIMEOUT" "$SUBTOP_OS_FAIL_OPEN" \
       "$SUBTOP_OS_ON_AMBIGUOUS" "$SUBTOP_OS_DEFAULT_USER" "$SUBTOP_OS_METADATA_KEY" \
-      "$_os_route_by" "$SUBTOP_OS_EXTRA")"
+      "$_os_scope" "$_os_route_by" "$SUBTOP_OS_EXTRA")"
   fi
 
   printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n%s%s\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \

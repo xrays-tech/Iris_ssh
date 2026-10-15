@@ -41,6 +41,11 @@ Per-server control keys (stripped from the Nova body):
     slim_list answer the `?name=` list with only `id`/`links`/`name` and no
              addresses — some real clouds (e.g. T_3741) slim list entries, so
              the gateway must refine a unique name match with show-by-id
+    cross_tenant mark this instance as living in a *different* project (the
+             mock gives it a `tenant_id` when served). Visible only when the
+             request carries `all_tenants=1` (the gateway's `cross_project`
+             mode); a single-project request must not see it — that is exactly
+             how Nova separates projects (appendix C.3).
 
 Self-contained: stdlib only, graceful SIGTERM, `--access-log` for assertions
 that must survive a restart.
@@ -56,7 +61,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
-CONTROL_KEYS = ("status", "delay_ms", "envelope", "slim_list")
+CONTROL_KEYS = ("status", "delay_ms", "envelope", "slim_list", "cross_tenant")
 
 # Headers worth keeping in the log: they are the evidence that the gateway
 # authenticated with a real token and asked for the microversion it claims to.
@@ -156,11 +161,18 @@ class Handler(BaseHTTPRequestHandler):
             # Instance-name lookup (plan-openstack appendix A.2): Nova's
             # `name` filter is a substring search, so the gateway's local
             # exact-match narrowing is what a case is actually testing.
-            needle = parse_qs(urlparse(self.path).query).get("name", [""])[0]
+            query = parse_qs(urlparse(self.path).query)
+            needle = query.get("name", [""])[0]
+            # `scope="cross_project"` sends `all_tenants=1`; anything else is a
+            # single-project request that must not see another project's
+            # instances (appendix C.3).
+            all_tenants = query.get("all_tenants", ["0"])[0] == "1"
             matched = []
             for uuid, server in state.rules["servers"].items():
                 if not isinstance(server, dict):
                     continue
+                if server.get("cross_tenant") and not all_tenants:
+                    continue  # a different project: invisible to this scope
                 if needle and needle in str(server.get("name", "")):
                     if server.get("slim_list"):
                         # A directory entry only: id/links/name, no addresses.
@@ -170,15 +182,27 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     body = {k: v for k, v in server.items() if k not in CONTROL_KEYS}
                     body.setdefault("id", uuid)
+                    if server.get("cross_tenant"):
+                        body.setdefault("tenant_id", "other-tenant")
                     matched.append(body)
             self._record(status=200)
             self._send(200, {"servers": matched})
             return
         if self.path.startswith("/v2.1/servers/"):
-            uuid = self.path[len("/v2.1/servers/") :]
+            path_only = self.path[len("/v2.1/servers/"):].split("?", 1)[0]
+            query = parse_qs(urlparse(self.path).query)
+            all_tenants = query.get("all_tenants", ["0"])[0] == "1"
+            uuid = path_only
             server = state.rules["servers"].get(uuid, state.rules["default"])
             if not isinstance(server, dict):
                 server = {"status": 404}
+            if server.get("cross_tenant") and not all_tenants:
+                # Same visibility boundary as the list path: Nova answers 404
+                # for "not visible to this credential" and the gateway must not
+                # be able to tell it apart from "does not exist".
+                self._record(status=404)
+                self._send(404, {"itemNotFound": {"code": 404, "message": "no such server"}})
+                return
             delay = server.get("delay_ms", 0)
             if delay:
                 time.sleep(delay / 1000.0)
@@ -189,6 +213,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             body = {k: v for k, v in server.items() if k not in CONTROL_KEYS}
             body.setdefault("id", uuid)
+            if server.get("cross_tenant"):
+                body.setdefault("tenant_id", "other-tenant")
             if server.get("envelope"):
                 body = {"server": body}
             self._send(200, body)

@@ -537,6 +537,15 @@ ALL_CASES=(
   # real-cloud refinement: a `?name=` directory entry without addresses is
   # refined with one show-by-id (caught against T_3741's Nova).
   case_openstack_name_slim_list
+  # plan-openstack appendix C (X series): scope="cross_project" lab mode —
+  # resolve an instance in another project (all_tenants), name-collision
+  # refusal, and the password⇔cross_project validation coupling.
+  case_openstack_cross_project_uuid
+  case_openstack_cross_project_name_unique
+  case_openstack_cross_project_name_ambiguous
+  case_openstack_cross_project_disabled_default
+  case_openstack_cross_project_requires_password
+  case_openstack_password_not_in_single_project
 )
 
 resolve_case_path() {
