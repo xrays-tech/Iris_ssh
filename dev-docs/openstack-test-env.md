@@ -101,10 +101,26 @@ ssh_port = 22
              生产推荐形态）解析成功 resolve_source="openstack"→172.16.46.25；
              后端拨号仍因网络不可达超时。指标 resolve_ok=1/err=1。全量 test 255+4、
              集成 38P/0F/2S 通过。
+2026-10-15  **T_3741 完整端到端踩通**（实例 e52bce4c… / yunqing_dev / 172.16.41.62，
+           网络 OPEN、root 登录、测试公钥已放 authorized_keys）：
+           - 第三个 real-env catch：该实例 `"image": ""`（卷启动/镜像已删，Nova 给空串
+             而非 `{"id":…}`/`null`）→ `ServerResponse` 的 `Envelope` 变体反序列化失败 →
+             untagged 静默回退 `Flat` → 信封 body 被解成空 addresses → `no_network`。
+             修复（commit 0f30b01）：`image` 容忍野生形态（`image_or_none`）+ `ServerResponse`
+             改**手写按 `server` 键判形态**（类型异常改为响亮的 `reason="decode"`，杜绝整类
+             静默清空）+ 真实 1375 字节 body 回归测试。
+           - 修复后 E2E 成功：`ssh -A e52bce4c…→` 网关解析 → agent 签名 → **root 登录
+             实例并回显 REACHED/yunqing-dev/root**；审计 `resolve_source=openstack
+             target_host=172.16.41.62 target_user=root auth_kind=agent
+             agent_signatures=1`；resolve_ok=1/err=0。全量 test 258+4、集成 38P/0F/2S。
 ```
 
-## 6b. 剩余缺口（真机端到端验证`ssh -A <uuid>`成功登录实例前）
+## 6b. 剩余缺口
 
-- [ ] 网络：网关所在机器需能到达 `172.16.46.x:22`（当前机器不可达）
-- [ ] 实例登录用户确认 + 测试公钥放入实例 `authorized_keys`（默认按 `ubuntu` 配置）
-- [ ] 实例选定（5 台 ACTIVE 任挑）后做完整登录断言（audit `resolve_source=openstack` + 会话成功）
+- **T_3741 已闭环**（2026-10-15）：网络可达（172.16.41.62:22 OPEN）、`root` 登录确认、
+  测试公钥已放 `authorized_keys`、`ssh -A <uuid>` 经网关完整登录成功（见 §6）。
+- 若要对 **T_3746** 那批实例（172.16.46.x）实测：仍需一台能到达该网段的网关机 +
+  对应实例的登录用户/公钥部署（本机到达不了 172.16.46.x）。
+- 持久生产配置建议：`auth_method="application_credential"`（凭据 scope 到目标项目；
+  T_3741 需另建一把 T_3741 作用域的 app-credential）+ `region="RegionOne"` +
+  `nova_endpoint` 或 catalog 发现均可。
