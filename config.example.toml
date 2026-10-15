@@ -150,6 +150,25 @@ timeout = "2s"
 # # UUID-shaped principals always take the UUID path, never the name path.
 # route_by = ["uuid", "name"]
 #
+# # --- project scope (plan-openstack appendix C) -----------------------------
+# # scope = "single_project"   # (default) resolve instances in ONE project — the
+# # # blast radius is the credential's project. Existing behaviour, unchanged.
+# #
+# # scope = "cross_project"    # ⚠ LAB ONLY: resolve instances in ANY project the
+# # # credential's roles allow. Nova is asked with `all_tenants=1`, so an
+# # # instance can be reached by UUID (globally unique) or by a name that is the
+# # # single exact match — a name shared across projects is refused, never
+# # # guessed. This REQUIRES auth_method = "password" (an application credential
+# # # is pinned to one project and cannot span them), and it means the gateway
+# # # holds a credential that can see/dial every project it has admin over.
+# # # Enable only on a private/lab cloud with a permissive Nova policy; a strict
+# # # public cloud will 404 cross-tenant lookups. NEVER on an internet-facing gw.
+# # auth_method = "password"   # only valid together with scope = "cross_project"
+# # username = "ops-user"
+# # password = "…"             # or password_file / $SSHGW_OPENSTACK_PASSWORD
+# # project_id = "…"           # under cross_project this is the AUTH scope (the
+# # # project whose roles the token carries), not the visibility boundary.
+#
 # # --- backend login user (metadata wins, then rules, then this default) -----
 # default_backend_user = "cloud-user"   # required while enabled
 # backend_user_metadata_key = "iris_ssh_user"

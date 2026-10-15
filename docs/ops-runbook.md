@@ -236,6 +236,8 @@ ssh_port = 22
 
 **实例名路由（appendix A，默认关）**：`route_by` 默认 `["uuid"]`，现有部署行为不变。写成 `route_by = ["uuid", "name"]` 后，非 UUID principal 在满足实例名边界（非空、≤255、无控制字符）时经 `GET /servers?name=<值>` 解析：名字只作百分号编码的 query 值、绝不进路径；Nova 的 `name` 是**子串**搜索，网关本地做**全等**过滤，0 个或多个全等命中对客户端都等于 404（`ambiguous_name` 只进日志，不猜机器）。UUID 形态永远优先走 UUID 路由、从不视为名字。路由选择的可观测性是 `sshgw_openstack_resolve_by_uuid_total` / `sshgw_openstack_resolve_by_name_total` 两个计数器——**审计记录格式不变**。
 
+**跨项目模式（appendix C，`scope="cross_project"`，默认关）**：`scope` 默认 `single_project`（零回归）；`cross_project` 让网关以 `all_tenants=1` 解析**任意项目**的实例——UUID（全局唯一）可直接直达；名字要求全云**唯一全等**，跨项目重名 → `ambiguous_name_cross_project` 拒绝，绝不猜。**必须 `auth_method="password"`**（app-credential 被 Keystone 锁死在单项目，无法跨项目），此时 `project_id` 是**认证 scope**（决定 token 带哪种角色），不是可见性边界。⚠ **这是最重的实验室开关**：网关持有的凭据能看/能拨其 admin 角色覆盖的所有项目实例，且依赖平台 Nova 策略允许 project-scoped admin 用 `all_tenants`（严格云会是 404）；**禁止公网/共享网关**。启动会出现专属 WARN（`scope = "cross_project": this is a LAB mode …`）。真机已验证：单项目 admin token 跨项目解析并 root 登录另一项目的实例（`case_openstack_cross_project_*` / T_3741 实录）。
+
 **排障**
 | 症状 / 日志关键字 | 含义 | 处置 |
 |---|---|---|
