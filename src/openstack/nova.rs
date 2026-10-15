@@ -1257,10 +1257,7 @@ mod tests {
         let flat: ServerResponse = serde_json::from_value(flat).expect("flat decodes");
         let envelope = envelope.into_server();
         let flat = flat.into_server();
-        assert_eq!(
-            envelope, flat,
-            "shape must not affect the parsed server"
-        );
+        assert_eq!(envelope, flat, "shape must not affect the parsed server");
         // …and the field actually round-tripped, rather than both sides
         // agreeing on "absent".
         assert_eq!(
