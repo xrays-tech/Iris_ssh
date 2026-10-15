@@ -27,55 +27,26 @@ pub struct NovaAddress {
 /// `server.image`: `{"id": "..."}`.
 ///
 /// Real clouds also send `null` (deleted image) and the bare empty string `""`
-/// (volume-backed server, or an image that is gone) — see [`image_or_none`].
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// (volume-backed server, or an image that is gone) — see [`decode_server`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NovaImage {
-    #[serde(default)]
     pub id: Option<String>,
-}
-
-/// Accept every form `server.image` takes in the wild, and treat all of them
-/// but the object as "no image".
-///
-/// The reference shape is `{"id": "..."}`; `null` and an absent key already
-/// mean "no image". But a real deployment (project T_3741) answers with the
-/// bare empty string `""`, and that string failed to deserialize into
-/// [`NovaImage`] — which, through the envelope/flat dispatch in
-/// [`ServerResponse`], used to cost the whole lookup. A field this gateway
-/// never acts on must not be able to break address resolution.
-fn image_or_none<'de, D>(deserializer: D) -> Result<Option<NovaImage>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|raw| match raw {
-        serde_json::Value::Object(_) => NovaImage::deserialize(raw).ok(),
-        // `""`, a bare id string, a number, an array … — none of these is an
-        // image reference this gateway could use, so none is worth failing on.
-        _ => None,
-    }))
 }
 
 /// The subset of `GET /v2.1/servers/{id}` this gateway uses.
 ///
-/// Every field is optional so a cloud that omits one (metadata, image, the
-/// legacy accessIPv4) still decodes — only `addresses` matters, and that has a
-/// documented fallback below.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+/// Built field-by-field by [`decode_server`] — never by a whole-document
+/// `Deserialize` (plan-openstack appendix B.2/B.5): every field is extracted
+/// independently, so one field of an unexpected type can no longer drag the
+/// entire document (and with it the instance's `addresses`) down with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NovaServer {
-    #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub addresses: BTreeMap<String, Vec<NovaAddress>>,
-    #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "image_or_none")]
     pub image: Option<NovaImage>,
-    #[serde(rename = "accessIPv4", default)]
     pub access_ipv4: Option<String>,
-    #[serde(rename = "accessIPv6", default)]
     pub access_ipv6: Option<String>,
 }
 
@@ -103,6 +74,212 @@ impl NovaServer {
     }
 }
 
+/// The lenient field extractor failed because the document is not an object at
+/// all (a JSON array, a string, `null`): there are no fields to salvage, so
+/// this is a decode failure, not a field-level surprise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    NotAnObject,
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::NotAnObject => write!(f, "server document is not a JSON object"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// The outcome of decoding one server document field-by-field
+/// (plan-openstack appendix B.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeOutcome {
+    /// Every field extracted independently; non-critical surprises yield the
+    /// field's default rather than an error.
+    pub view: NovaServer,
+    /// `addresses` was present but nothing usable could be extracted from its
+    /// shape. This is *not* "the instance has no addresses" (`no_address`):
+    /// it is a body this gateway could not read, and the caller must refuse
+    /// loudly (appendix B.3/B.5).
+    pub addresses_present_but_unusable: bool,
+    /// Names of fields that arrived in an unexpected shape and were dropped
+    /// or defaulted — for a `warn!` line, never for the client.
+    pub notes: Vec<&'static str>,
+}
+
+/// Extract one server document, one field at a time (appendix B.1/B.2).
+///
+/// The classic v2 envelope (`{"server": {…}}`) and the flat v2.1 document
+/// (`{…}`) are both accepted: the effective document is whichever object this
+/// finds. Every field is independent — a `null` `name`, a bare-string
+/// `image` (project T_3741's `""`), a numeric metadata value: each yields the
+/// field's default and is noted, never an error. The only hard failure is a
+/// root that is not an object at all.
+pub fn decode_server(value: &serde_json::Value) -> Result<DecodeOutcome, DecodeError> {
+    let doc = value.get("server").unwrap_or(value);
+    if !doc.is_object() {
+        return Err(DecodeError::NotAnObject);
+    }
+    let mut notes = Vec::new();
+
+    let id = string_from_value(doc.get("id"), "id", &mut notes);
+    let name = string_from_value(doc.get("name"), "name", &mut notes);
+    let metadata = metadata_from_value(doc.get("metadata"), &mut notes);
+    let image_id = image_id_from_value(doc.get("image"), &mut notes);
+    let access_ipv4 = string_from_value(doc.get("accessIPv4"), "accessIPv4", &mut notes);
+    let access_ipv6 = string_from_value(doc.get("accessIPv6"), "accessIPv6", &mut notes);
+    let (addresses, addresses_present_but_unusable) = addr_map_from_value(doc.get("addresses"));
+
+    Ok(DecodeOutcome {
+        view: NovaServer {
+            id,
+            name,
+            addresses,
+            metadata,
+            image: image_id.map(|id| NovaImage {
+                id: Some(id.to_owned()),
+            }),
+            access_ipv4,
+            access_ipv6,
+        },
+        addresses_present_but_unusable,
+        notes,
+    })
+}
+
+/// A JSON string field: `null`/absent means "no value"; anything that is not
+/// a string is dropped (and noted) instead of failing the document.
+fn string_from_value(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+    notes: &mut Vec<&'static str>,
+) -> Option<String> {
+    match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => Some(raw.clone()),
+        Some(_) => {
+            notes.push(field);
+            None
+        }
+    }
+}
+
+/// `server.image` in every form real clouds send (appendix B.2): only an
+/// object carries an id; `null`, `""` (project T_3741), a bare id string, a
+/// number … all mean "no image" and must never fail the document.
+fn image_id_from_value<'a>(
+    value: Option<&'a serde_json::Value>,
+    notes: &mut Vec<&'static str>,
+) -> Option<&'a str> {
+    match value? {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(image) => match image.get("id") {
+            Some(serde_json::Value::String(id)) => Some(id),
+            // An object without a usable id is "no image", harmlessly.
+            _ => None,
+        },
+        _ => {
+            notes.push("image");
+            None
+        }
+    }
+}
+
+/// `server.metadata`, leniently (appendix B.2): `null` is empty; scalar
+/// values (numbers, booleans) are stringified, because operators do label
+/// instances with `{"count": 3}`; anything else is dropped and noted.
+fn metadata_from_value(
+    value: Option<&serde_json::Value>,
+    notes: &mut Vec<&'static str>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(value) = value else { return out };
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                match value {
+                    serde_json::Value::String(raw) => {
+                        out.insert(key.clone(), raw.clone());
+                    }
+                    serde_json::Value::Number(number) => {
+                        out.insert(key.clone(), number.to_string());
+                    }
+                    serde_json::Value::Bool(flag) => {
+                        out.insert(key.clone(), flag.to_string());
+                    }
+                    // A nested object/array is not a login name; drop it.
+                    _ => notes.push("metadata"),
+                }
+            }
+        }
+        _ => notes.push("metadata"),
+    }
+    out
+}
+
+/// `server.addresses`, shape-aware (plan-openstack appendix B.3).
+///
+/// Returns `(map, unusable)`:
+///
+/// - missing / `null` → `({}, false)` — the field is simply gone;
+/// - `{}`             → `({}, false)` — a real instance with no addresses,
+///   which resolves to `no_address` (legal, not an error);
+/// - a map            → per-network, per-entry lenient extraction; a non-empty
+///   map that yields **no** parseable address at all is `unusable=true`,
+///   because "structure we could not read" and "an instance with no
+///   addresses" must never look the same (this is the direct antidote to the
+///   two silent-empty incidents, 2963e76 and 0f30b01);
+/// - anything else (a string, an array, a number) → `({}, true)`.
+fn addr_map_from_value(
+    value: Option<&serde_json::Value>,
+) -> (BTreeMap<String, Vec<NovaAddress>>, bool) {
+    let Some(value) = value else {
+        return (BTreeMap::new(), false);
+    };
+    match value {
+        serde_json::Value::Null => (BTreeMap::new(), false),
+        serde_json::Value::Object(networks) => {
+            if networks.is_empty() {
+                // An empty map is a legitimate "this instance has no
+                // addresses" answer (the `case_openstack_no_address` shape).
+                return (BTreeMap::new(), false);
+            }
+            let mut out = BTreeMap::new();
+            let mut raw_entries = 0usize;
+            for (network, value) in networks {
+                let entries = match value {
+                    serde_json::Value::Array(items) => {
+                        raw_entries += items.len();
+                        items.as_slice()
+                    }
+                    // A single object where a list is documented: one entry.
+                    single @ serde_json::Value::Object(_) => {
+                        raw_entries += 1;
+                        std::slice::from_ref(single)
+                    }
+                    // A network whose value is not a list at all: unreadable.
+                    _ => continue,
+                };
+                let parsed: Vec<NovaAddress> = entries
+                    .iter()
+                    .filter_map(|entry| serde_json::from_value::<NovaAddress>(entry.clone()).ok())
+                    .collect();
+                if !parsed.is_empty() {
+                    out.insert(network.clone(), parsed);
+                }
+            }
+            // Entries existed but none of them yielded a dialable address:
+            // loud, not silently empty (appendix B.3/B.5).
+            let unusable = raw_entries > 0 && candidates(&out).is_empty();
+            (out, unusable)
+        }
+        _ => (BTreeMap::new(), true),
+    }
+}
+
 /// The two shapes a `GET /servers/{id}` body may take.
 ///
 /// The v2.1 reference documents the flat form, and that is what upstream
@@ -114,27 +291,27 @@ impl NovaServer {
 /// {"server": {"id": "…", "addresses": {"NET3746": [ … ]}}}
 /// ```
 ///
-/// Caught the hard way against a real cloud: decoding the envelope as a
-/// [`NovaServer`] succeeds (every field is optional) but yields *empty*
-/// `addresses`, so `[openstack] network` matched nothing and the lookup died
-/// with the misleading `reason="no_network"` — while the very same request via
-/// curl returned the addresses just fine. Accept both shapes so a wire-format
-/// difference can never again masquerade as a configuration error.
+/// Caught the hard way against a real cloud: decoding the envelope as a bare
+/// server loses `addresses`, so `[openstack] network` matched nothing and the
+/// lookup died with the misleading `reason="no_network"` — while the very same
+/// request via curl returned the addresses just fine. Accept both shapes so a
+/// wire-format difference can never again masquerade as a configuration error.
 ///
-/// The variant is chosen by **shape** (does the document carry a `server`
-/// key?), not by `#[serde(untagged)]` trial and error. Untagged falls through
-/// to the next variant whenever one fails, and because every field of
-/// [`NovaServer`] is optional, a single field of an unexpected type anywhere
-/// inside an envelope used to "successfully" decode the whole document as an
-/// empty server: the lookup then failed with `no_network` and `networks=[]`
-/// instead of naming the field that broke. That is exactly how a second real
-/// cloud (project T_3741, `"image": ""`) went dark.
+/// The shape is picked by [`decode_server`] (does the document carry a
+/// `server` key?), which then extracts every field independently — so a type
+/// surprise anywhere inside either shape surfaces as a *field-level* note (or
+/// the `addresses_present_but_unusable` flag) instead of silently emptying
+/// the document. That is how a second real cloud (project T_3741,
+/// `"image": ""`) went dark, and why it cannot again.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerResponse {
-    /// `{"server": { … }}` (classic v2 envelope).
-    Envelope { server: NovaServer },
-    /// `{ … }` (v2.1 flat document).
-    Flat(NovaServer),
+pub struct ServerResponse {
+    /// The extracted document, whichever shape it arrived in.
+    pub server: NovaServer,
+    /// See [`DecodeOutcome::addresses_present_but_unusable`]: the caller must
+    /// refuse loudly (`reason="unparseable"`) rather than dial nothing.
+    pub addresses_present_but_unusable: bool,
+    /// See [`DecodeOutcome::notes`].
+    pub notes: Vec<&'static str>,
 }
 
 impl<'de> Deserialize<'de> for ServerResponse {
@@ -143,28 +320,20 @@ impl<'de> Deserialize<'de> for ServerResponse {
         D: Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
-        match value.get("server") {
-            // Envelope: decode the nested document *strictly*, so a type
-            // surprise inside it surfaces as a decode failure (loud, logged as
-            // `reason="decode"`) rather than silently emptying `addresses`.
-            Some(inner) => NovaServer::deserialize(inner)
-                .map(|server| ServerResponse::Envelope { server })
-                .map_err(serde::de::Error::custom),
-            // Flat document: no wrapper key in sight.
-            None => NovaServer::deserialize(value)
-                .map(ServerResponse::Flat)
-                .map_err(serde::de::Error::custom),
-        }
+        decode_server(&value)
+            .map(|outcome| ServerResponse {
+                server: outcome.view,
+                addresses_present_but_unusable: outcome.addresses_present_but_unusable,
+                notes: outcome.notes,
+            })
+            .map_err(serde::de::Error::custom)
     }
 }
 
 impl ServerResponse {
     /// The enclosed [`NovaServer`], whichever shape it arrived in.
     pub fn into_server(self) -> NovaServer {
-        match self {
-            ServerResponse::Envelope { server } => server,
-            ServerResponse::Flat(server) => server,
-        }
+        self.server
     }
 }
 
@@ -187,7 +356,26 @@ impl<'de> Deserialize<'de> for ServerList {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         let array = value.get("servers").unwrap_or(&value);
-        let servers = Vec::<NovaServer>::deserialize(array).map_err(serde::de::Error::custom)?;
+        let items = array.as_array().ok_or_else(|| {
+            serde::de::Error::custom("body is neither {\"servers\":[…]} nor an array")
+        })?;
+        let servers = items
+            .iter()
+            .map(|item| {
+                let outcome = decode_server(item).map_err(serde::de::Error::custom)?;
+                // An element whose `addresses` could not be read is a body we
+                // do not understand: fail the list loudly (the caller logs
+                // `reason="decode"`) instead of carrying a silently empty
+                // instance into the exact-match filter and then dialing
+                // nothing (appendix B.5: no silent emptying, ever).
+                if outcome.addresses_present_but_unusable {
+                    return Err(serde::de::Error::custom(
+                        "a server in the list carries unreadable addresses",
+                    ));
+                }
+                Ok(outcome.view)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(ServerList { servers })
     }
 }
@@ -554,10 +742,16 @@ mod tests {
         entries.into_iter().collect()
     }
 
+    /// Decode one body the way the gateway does: JSON → `decode_server`.
+    fn decode(json: &str) -> Result<DecodeOutcome, DecodeError> {
+        let value: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        decode_server(&value)
+    }
+
     #[test]
     fn parses_single_network_single_address() {
         let json = r#"{"addresses":{"private":[{"addr":"10.0.0.7","version":4,"OS-EXT-IPS:type":"fixed"}]}}"#;
-        let server: NovaServer = serde_json::from_str(json).expect("decodes");
+        let server = decode(json).expect("decodes").view;
         assert_eq!(server.addresses.len(), 1);
         let got = select_address(
             &server.addresses,
@@ -575,7 +769,7 @@ mod tests {
 
     #[test]
     fn missing_addresses_field_decodes_as_empty() {
-        let server: NovaServer = serde_json::from_str(r#"{"id":"u"}"#).expect("decodes");
+        let server = decode(r#"{"id":"u"}"#).expect("decodes").view;
         assert!(server.addresses.is_empty());
         assert!(server.metadata.is_empty());
         assert_eq!(server.image_id(), None);
@@ -598,7 +792,7 @@ mod tests {
     fn parses_metadata_and_image() {
         let json =
             r#"{"name":"web-1","metadata":{"iris_ssh_user":"alice"},"image":{"id":"img-1"}}"#;
-        let server: NovaServer = serde_json::from_str(json).expect("decodes");
+        let server = decode(json).expect("decodes").view;
         assert_eq!(server.name.as_deref(), Some("web-1"));
         assert_eq!(server.image_id(), Some("img-1"));
         assert_eq!(
@@ -883,7 +1077,7 @@ mod tests {
     #[test]
     fn access_ips_are_parsed_from_both_legacy_fields() {
         let json = r#"{"accessIPv4":"192.0.2.55","accessIPv6":"2001:db8::9"}"#;
-        let server: NovaServer = serde_json::from_str(json).expect("decodes");
+        let server = decode(json).expect("decodes").view;
         assert_eq!(
             server.access_ips(),
             vec![
@@ -893,7 +1087,7 @@ mod tests {
         );
         // Garbage is dropped rather than dialed.
         let json = r#"{"accessIPv4":"not-an-ip","accessIPv6":""}"#;
-        let server: NovaServer = serde_json::from_str(json).expect("decodes");
+        let server = decode(json).expect("decodes").view;
         assert!(server.access_ips().is_empty());
     }
 
@@ -1104,46 +1298,66 @@ mod tests {
     }
 
     /// `server.image` in every form seen in the wild. Only the object carries
-    /// an id; the rest mean "no image" and must never fail the decode.
+    /// an id; the rest mean "no image" and must never fail the decode — the
+    /// non-object forms are noted so the caller can warn (appendix B.2).
     #[test]
     fn image_is_accepted_in_every_form_real_clouds_send() {
-        let with_id: NovaServer =
-            serde_json::from_str(r#"{"image":{"id":"img-1"}}"#).expect("object");
-        assert_eq!(with_id.image_id(), Some("img-1"));
+        let with_id = decode(r#"{"image":{"id":"img-1"}}"#).expect("object");
+        assert_eq!(with_id.view.image_id(), Some("img-1"));
+        assert!(
+            with_id.notes.is_empty(),
+            "the reference shape is not a surprise"
+        );
 
-        for body in [
-            r#"{"image":null}"#,    // documented "deleted image"
-            r#"{"image":""}"#,      // T_3741: the empty-string form
-            r#"{"image":"img-1"}"#, // a bare string is not an object we model
-            r#"{"image":42}"#,      // … and neither is this
-            r#"{}"#,                // absent key
+        for (body, noted) in [
+            (r#"{"image":null}"#, false),   // documented "deleted image"
+            (r#"{}"#, false),               // absent key
+            (r#"{"image":""}"#, true),      // T_3741: the empty-string form
+            (r#"{"image":"img-1"}"#, true), // a bare string is not an object
+            (r#"{"image":42}"#, true),      // … and neither is this
         ] {
-            let server: NovaServer =
-                serde_json::from_str(body).unwrap_or_else(|err| panic!("{body}: {err}"));
-            assert_eq!(server.image_id(), None, "{body}");
+            let outcome = decode(body).unwrap_or_else(|err| panic!("{body}: {err:?}"));
+            assert_eq!(outcome.view.image_id(), None, "{body}");
+            assert_eq!(
+                outcome.notes.contains(&"image"),
+                noted,
+                "image note for {body}: {:?}",
+                outcome.notes
+            );
         }
     }
 
-    /// The property the `untagged` dispatch used to break: a type error inside
-    /// an envelope must be a **loud** decode failure, never a silently empty
-    /// server (empty `addresses` read as `no_network` / `networks=[]`).
+    /// The property the old dispatch used to break: a broken `addresses`
+    /// shape inside either wire form must surface **loudly** — the
+    /// `addresses_present_but_unusable` flag the caller refuses on — never as
+    /// a silently empty server (empty `addresses` read as `no_network` /
+    /// `networks=[]`). Documents that are not objects at all stay hard
+    /// decode failures.
     #[test]
-    fn a_type_error_inside_an_envelope_fails_loudly_instead_of_empting_the_server() {
-        let envelope = r#"{"server":{"id":"e52bce4c","addresses":"not-a-map"}}"#;
+    fn a_broken_addresses_shape_is_loud_not_silently_empty() {
+        let envelope = decode(r#"{"server":{"id":"e52bce4c","addresses":"not-a-map"}}"#)
+            .expect("the document itself still decodes");
+        assert!(envelope.addresses_present_but_unusable);
         assert!(
-            serde_json::from_str::<ServerResponse>(envelope).is_err(),
-            "a broken inner document must not decode"
+            envelope.view.addresses.is_empty(),
+            "and yields nothing usable"
         );
 
-        let flat = r#"{"id":"x","addresses":"not-a-map"}"#;
-        assert!(
-            serde_json::from_str::<ServerResponse>(flat).is_err(),
-            "a broken flat document must not decode either"
-        );
+        let flat = decode(r#"{"id":"x","addresses":"not-a-map"}"#).expect("flat decodes");
+        assert!(flat.addresses_present_but_unusable);
 
+        // An array where a map belongs is equally unreadable.
+        let array = decode(r#"{"addresses":[1,2,3]}"#).expect("decodes");
+        assert!(array.addresses_present_but_unusable);
+
+        // Not an object at all: nothing to salvage, a decode failure.
         assert!(
             serde_json::from_str::<ServerResponse>(r#"{"server":null}"#).is_err(),
             "a null wrapper is not a server"
+        );
+        assert!(
+            serde_json::from_str::<ServerResponse>(r#"[]"#).is_err(),
+            "a bare array is not a server document"
         );
 
         // An unknown key is still ignored: clouds add fields all the time.
@@ -1151,10 +1365,134 @@ mod tests {
             r#"{"server":{"id":"x","brand_new_field":{"a":1},"addresses":{"n":[{"addr":"10.0.0.1"}]}}}"#,
         )
         .expect("unknown fields stay harmless");
+        assert!(!ok.addresses_present_but_unusable);
         assert_eq!(
             ok.into_server().addresses["n"][0].addr.as_deref(),
             Some("10.0.0.1")
         );
+    }
+
+    /// The appendix B.2 field matrix: every field is independent, so one
+    /// surprise cannot drag the document (or another field) down with it.
+    #[test]
+    fn every_field_decodes_independently_of_its_neighbours() {
+        // A name/metadata/image/accessIP surprise next to a perfectly good
+        // `addresses` map: the address must still be there.
+        let outcome = decode(
+            r#"{
+                "id": 42,
+                "name": 7,
+                "metadata": "not-a-map",
+                "image": "",
+                "accessIPv4": 17,
+                "accessIPv6": [],
+                "addresses": {"private": [{"addr": "10.0.0.7"}]}
+            }"#,
+        )
+        .expect("decodes");
+        assert!(!outcome.addresses_present_but_unusable);
+        assert_eq!(
+            outcome.view.addresses["private"][0].addr.as_deref(),
+            Some("10.0.0.7"),
+            "a broken neighbour must not cost the address"
+        );
+        assert_eq!(outcome.view.id, None, "a numeric id is dropped");
+        assert_eq!(outcome.view.name, None, "a non-string name is dropped");
+        assert!(outcome.view.metadata.is_empty());
+        assert_eq!(outcome.view.image_id(), None);
+        assert!(outcome.view.access_ips().is_empty());
+        for noted in [
+            "id",
+            "name",
+            "metadata",
+            "image",
+            "accessIPv4",
+            "accessIPv6",
+        ] {
+            assert!(
+                outcome.notes.contains(&noted),
+                "{noted} should be noted: {:?}",
+                outcome.notes
+            );
+        }
+
+        // A `null` field is "no value", not a type surprise: no note.
+        let outcome = decode(r#"{"id":"x","name":null,"image":null}"#).expect("decodes");
+        assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);
+
+        // Metadata scalars are stringified, not dropped (operators do write
+        // `{"count": 3}`); nested structures are dropped and noted.
+        let outcome =
+            decode(r#"{"metadata":{"user":"alice","restarts":3,"retired":true,"tags":["a"]}}"#)
+                .expect("decodes");
+        assert_eq!(
+            outcome.view.metadata.get("user").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            outcome.view.metadata.get("restarts").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            outcome.view.metadata.get("retired").map(String::as_str),
+            Some("true")
+        );
+        assert!(!outcome.view.metadata.contains_key("tags"));
+        assert!(outcome.notes.contains(&"metadata"));
+
+        // Only a root that is not an object at all fails.
+        for body in [r#""nova""#, r#"7"#, r#"[]"#, r#"null"#] {
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                decode_server(&value),
+                Err(DecodeError::NotAnObject),
+                "{body}"
+            );
+        }
+    }
+
+    /// The appendix B.3 shape matrix for `addresses`: "gone", "legitimately
+    /// empty" and "unreadable" are three different answers (R13).
+    #[test]
+    fn addresses_shapes_distinguish_gone_empty_and_unreadable() {
+        // Gone: missing or null — no_address later, not an error.
+        for body in [r#"{"id":"x"}"#, r#"{"addresses":null}"#] {
+            let outcome = decode(body).expect("decodes");
+            assert!(!outcome.addresses_present_but_unusable, "{body}");
+            assert!(outcome.view.addresses.is_empty(), "{body}");
+        }
+
+        // Legitimately empty: the `case_openstack_no_address` shape.
+        let outcome = decode(r#"{"addresses":{}}"#).expect("decodes");
+        assert!(!outcome.addresses_present_but_unusable);
+        assert!(outcome.view.addresses.is_empty());
+
+        // Readable: the documented shape.
+        let outcome = decode(
+            r#"{"addresses":{"private":[{"addr":"10.0.0.7","version":4,"OS-EXT-IPS:type":"fixed"}]}}"#,
+        )
+        .expect("decodes");
+        assert!(!outcome.addresses_present_but_unusable);
+
+        // Entries exist but none is a dialable address: loud, not empty.
+        let outcome = decode(r#"{"addresses":{"private":[{"addr":"not-an-ip","version":4}]}}"#)
+            .expect("decodes");
+        assert!(outcome.addresses_present_but_unusable);
+
+        // One good network next to an unreadable one keeps the good one.
+        let outcome = decode(r#"{"addresses":{"good":[{"addr":"10.0.0.1"}],"bad":"not-a-list"}}"#)
+            .expect("decodes");
+        assert!(!outcome.addresses_present_but_unusable);
+        assert_eq!(
+            outcome.view.addresses["good"][0].addr.as_deref(),
+            Some("10.0.0.1")
+        );
+
+        // IPv6 and missing type/version fields are fine: the literal is what
+        // gets dialed, the type is only a preference hint.
+        let outcome = decode(r#"{"addresses":{"v6":[{"addr":"2001:db8::7"}]}}"#).expect("decodes");
+        assert!(!outcome.addresses_present_but_unusable);
+        assert_eq!(outcome.view.addresses["v6"][0].addr_type, None);
     }
 
     // --- name lookup (appendix A.2) ---------------------------------------

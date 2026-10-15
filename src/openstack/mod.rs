@@ -378,7 +378,25 @@ impl OpenStackClient {
             // classic `{"server": {…}}` envelope (see [`ServerResponse`]) — an
             // envelope decoded as a bare server silently loses `addresses`,
             // which turned into a `no_network` refusal against a real cloud.
-            Ok(server) => Ok(server.into_server()),
+            Ok(response) => {
+                if response.addresses_present_but_unusable {
+                    // Appendix B.3/B.5: `addresses` was there but nothing
+                    // usable could be read from its shape. Refusing like an
+                    // unknown instance (NotFound) keeps the client-facing
+                    // failure homogeneous, while the log names the real cause
+                    // instead of the misleading `no_network`.
+                    tracing::warn!(
+                        target: "openstack",
+                        reason = "unparseable",
+                        route_by = "uuid",
+                        %uuid,
+                        notes = ?response.notes,
+                        "Nova returned an addresses structure this gateway could not read"
+                    );
+                    return Err(ControlError::NotFound);
+                }
+                Ok(response.into_server())
+            }
             Err(_) => {
                 tracing::warn!(
                     target: "openstack",
