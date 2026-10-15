@@ -37,8 +37,8 @@ use crate::types::{
 };
 
 use nova::{
-    exact_name_match, map_backend_user, select_address, AddressSelection, NovaServer, ServerList,
-    ServerResponse, UserMapping, UserSource,
+    decode_server, decode_server_list, exact_name_match, map_backend_user, select_address,
+    summarize_body, AddressSelection, NovaServer, UserMapping, UserSource,
 };
 
 /// Refresh a token this long before its advertised expiry: a token that dies
@@ -373,36 +373,50 @@ impl OpenStackClient {
                 uuid,
             )
             .await?;
-        match resp.json::<ServerResponse>().await {
-            // Both wire shapes are accepted: the flat v2.1 document and the
-            // classic `{"server": {…}}` envelope (see [`ServerResponse`]) — an
-            // envelope decoded as a bare server silently loses `addresses`,
-            // which turned into a `no_network` refusal against a real cloud.
-            Ok(response) => {
-                if response.addresses_present_but_unusable {
-                    // Appendix B.3/B.5: `addresses` was there but nothing
-                    // usable could be read from its shape. Refusing like an
-                    // unknown instance (NotFound) keeps the client-facing
-                    // failure homogeneous, while the log names the real cause
-                    // instead of the misleading `no_network`.
-                    tracing::warn!(
-                        target: "openstack",
-                        reason = "unparseable",
-                        route_by = "uuid",
-                        %uuid,
-                        notes = ?response.notes,
-                        "Nova returned an addresses structure this gateway could not read"
-                    );
-                    return Err(ControlError::NotFound);
-                }
-                Ok(response.into_server())
-            }
+        let raw_len = resp.content_length().unwrap_or(0) as usize;
+        let value: serde_json::Value = match resp.json().await {
+            Ok(value) => value,
             Err(_) => {
                 tracing::warn!(
                     target: "openstack",
                     reason = "decode",
                     route_by = "uuid",
                     %uuid,
+                    "Nova server response was not JSON"
+                );
+                return Err(ControlError::Decode);
+            }
+        };
+        match decode_server(&value) {
+            // Both wire shapes are accepted (see [`ServerResponse`]): the flat
+            // v2.1 document and the classic `{"server": {…}}` envelope.
+            Ok(outcome) if outcome.addresses_present_but_unusable => {
+                // Appendix B.3/B.5: `addresses` was there but nothing usable
+                // could be read from its shape. Refusing like an unknown
+                // instance (NotFound) keeps the client-facing failure
+                // homogeneous, while the log names the real cause instead of
+                // the misleading `no_network` — with a structural summary,
+                // never the body (red line B.7.5).
+                tracing::warn!(
+                    target: "openstack",
+                    reason = "unparseable",
+                    route_by = "uuid",
+                    %uuid,
+                    summary = %summarize_body(&value, raw_len),
+                    notes = ?outcome.notes,
+                    "Nova returned an addresses structure this gateway could not read"
+                );
+                Err(ControlError::NotFound)
+            }
+            Ok(outcome) => Ok(outcome.view),
+            Err(err) => {
+                tracing::warn!(
+                    target: "openstack",
+                    reason = "decode",
+                    route_by = "uuid",
+                    %uuid,
+                    error = %err,
+                    summary = %summarize_body(&value, raw_len),
                     "Nova server response could not be decoded"
                 );
                 Err(ControlError::Decode)
@@ -432,20 +446,36 @@ impl OpenStackClient {
                 name,
             )
             .await?;
-        let list = match resp.json::<ServerList>().await {
-            Ok(list) => list,
+        let raw_len = resp.content_length().unwrap_or(0) as usize;
+        let value: serde_json::Value = match resp.json().await {
+            Ok(value) => value,
             Err(_) => {
                 tracing::warn!(
                     target: "openstack",
                     reason = "decode",
                     route_by = "name",
                     principal = %name,
+                    "Nova server-list response was not JSON"
+                );
+                return Err(ControlError::Decode);
+            }
+        };
+        let servers = match decode_server_list(&value) {
+            Ok(servers) => servers,
+            Err(err) => {
+                tracing::warn!(
+                    target: "openstack",
+                    reason = "decode",
+                    route_by = "name",
+                    principal = %name,
+                    error = %err,
+                    summary = %summarize_body(&value, raw_len),
                     "Nova server-list response could not be decoded"
                 );
                 return Err(ControlError::Decode);
             }
         };
-        match exact_name_match(list.servers, name) {
+        match exact_name_match(servers, name) {
             Ok(server) => Ok(server),
             Err(err) => {
                 // Zero matches and "several machines share this name" are both
@@ -948,6 +978,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
     struct Response {
         status: u16,
         headers: Vec<(String, String)>,
@@ -975,6 +1006,15 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body: String::new(),
+            }
+        }
+        /// A 200 whose body is not JSON (an HTML error page, a proxy
+        /// interstitial). Appendix B: must surface as a decode failure.
+        fn non_json(status: u16, body: &str) -> Self {
+            Response {
+                status,
+                headers: vec![("Content-Type".into(), "text/html".into())],
+                body: body.to_owned(),
             }
         }
     }
@@ -1773,6 +1813,56 @@ mod tests {
             paths.iter().all(|p| !p.contains("?name=")),
             "a UUID must never be looked up by name: {paths:?}"
         );
+    }
+
+    /// A 200 body the gateway cannot use must fail loudly at the lookup, and
+    /// the client-facing outcome must stay homogeneous (appendix B.4 / red
+    /// line B.7.3): unreadable `addresses` is a NotFound, like "no such
+    /// instance"; a body that is not even JSON is a Decode failure.
+    #[tokio::test]
+    async fn an_unusable_200_body_fails_loudly_and_homogeneously() {
+        async fn resolve_with_server_body(body: Response) -> ControlError {
+            let base = Arc::new(OnceLock::<String>::new());
+            let base_for_handler = Arc::clone(&base);
+            let server = MockHttp::start(move |request| {
+                let base = base_for_handler.get().cloned().unwrap_or_default();
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/v3/auth/tokens") => Response::token(
+                        "subject-token",
+                        &token_body("2099-01-01T00:00:00.000000Z", &base),
+                    ),
+                    ("GET", path) if path.starts_with("/v2.1/servers/") => body.clone(),
+                    _ => Response::json(404, "{}"),
+                }
+            });
+            base.set(server.url("")).expect("base url set");
+            let base = base.get().expect("base").clone();
+            let client = OpenStackClient::new(os_config(&urls(&base))).expect("client");
+            client.resolve(&req(UUID)).await.expect_err("must fail")
+        }
+
+        // A 200 that is not JSON at all (an HTML proxy page, say).
+        let err = resolve_with_server_body(Response::non_json(
+            200,
+            "<html><body>upstream proxy error</body></html>",
+        ))
+        .await;
+        assert_eq!(
+            err,
+            ControlError::Decode,
+            "a body that is not JSON is unreadable"
+        );
+
+        // Valid JSON, but `addresses` is a string: the flag path — NotFound
+        // for the client (homogeneous), `unparseable` in the log.
+        let err =
+            resolve_with_server_body(Response::json(200, r#"{"id":"x","addresses":"not-a-map"}"#))
+                .await;
+        assert_eq!(err, ControlError::NotFound);
+
+        // A JSON scalar is not a server document either.
+        let err = resolve_with_server_body(Response::json(200, "42")).await;
+        assert_eq!(err, ControlError::Decode);
     }
 
     #[tokio::test]

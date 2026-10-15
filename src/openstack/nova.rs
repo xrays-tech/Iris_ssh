@@ -79,13 +79,24 @@ impl NovaServer {
 /// this is a decode failure, not a field-level surprise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
+    /// The root (or the enveloped document) is not a JSON object.
     NotAnObject,
+    /// The body is neither `{"servers": [ … ]}` nor a bare array.
+    NotAList,
+    /// A server in the list carries `addresses` that could not be read.
+    UnreadableAddresses,
 }
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeError::NotAnObject => write!(f, "server document is not a JSON object"),
+            DecodeError::NotAList => {
+                write!(f, "body is neither {{\"servers\":[…]}} nor an array")
+            }
+            DecodeError::UnreadableAddresses => {
+                write!(f, "a server in the list carries unreadable addresses")
+            }
         }
     }
 }
@@ -265,7 +276,20 @@ fn addr_map_from_value(
                 };
                 let parsed: Vec<NovaAddress> = entries
                     .iter()
-                    .filter_map(|entry| serde_json::from_value::<NovaAddress>(entry.clone()).ok())
+                    .filter_map(|entry| match entry {
+                        serde_json::Value::Object(_) => {
+                            serde_json::from_value::<NovaAddress>(entry.clone()).ok()
+                        }
+                        // Extreme defence: some API-compat layers flatten an
+                        // entry down to the bare IP literal. The literal is
+                        // what would be dialed, so honour it (appendix B.3).
+                        serde_json::Value::String(raw) => Some(NovaAddress {
+                            addr: Some(raw.clone()),
+                            version: None,
+                            addr_type: None,
+                        }),
+                        _ => None,
+                    })
                     .collect();
                 if !parsed.is_empty() {
                     out.insert(network.clone(), parsed);
@@ -349,35 +373,89 @@ pub struct ServerList {
     pub servers: Vec<NovaServer>,
 }
 
+/// Decode a `GET /servers?name=…` body (plan-openstack appendix B.6).
+///
+/// The documented shape is `{"servers":[ … ]}`; some API-compat layers answer
+/// with a bare array. Elements are *bare* server documents — never enveloped —
+/// so each one goes through [`decode_server`]. A 200 whose body is neither
+/// shape is a decode failure, never an empty list: "zero instances" and "a
+/// body we could not read" must not look the same to the caller.
+pub fn decode_server_list(value: &serde_json::Value) -> Result<Vec<NovaServer>, DecodeError> {
+    let array = value.get("servers").unwrap_or(value);
+    let items = array.as_array().ok_or(DecodeError::NotAList)?;
+    items
+        .iter()
+        .map(|item| {
+            let outcome = decode_server(item)?;
+            // An element whose `addresses` could not be read is a body we do
+            // not understand: fail the list loudly (the caller logs
+            // `reason="decode"`) instead of carrying a silently empty
+            // instance into the exact-match filter and then dialing nothing
+            // (appendix B.5: no silent emptying, ever).
+            if outcome.addresses_present_but_unusable {
+                return Err(DecodeError::UnreadableAddresses);
+            }
+            Ok(outcome.view)
+        })
+        .collect()
+}
+
 impl<'de> Deserialize<'de> for ServerList {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
-        let array = value.get("servers").unwrap_or(&value);
-        let items = array.as_array().ok_or_else(|| {
-            serde::de::Error::custom("body is neither {\"servers\":[…]} nor an array")
-        })?;
-        let servers = items
-            .iter()
-            .map(|item| {
-                let outcome = decode_server(item).map_err(serde::de::Error::custom)?;
-                // An element whose `addresses` could not be read is a body we
-                // do not understand: fail the list loudly (the caller logs
-                // `reason="decode"`) instead of carrying a silently empty
-                // instance into the exact-match filter and then dialing
-                // nothing (appendix B.5: no silent emptying, ever).
-                if outcome.addresses_present_but_unusable {
-                    return Err(serde::de::Error::custom(
-                        "a server in the list carries unreadable addresses",
-                    ));
-                }
-                Ok(outcome.view)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ServerList { servers })
+        decode_server_list(&value)
+            .map(|servers| ServerList { servers })
+            .map_err(serde::de::Error::custom)
     }
+}
+
+/// A structural summary of a response body, safe to log (plan-openstack
+/// appendix B.4 / red line 5: never the body itself — it can carry tenant
+/// names, IPs and other data an operator's log pipeline should not receive).
+///
+/// Top-level keys, whether a `server` key is present, the JSON type of
+/// `addresses`, the number of networks, and the body length as reported by
+/// the transport (`0` when the server did not send a Content-Length). Enough
+/// to tell "envelope vs flat", "addresses was a string", or "a 200 with an
+/// empty body" apart at a glance — never enough to reconstruct the instance.
+pub fn summarize_body(value: &serde_json::Value, raw_len: usize) -> String {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    // A cloud may add dozens of keys; the log line stays bounded.
+    let truncated = keys.len() > 12;
+    keys.truncate(12);
+
+    let doc = value.get("server").unwrap_or(value);
+    let addresses = doc.get("addresses");
+    let addresses_type = match addresses {
+        None => "missing",
+        Some(serde_json::Value::Null) => "null",
+        Some(serde_json::Value::Object(_)) => "object",
+        Some(serde_json::Value::Array(_)) => "array",
+        Some(serde_json::Value::String(_)) => "string",
+        Some(serde_json::Value::Number(_)) => "number",
+        Some(serde_json::Value::Bool(_)) => "bool",
+    };
+    let networks = addresses
+        .and_then(|value| value.as_object())
+        .map(|networks| networks.len())
+        .unwrap_or(0);
+
+    format!(
+        "keys=[{}{}] has_server={} addresses={} networks={} len={}",
+        keys.join(","),
+        if truncated { ",…" } else { "" },
+        value.get("server").is_some(),
+        addresses_type,
+        networks,
+        raw_len,
+    )
 }
 
 /// Why a `?name=` lookup did not yield exactly one instance
@@ -1493,6 +1571,112 @@ mod tests {
         let outcome = decode(r#"{"addresses":{"v6":[{"addr":"2001:db8::7"}]}}"#).expect("decodes");
         assert!(!outcome.addresses_present_but_unusable);
         assert_eq!(outcome.view.addresses["v6"][0].addr_type, None);
+    }
+
+    // --- lenient extraction + loud summaries (appendix B.3 / B.4) ---------
+
+    #[test]
+    fn bare_string_address_entries_are_honoured_as_ip_literals() {
+        // Some API-compat layers flatten an entry down to the bare IP.
+        let outcome =
+            decode(r#"{"addresses":{"private":["10.0.0.7","2001:db8::7"]}}"#).expect("decodes");
+        assert!(!outcome.addresses_present_but_unusable);
+        assert_eq!(outcome.view.addresses["private"].len(), 2);
+        let got = select_address(
+            &outcome.view.addresses,
+            &[],
+            &selection(
+                "",
+                AddressFamily::IPv4,
+                IpPrefer::Floating,
+                OnAmbiguous::Reject,
+            ),
+        )
+        .expect("the literal is what gets dialed");
+        assert_eq!(got, "10.0.0.7".parse::<IpAddr>().unwrap());
+
+        // Mixing an object entry and a bare string in one network works too.
+        let outcome = decode(r#"{"addresses":{"private":[{"addr":"10.0.0.1"},"10.0.0.2"]}}"#)
+            .expect("decodes");
+        assert!(!outcome.addresses_present_but_unusable);
+        assert_eq!(outcome.view.addresses["private"].len(), 2);
+
+        // A bare string that is not an IP is dropped; with nothing else left
+        // in the map, that is still the loud "unreadable" answer.
+        let outcome = decode(r#"{"addresses":{"private":["not-an-ip"]}}"#).expect("decodes");
+        assert!(outcome.addresses_present_but_unusable);
+    }
+
+    #[test]
+    fn decode_server_list_matches_the_deserialize_entry_point() {
+        let value = serde_json::json!({"servers":[{"name":"a"},{"name":"b"}]});
+        assert_eq!(
+            decode_server_list(&value).expect("documented shape").len(),
+            2
+        );
+        let bare = serde_json::json!([{"name":"a"}]);
+        assert_eq!(decode_server_list(&bare).expect("bare array").len(), 1);
+
+        // Neither shape: a decode failure, never an empty list.
+        assert_eq!(
+            decode_server_list(&serde_json::json!({"error": {"code": 404}})),
+            Err(DecodeError::NotAList)
+        );
+        assert_eq!(
+            decode_server_list(&serde_json::json!({"servers": "not-an-array"})),
+            Err(DecodeError::NotAList)
+        );
+        // An element with unreadable addresses fails the whole list loudly.
+        let broken = serde_json::json!({"servers": [{"name": "a", "addresses": "not-a-map"}]});
+        assert_eq!(
+            decode_server_list(&broken),
+            Err(DecodeError::UnreadableAddresses)
+        );
+    }
+
+    #[test]
+    fn summarize_body_reports_shape_without_the_body() {
+        // The real envelope: has_server, addresses type, network count, length.
+        let value: serde_json::Value = serde_json::from_str(REAL_ENVELOPE).expect("fixture");
+        let summary = summarize_body(&value, 1234);
+        assert!(summary.contains("has_server=true"), "{summary}");
+        assert!(summary.contains("addresses=object"), "{summary}");
+        assert!(summary.contains("networks=1"), "{summary}");
+        assert!(summary.contains("len=1234"), "{summary}");
+        // Red line B.7.5: none of the body's data — not the instance id, not
+        // the address, not the network name — may appear in the summary.
+        assert!(!summary.contains("d702cf44"), "{summary}");
+        assert!(!summary.contains("172.16.46.25"), "{summary}");
+        assert!(!summary.contains("NET3746"), "{summary}");
+
+        // Flat document, with data that must stay out of the log line.
+        let value = serde_json::json!({
+            "id": "e52bce4c",
+            "metadata": {"iris_ssh_user": "alice"},
+            "addresses": {"private": [{"addr": "10.0.0.7"}]}
+        });
+        let summary = summarize_body(&value, 99);
+        assert!(summary.contains("has_server=false"), "{summary}");
+        assert!(summary.contains("networks=1"), "{summary}");
+        assert!(!summary.contains("alice"), "{summary}");
+        assert!(!summary.contains("e52bce4c"), "{summary}");
+
+        // An addresses string reads as `addresses=string`, networks=0 — the
+        // shape that used to masquerade as `no_network`.
+        let value = serde_json::json!({"id": "x", "addresses": "not-a-map"});
+        let summary = summarize_body(&value, 12);
+        assert!(summary.contains("addresses=string"), "{summary}");
+        assert!(summary.contains("networks=0"), "{summary}");
+
+        // Key listing is bounded: a chatty cloud cannot flood the log.
+        let object: serde_json::Map<String, serde_json::Value> = (0..20)
+            .map(|i| (format!("k{i:02}"), serde_json::json!(i)))
+            .collect();
+        let summary = summarize_body(&serde_json::Value::Object(object), 5);
+        assert!(summary.contains("k00"), "{summary}");
+        assert!(summary.contains("k11"), "{summary}");
+        assert!(!summary.contains("k19"), "{summary}");
+        assert!(summary.contains('…'), "{summary}");
     }
 
     // --- name lookup (appendix A.2) ---------------------------------------
