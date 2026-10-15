@@ -48,6 +48,11 @@ pub struct NovaServer {
     pub image: Option<NovaImage>,
     pub access_ipv4: Option<String>,
     pub access_ipv6: Option<String>,
+    /// The project the instance lives in. Purely diagnostic: under
+    /// `scope = "cross_project"` the gateway is looking at instances from
+    /// every project its roles allow, and this says which one it found.
+    /// Never used for authorization or address selection.
+    pub tenant_id: Option<String>,
 }
 
 impl NovaServer {
@@ -141,6 +146,7 @@ pub fn decode_server(value: &serde_json::Value) -> Result<DecodeOutcome, DecodeE
     let image_id = image_id_from_value(doc.get("image"), &mut notes);
     let access_ipv4 = string_from_value(doc.get("accessIPv4"), "accessIPv4", &mut notes);
     let access_ipv6 = string_from_value(doc.get("accessIPv6"), "accessIPv6", &mut notes);
+    let tenant_id = string_from_value(doc.get("tenant_id"), "tenant_id", &mut notes);
     let (addresses, addresses_present_but_unusable) = addr_map_from_value(doc.get("addresses"));
 
     Ok(DecodeOutcome {
@@ -154,6 +160,7 @@ pub fn decode_server(value: &serde_json::Value) -> Result<DecodeOutcome, DecodeE
             }),
             access_ipv4,
             access_ipv6,
+            tenant_id,
         },
         addresses_present_but_unusable,
         notes,
@@ -1244,12 +1251,21 @@ mod tests {
             },
             "accessIPv4": "",
             "accessIPv6": "",
+            // The capture carries a tenant, so the flat sibling must too.
+            "tenant_id": "a070dab7800e4eff88ad72e11f864471",
         });
         let flat: ServerResponse = serde_json::from_value(flat).expect("flat decodes");
+        let envelope = envelope.into_server();
+        let flat = flat.into_server();
         assert_eq!(
-            envelope.into_server(),
-            flat.into_server(),
+            envelope, flat,
             "shape must not affect the parsed server"
+        );
+        // …and the field actually round-tripped, rather than both sides
+        // agreeing on "absent".
+        assert_eq!(
+            envelope.tenant_id.as_deref(),
+            Some("a070dab7800e4eff88ad72e11f864471")
         );
     }
 

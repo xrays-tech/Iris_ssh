@@ -30,7 +30,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use serde::Deserialize;
 
-use crate::config::{EndpointInterface, OpenStackAuthMethod, OpenStackConfig, RouteKind};
+use crate::config::{
+    EndpointInterface, OpenStackAuthMethod, OpenStackConfig, OpenStackScope, RouteKind,
+};
 use crate::resolve::ControlError;
 use crate::types::{
     is_instance_name, is_instance_uuid, Policy, ResolveRequest, ResolveResponse, Target,
@@ -38,7 +40,7 @@ use crate::types::{
 
 use nova::{
     decode_server, decode_server_list, exact_name_match, map_backend_user, select_address,
-    summarize_body, AddressSelection, NovaServer, UserMapping, UserSource,
+    summarize_body, AddressSelection, NameLookupError, NovaServer, UserMapping, UserSource,
 };
 
 /// Refresh a token this long before its advertised expiry: a token that dies
@@ -428,7 +430,7 @@ impl OpenStackClient {
             .nova_get(
                 token,
                 &format!("/servers/{uuid}"),
-                None,
+                &self.nova_query(&[]),
                 RouteKind::Uuid,
                 uuid,
             )
@@ -501,7 +503,7 @@ impl OpenStackClient {
             .nova_get(
                 token,
                 "/servers",
-                Some(("name", name)),
+                &self.nova_query(&[("name", name)]),
                 RouteKind::Name,
                 name,
             )
@@ -568,16 +570,55 @@ impl OpenStackClient {
                 // Zero matches and "several machines share this name" are both
                 // `not_found` from the outside; only the log distinguishes
                 // them, so a name guesser learns nothing (appendix A.3).
+                //
+                // Under `cross_project` the search spanned every project the
+                // roles allow, so a collision is far likelier and the operator
+                // needs to be told which mode it happened in — hence a distinct
+                // token rather than a `scope=` field (appendix C.8 decision 3).
                 tracing::warn!(
                     target: "openstack",
-                    reason = err.reason(),
+                    reason = Self::ambiguity_reason(&err, self.cfg.scope),
                     route_by = "name",
                     principal = %name,
+                    scope = self.cfg.scope.as_str(),
                     "name lookup did not yield exactly one instance"
                 );
                 Err(ControlError::NotFound)
             }
         }
+    }
+
+    /// Map a name-lookup failure to a stable log reason, distinguishing the
+    /// cross-project case (appendix C.8 decision 3): a collision under
+    /// `scope = "cross_project"` searched every project the roles allow, so it
+    /// deserves its own token so an operator can tell which mode it happened
+    /// in. The client always sees the same homogeneous refusal either way.
+    fn ambiguity_reason(err: &NameLookupError, scope: OpenStackScope) -> &'static str {
+        if matches!(err, NameLookupError::AmbiguousName) && scope == OpenStackScope::CrossProject {
+            return "ambiguous_name_cross_project";
+        }
+        match err {
+            NameLookupError::NotFound => "not_found",
+            NameLookupError::AmbiguousName => "ambiguous_name",
+        }
+    }
+
+    /// The query parameters a Nova request needs, per scope.
+    ///
+    /// `single_project` is byte-for-byte what it always was: whatever the
+    /// caller asked for, nothing more. `cross_project` adds `all_tenants=1`,
+    /// which is the whole point of the lab mode — Nova then answers from every
+    /// project the token's roles allow (appendix C.3.1).
+    ///
+    /// The value is a constant and the key is a constant; the caller's
+    /// parameters still reach reqwest as *values*, which percent-encodes them,
+    /// so this widens nothing about what can be injected (appendix A.3).
+    fn nova_query<'a>(&'a self, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut query: Vec<(&'a str, &'a str)> = extra.to_vec();
+        if self.cfg.scope == OpenStackScope::CrossProject {
+            query.push(("all_tenants", "1"));
+        }
+        query
     }
 
     /// One Nova `GET`, with the shared "refresh the token once on 401" and
@@ -590,7 +631,7 @@ impl OpenStackClient {
         &self,
         mut token: CachedToken,
         path: &str,
-        query: Option<(&str, &str)>,
+        query: &[(&str, &str)],
         route_by: RouteKind,
         principal: &str,
     ) -> Result<reqwest::Response, ControlError> {
@@ -606,9 +647,10 @@ impl OpenStackClient {
                         .header("X-Auth-Token", token.value.as_str())
                         .header("OpenStack-API-Version", format!("compute {microversion}"))
                         .header("X-OpenStack-Nova-API-Version", microversion);
-                    match query {
-                        Some((key, value)) => request.query(&[(key, value)]),
-                        None => request,
+                    if query.is_empty() {
+                        request
+                    } else {
+                        request.query(query)
                     }
                 })
                 .await?;
@@ -850,6 +892,11 @@ impl OpenStackClient {
             target: "openstack",
             principal,
             route_by = route.as_str(),
+            scope = self.cfg.scope.as_str(),
+            // Diagnostic only: under `cross_project` this says which of the
+            // many visible projects the instance came from. It never decides
+            // anything — the address above is still the only host dialed.
+            tenant_id = server.tenant_id.as_deref().unwrap_or(""),
             %addr,
             user = %choice.user,
             source = choice.source.as_str(),
@@ -1842,6 +1889,210 @@ mod tests {
             "{urls}\nroute_by = [\"uuid\", \"name\"]",
             urls = urls(base)
         ))
+    }
+
+    /// A config that also enables the cross-project lab mode (appendix C).
+    fn os_config_cross_project(base: &str) -> OpenStackConfig {
+        os_config(&format!(
+            "{urls}\nroute_by = [\"uuid\", \"name\"]\nscope = \"cross_project\"\n\
+             auth_method = \"password\"\nusername = \"ops-admin\"\n\
+             password = \"hunter2\"\nproject_id = \"proj-1\"",
+            urls = urls(base)
+        ))
+    }
+
+    // --- cross_project Nova wiring (appendix C.3) --------------------------
+
+    #[test]
+    fn all_tenants_is_added_only_under_cross_project() {
+        // The query is the SSRF-relevant surface: the caller's parameters are
+        // values, and the extra one is a constant pair this module owns.
+        let base = "http://nova.example:8774";
+        let single = OpenStackClient::new(os_config(&urls(base))).expect("client");
+        assert_eq!(
+            single.nova_query(&[]),
+            vec![],
+            "single_project must add nothing at all"
+        );
+        assert_eq!(
+            single.nova_query(&[("name", "web-1")]),
+            vec![("name", "web-1")],
+            "single_project passes the caller's parameters through untouched"
+        );
+
+        let cross = OpenStackClient::new(os_config_cross_project(base)).expect("client");
+        assert_eq!(
+            cross.nova_query(&[]),
+            vec![("all_tenants", "1")],
+            "cross_project asks Nova for every tenant"
+        );
+        assert_eq!(
+            cross.nova_query(&[("name", "web-1")]),
+            vec![("name", "web-1"), ("all_tenants", "1")],
+            "…without disturbing the parameters the caller asked for"
+        );
+
+        // The name route is what turns a caller string into a query value, so
+        // it is the one that matters for injection: the path stays the literal
+        // `/servers` and the name stays a value (appendix A.3).
+        for scope_cfg in [
+            os_config(&urls(base)),
+            os_config_cross_project(base),
+        ] {
+            let client = OpenStackClient::new(scope_cfg).expect("client");
+            for name in ["web-1", "a&all_tenants=1", "a?all_tenants=1", "../../etc/passwd"] {
+                let query = client.nova_query(&[("name", name)]);
+                assert_eq!(
+                    query.first().copied(),
+                    Some(("name", name)),
+                    "the caller's string survives as a *value*, never a key"
+                );
+            }
+        }
+    }
+
+    /// A list body whose instances each carry a `tenant_id`.
+    const TENANTED_INSTANCES: &str = r#"[
+        {"id":"i-a","name":"web-1","tenant_id":"proj-a","addresses":{"private":[{"addr":"10.0.0.7","version":4,"OS-EXT-IPS:type":"fixed"}]},"metadata":{},"image":{"id":"img-1"}},
+        {"id":"i-b","name":"web-1","tenant_id":"proj-b","addresses":{"private":[{"addr":"10.0.0.9","version":4,"OS-EXT-IPS:type":"fixed"}]},"metadata":{},"image":{"id":"img-1"}}
+    ]"#;
+
+    /// A name that resolves to exactly one instance, which lives in another
+    /// project — visible only because `all_tenants=1` was sent.
+    const ONE_TENANTED_INSTANCE: &str = r#"[
+        {"id":"i-b","name":"web-1","tenant_id":"proj-b","addresses":{"private":[{"addr":"10.0.0.9","version":4,"OS-EXT-IPS:type":"fixed"}]},"metadata":{},"image":{"id":"img-1"}}
+    ]"#;
+
+    /// A mock that answers the list route from a table, recording the query
+    /// it received so the test can assert on `all_tenants`.
+    fn keystone_and_nova_list_recording(
+        expires_at: String,
+        instances: &'static str,
+    ) -> (MockHttp, Arc<OnceLock<String>>) {
+        let base = Arc::new(OnceLock::<String>::new());
+        let base_for_handler = Arc::clone(&base);
+        let server = MockHttp::start(move |request| {
+            let base = base_for_handler.get().cloned().unwrap_or_default();
+            let method = request.method.as_str();
+            let path = request.path.as_str();
+            if method == "POST" && path == "/v3/auth/tokens" {
+                return Response::token("subject-token", &token_body(&expires_at, &base));
+            }
+            if method == "GET" && path.starts_with("/v2.1/servers?") {
+                let needle = name_query_of(path).unwrap_or_default();
+                let all: Vec<serde_json::Value> =
+                    serde_json::from_str(instances).expect("instance fixtures");
+                let matched: Vec<&serde_json::Value> = all
+                    .iter()
+                    .filter(|server| {
+                        server["name"]
+                            .as_str()
+                            .is_some_and(|name| name.contains(&needle))
+                    })
+                    .collect();
+                return Response::json(200, &serde_json::json!({ "servers": matched }).to_string());
+            }
+            Response::json(404, "{}")
+        });
+        base.set(server.url("")).expect("base url set");
+        (server, base)
+    }
+
+    /// Read one value back out of a recorded query string, decoded the way
+    /// form-encoding does.
+    fn query_value_of(path: &str, key: &str) -> Option<String> {
+        let (_, query) = path.split_once('?')?;
+        let prefix = format!("{key}=");
+        query.split('&').find_map(|pair| {
+            pair.strip_prefix(&prefix)
+                .map(|value| percent_decode(value))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_cross_project_lookup_asks_nova_for_every_tenant() {
+        let (mock, base) = keystone_and_nova_list_recording(
+            "2099-01-01T00:00:00.000000Z".to_owned(),
+            ONE_TENANTED_INSTANCE,
+        );
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_cross_project(&base)).expect("client");
+
+        let grant = client
+            .resolve(&req("web-1"))
+            .await
+            .expect("resolves across projects");
+        assert_eq!(grant.target.host, "10.0.0.9");
+
+        let list = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path.starts_with("/v2.1/servers?"))
+            .expect("the name route listed servers");
+        assert_eq!(
+            query_value_of(&list.path, "all_tenants").as_deref(),
+            Some("1"),
+            "cross_project must send all_tenants=1: {}",
+            list.path
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_project_lookup_never_sends_all_tenants() {
+        let (mock, base) = keystone_and_nova_list(
+            "2099-01-01T00:00:00.000000Z".to_owned(),
+            NAME_INSTANCES,
+        );
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
+        client.resolve(&req("inst-1")).await.expect("resolves");
+
+        let list = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path.starts_with("/v2.1/servers?"))
+            .expect("the name route listed servers");
+        assert_eq!(
+            query_value_of(&list.path, "all_tenants"),
+            None,
+            "single_project must not widen visibility: {}",
+            list.path
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_shared_across_projects_is_refused_with_its_own_reason() {
+        // Two projects, one name: `cross_project` sees both and must refuse
+        // rather than pick one. The client still sees a plain refusal.
+        let (mock, base) =
+            keystone_and_nova_list_recording("2099-01-01T00:00:00.000000Z".to_owned(), TENANTED_INSTANCES);
+        let base = base.get().expect("base").clone();
+        let client = OpenStackClient::new(os_config_cross_project(&base)).expect("client");
+
+        let err = client.resolve(&req("web-1")).await.expect_err("ambiguous");
+        assert_eq!(err, ControlError::NotFound);
+        let _ = mock;
+    }
+
+    #[test]
+    fn tenant_id_is_extracted_leniently() {
+        // Present as a string: kept. Missing / null / wrong type: absent, and
+        // the rest of the document still decodes (appendix B.2).
+        let out = decode_server(&serde_json::json!({
+            "id": "i-1", "name": "web-1", "tenant_id": "proj-42",
+            "addresses": {"private": [{"addr": "10.0.0.7", "version": 4}]}
+        }))
+        .expect("decodes");
+        assert_eq!(out.view.tenant_id.as_deref(), Some("proj-42"));
+
+        for body in [
+            serde_json::json!({"id": "i-1", "addresses": {}}),
+            serde_json::json!({"id": "i-1", "tenant_id": null, "addresses": {}}),
+            serde_json::json!({"id": "i-1", "tenant_id": 7, "addresses": {}}),
+        ] {
+            let out = decode_server(&body).expect("still decodes");
+            assert_eq!(out.view.tenant_id, None, "for {body}");
+        }
     }
 
     #[tokio::test]
