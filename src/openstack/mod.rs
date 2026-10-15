@@ -346,14 +346,13 @@ impl OpenStackClient {
                 "secret": self.cfg.application_credential_secret,
             }
         });
-        let mut auth = serde_json::json!({ "identity": identity });
-        // `scope` sits beside `identity` (Keystone v3 shape). It is the
-        // blast-radius gate that limits which instances this gateway can
-        // even see, so it is sent whenever it is configured.
-        if !self.cfg.project_id.is_empty() {
-            auth["scope"] = serde_json::json!({ "project": { "id": self.cfg.project_id } });
-        }
-        serde_json::json!({ "auth": auth })
+        // No `scope` is sent: an application credential is already scoped to
+        // the project it was created in — that scope *is* the blast radius,
+        // fixed at credential creation, so a request-time scope adds nothing.
+        // Keystone also *rejects* an explicit scope on this method with a 401
+        // ("Application credentials cannot request a scope" — observed on the
+        // real Keystone v3.14; the in-repo mock never enforced the rule).
+        serde_json::json!({ "auth": { "identity": identity } })
     }
 
     // --- Nova --------------------------------------------------------------
@@ -1094,11 +1093,10 @@ mod tests {
         assert!(keystone.body.contains("application_credential"));
         assert!(keystone.body.contains("cred-secret"));
         assert!(
-            keystone.body.contains("\"scope\""),
-            "project scope is sent: {}",
+            !keystone.body.contains("\"scope\""),
+            "no scope for application credentials (Keystone 401s it): {}",
             keystone.body
         );
-        assert!(keystone.body.contains("proj-1"));
 
         let nova = &requests[1];
         assert_eq!(nova.path, format!("/v2.1/servers/{UUID}"));
