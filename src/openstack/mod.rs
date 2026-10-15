@@ -1935,12 +1935,14 @@ mod tests {
         // The name route is what turns a caller string into a query value, so
         // it is the one that matters for injection: the path stays the literal
         // `/servers` and the name stays a value (appendix A.3).
-        for scope_cfg in [
-            os_config(&urls(base)),
-            os_config_cross_project(base),
-        ] {
+        for scope_cfg in [os_config(&urls(base)), os_config_cross_project(base)] {
             let client = OpenStackClient::new(scope_cfg).expect("client");
-            for name in ["web-1", "a&all_tenants=1", "a?all_tenants=1", "../../etc/passwd"] {
+            for name in [
+                "web-1",
+                "a&all_tenants=1",
+                "a?all_tenants=1",
+                "../../etc/passwd",
+            ] {
                 let query = client.nova_query(&[("name", name)]);
                 assert_eq!(
                     query.first().copied(),
@@ -2003,10 +2005,9 @@ mod tests {
     fn query_value_of(path: &str, key: &str) -> Option<String> {
         let (_, query) = path.split_once('?')?;
         let prefix = format!("{key}=");
-        query.split('&').find_map(|pair| {
-            pair.strip_prefix(&prefix)
-                .map(|value| percent_decode(value))
-        })
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&prefix).map(percent_decode))
     }
 
     #[tokio::test]
@@ -2039,10 +2040,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_single_project_lookup_never_sends_all_tenants() {
-        let (mock, base) = keystone_and_nova_list(
-            "2099-01-01T00:00:00.000000Z".to_owned(),
-            NAME_INSTANCES,
-        );
+        let (mock, base) =
+            keystone_and_nova_list("2099-01-01T00:00:00.000000Z".to_owned(), NAME_INSTANCES);
         let base = base.get().expect("base").clone();
         let client = OpenStackClient::new(os_config_with_names(&base)).expect("client");
         client.resolve(&req("inst-1")).await.expect("resolves");
@@ -2064,8 +2063,10 @@ mod tests {
     async fn a_name_shared_across_projects_is_refused_with_its_own_reason() {
         // Two projects, one name: `cross_project` sees both and must refuse
         // rather than pick one. The client still sees a plain refusal.
-        let (mock, base) =
-            keystone_and_nova_list_recording("2099-01-01T00:00:00.000000Z".to_owned(), TENANTED_INSTANCES);
+        let (mock, base) = keystone_and_nova_list_recording(
+            "2099-01-01T00:00:00.000000Z".to_owned(),
+            TENANTED_INSTANCES,
+        );
         let base = base.get().expect("base").clone();
         let client = OpenStackClient::new(os_config_cross_project(&base)).expect("client");
 
