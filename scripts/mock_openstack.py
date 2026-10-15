@@ -9,6 +9,11 @@ Contract (plan-openstack §3.2 / §4.2):
         -> 200 with the instance JSON from the rules file, or 404 when the uuid
            is unknown (Nova's answer for "not visible to this credential" is
            deliberately indistinguishable from "does not exist").
+    GET  /v2.1/servers?name={value}
+        -> 200 with `{"servers": [...]}`, the instances whose `name` *contains*
+           the value (Nova's `name` filter is a substring/regex search, so the
+           gateway must narrow the result to an exact match locally — plan-
+           openstack appendix A.2/A.3). No hit => `{"servers": []}`, never 404.
     GET  /healthz  -> {"ok": true}         (readiness probe)
     GET  /__log    -> {"requests": [...]}  (debugging / MUST1 assertions)
 
@@ -44,6 +49,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 CONTROL_KEYS = ("status", "delay_ms")
 
@@ -140,6 +146,22 @@ class Handler(BaseHTTPRequestHandler):
             with state.lock:
                 data = list(state.requests)
             self._send(200, {"requests": data})
+            return
+        if self.path.startswith("/v2.1/servers?"):
+            # Instance-name lookup (plan-openstack appendix A.2): Nova's
+            # `name` filter is a substring search, so the gateway's local
+            # exact-match narrowing is what a case is actually testing.
+            needle = parse_qs(urlparse(self.path).query).get("name", [""])[0]
+            matched = []
+            for uuid, server in state.rules["servers"].items():
+                if not isinstance(server, dict):
+                    continue
+                if needle and needle in str(server.get("name", "")):
+                    body = {k: v for k, v in server.items() if k not in CONTROL_KEYS}
+                    body.setdefault("id", uuid)
+                    matched.append(body)
+            self._record(status=200)
+            self._send(200, {"servers": matched})
             return
         if self.path.startswith("/v2.1/servers/"):
             uuid = self.path[len("/v2.1/servers/") :]

@@ -527,6 +527,10 @@ ALL_CASES=(
   case_openstack_preauth_no_lookup
   case_openstack_non_uuid
   case_openstack_upstream_down
+  # plan-openstack appendix A (layer O6c): the instance-name route, opt-in.
+  case_openstack_name_route
+  case_openstack_name_ambiguous
+  case_openstack_name_disabled
 )
 
 resolve_case_path() {
