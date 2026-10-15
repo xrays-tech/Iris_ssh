@@ -78,6 +78,42 @@ impl NovaServer {
     }
 }
 
+/// The two shapes a `GET /servers/{id}` body may take.
+///
+/// The v2.1 reference documents the flat form, and that is what upstream
+/// DevStack and this repo's mock return. But deployments that still expose the
+/// classic v2 wire format — every OpenStack API-compat layer (v2 compat,
+/// vendor clouds, older `osapi_compute`) — wrap the resource:
+///
+/// ```json
+/// {"server": {"id": "…", "addresses": {"NET3746": [ … ]}}}
+/// ```
+///
+/// Caught the hard way against a real cloud: decoding the envelope as a
+/// [`NovaServer`] succeeds (every field is optional) but yields *empty*
+/// `addresses`, so `[openstack] network` matched nothing and the lookup died
+/// with the misleading `reason="no_network"` — while the very same request via
+/// curl returned the addresses just fine. Accept both shapes so a wire-format
+/// difference can never again masquerade as a configuration error.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ServerResponse {
+    /// `{"server": { … }}` (classic v2 envelope).
+    Envelope { server: NovaServer },
+    /// `{ … }` (v2.1 flat document).
+    Flat(NovaServer),
+}
+
+impl ServerResponse {
+    /// The enclosed [`NovaServer`], whichever shape it arrived in.
+    pub fn into_server(self) -> NovaServer {
+        match self {
+            ServerResponse::Envelope { server } => server,
+            ServerResponse::Flat(server) => server,
+        }
+    }
+}
+
 /// Why an address could not be selected. Logged as `reason=...` and mapped to
 /// a client-facing `ControlError::NotFound` so every refusal is identical from
 /// the outside (plan-openstack §3.5).
@@ -733,6 +769,159 @@ mod tests {
         let json = r#"{"accessIPv4":"not-an-ip","accessIPv6":""}"#;
         let server: NovaServer = serde_json::from_str(json).expect("decodes");
         assert!(server.access_ips().is_empty());
+    }
+
+    /// A **verbatim** `GET /v2.1/servers/{id}` body captured from a real
+    /// deployment (`nova_endpoint = 172.16.29.18:8774/v2.1`, instance
+    /// `d702cf44-7c17-4410-8ac0-6bd3727fe081`, network `NET3746`).
+    ///
+    /// Note the shape: the resource is wrapped in `{"server": …}`. That is
+    /// what the live cloud returned for the *same* request the gateway sends,
+    /// and it is why the gateway refused with `reason="no_network"` while
+    /// curl showed a perfectly good address.
+    const REAL_ENVELOPE: &str = r#"{
+        "server": {
+            "id": "d702cf44-7c17-4410-8ac0-6bd3727fe081",
+            "name": "gpu-f3a3f738-d26f-402d-a986-ac7b90394ac9",
+            "status": "ACTIVE",
+            "tenant_id": "a070dab7800e4eff88ad72e11f864471",
+            "user_id": "9e8501ed43644dda92541ebe5f195444",
+            "metadata": {},
+            "hostId": "0238b0cb597c849d040c308f3d94c6636b10e741a04df8a8e32c8d00",
+            "image": {
+                "id": "dcbd8815-cb87-4a26-a5b4-992e45269c26",
+                "links": [
+                    {
+                        "rel": "bookmark",
+                        "href": "http://172.16.29.18:8774/images/dcbd8815-cb87-4a26-a5b4-992e45269c26"
+                    }
+                ]
+            },
+            "flavor": {
+                "id": "903648e3-bf5d-4800-a8fe-e19dc85c61c3",
+                "links": [
+                    {
+                        "rel": "bookmark",
+                        "href": "http://172.16.29.18:8774/flavors/903648e3-bf5d-4800-a8fe-e19dc85c61c3"
+                    }
+                ]
+            },
+            "created": "2026-10-12T06:27:57Z",
+            "updated": "2026-10-12T06:28:17Z",
+            "addresses": {
+                "NET3746": [
+                    {
+                        "version": 4,
+                        "addr": "172.16.46.25",
+                        "OS-EXT-IPS:type": "fixed",
+                        "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:18:27:7a"
+                    }
+                ]
+            },
+            "accessIPv4": "",
+            "accessIPv6": "",
+            "links": [
+                {
+                    "rel": "self",
+                    "href": "http://172.16.29.18:8774/v2.1/servers/d702cf44-7c17-4410-8ac0-6bd3727fe081"
+                },
+                {
+                    "rel": "bookmark",
+                    "href": "http://172.16.29.18:8774/servers/d702cf44-7c17-4410-8ac0-6bd3727fe081"
+                }
+            ],
+            "OS-DCF:diskConfig": "MANUAL",
+            "progress": 0,
+            "OS-EXT-AZ:availability_zone": "GPU_4090_Renting",
+            "config_drive": "True",
+            "key_name": "rental-e9fbcd0c-5099-4831-a6d0-99eeeb41ca88",
+            "OS-SRV-USG:launched_at": "2026-10-12T06:28:17.000000",
+            "OS-SRV-USG:terminated_at": null,
+            "security_groups": [
+                {
+                    "name": "default"
+                }
+            ],
+            "OS-EXT-SRV-ATTR:host": "host91",
+            "OS-EXT-SRV-ATTR:instance_name": "instance-00000a1a",
+            "OS-EXT-SRV-ATTR:hypervisor_hostname": "host91",
+            "OS-EXT-STS:task_state": null,
+            "OS-EXT-STS:vm_state": "active",
+            "OS-EXT-STS:power_state": 1,
+            "os-extended-volumes:volumes_attached": []
+        }
+    }"#;
+
+    /// The real-cloud catch, as a regression test: an enveloped body must
+    /// decode *and* yield the address, with the configured network matching.
+    #[test]
+    fn real_cloud_envelope_body_decodes_and_selects_the_advertised_address() {
+        let parsed: ServerResponse = serde_json::from_str(REAL_ENVELOPE).expect("envelope decodes");
+        let server = parsed.into_server();
+
+        assert_eq!(
+            server.id.as_deref(),
+            Some("d702cf44-7c17-4410-8ac0-6bd3727fe081")
+        );
+        assert_eq!(
+            server
+                .addresses
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["NET3746"],
+            "the wrapped `addresses` map is what used to come back empty"
+        );
+        assert!(
+            server.access_ips().is_empty(),
+            "empty legacy fields stay empty"
+        );
+
+        let got = select_address(
+            &server.addresses,
+            &server.access_ips(),
+            &AddressSelection {
+                network: "NET3746",
+                family: AddressFamily::IPv4,
+                prefer: IpPrefer::Fixed,
+                on_ambiguous: OnAmbiguous::Reject,
+            },
+        )
+        .expect("real instance resolves");
+        assert_eq!(got, "172.16.46.25".parse::<IpAddr>().unwrap());
+    }
+
+    /// Both wire shapes must decode to the *same* server, so a cloud's format
+    /// choice cannot change which address gets dialed.
+    #[test]
+    fn envelope_and_flat_shapes_decode_to_the_same_server() {
+        let envelope: ServerResponse =
+            serde_json::from_str(REAL_ENVELOPE).expect("envelope decodes");
+        // The flat sibling: the same fields the envelope carries, unwrapped.
+        let flat = serde_json::json!({
+            "id": "d702cf44-7c17-4410-8ac0-6bd3727fe081",
+            "name": "gpu-f3a3f738-d26f-402d-a986-ac7b90394ac9",
+            "metadata": {},
+            "image": { "id": "dcbd8815-cb87-4a26-a5b4-992e45269c26" },
+            "addresses": {
+                "NET3746": [
+                    {
+                        "version": 4,
+                        "addr": "172.16.46.25",
+                        "OS-EXT-IPS:type": "fixed",
+                        "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:18:27:7a"
+                    }
+                ]
+            },
+            "accessIPv4": "",
+            "accessIPv6": "",
+        });
+        let flat: ServerResponse = serde_json::from_value(flat).expect("flat decodes");
+        assert_eq!(
+            envelope.into_server(),
+            flat.into_server(),
+            "shape must not affect the parsed server"
+        );
     }
 
     // --- backend user mapping (§3.4) --------------------------------------

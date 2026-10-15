@@ -35,7 +35,8 @@ use crate::resolve::ControlError;
 use crate::types::{is_instance_uuid, Policy, ResolveRequest, ResolveResponse, Target};
 
 use nova::{
-    map_backend_user, select_address, AddressSelection, NovaServer, UserMapping, UserSource,
+    map_backend_user, select_address, AddressSelection, NovaServer, ServerResponse, UserMapping,
+    UserSource,
 };
 
 /// Refresh a token this long before its advertised expiry: a token that dies
@@ -390,8 +391,13 @@ impl OpenStackClient {
             }
 
             return match status {
-                200 => match resp.json().await {
-                    Ok(server) => Ok(server),
+                200 => match resp.json::<ServerResponse>().await {
+                    // Both wire shapes are accepted: the flat v2.1 document and
+                    // the classic `{"server": {…}}` envelope (see
+                    // [`ServerResponse`]) — an envelope decoded as a bare
+                    // server silently loses `addresses`, which turned into a
+                    // `no_network` refusal against a real cloud.
+                    Ok(server) => Ok(server.into_server()),
                     Err(_) => {
                         tracing::warn!(
                             target: "openstack",
@@ -534,10 +540,19 @@ impl OpenStackClient {
         };
         let access_ips = server.access_ips();
         let addr = select_address(&server.addresses, &access_ips, &selection).map_err(|err| {
+            // Spell out *why*: `no_network` alone reads as "you typo'd the
+            // network name", and it was hours of false leads when the real
+            // problem was that `addresses` came back empty on the wire. The
+            // configured name next to the names Nova actually advertised makes
+            // the two cases (`networks: []` vs `networks: ["other"]`)
+            // distinguishable at a glance.
+            let networks: Vec<&str> = server.addresses.keys().map(String::as_str).collect();
             tracing::warn!(
                 target: "openstack",
                 %uuid,
                 reason = err.reason(),
+                configured_network = %self.cfg.network,
+                networks = ?networks,
                 "instance address could not be selected"
             );
             // Identical to "unknown instance" from the outside: a client must
@@ -1090,6 +1105,56 @@ mod tests {
         assert!(!nova.header("X-Auth-Token").unwrap().is_empty());
         assert_eq!(nova.header("OpenStack-API-Version"), Some("compute 2.1"));
         assert_eq!(nova.header("X-OpenStack-Nova-API-Version"), Some("2.1"));
+    }
+
+    /// Regression (caught on a real cloud): a deployment that answers the
+    /// classic v2 wire format wraps the resource in `{"server": {…}}`.
+    /// Decoding that envelope as a bare `NovaServer` succeeds but loses
+    /// `addresses`, so the lookup died with `reason="no_network"` even though
+    /// the same request via curl returned a perfectly good address. The body
+    /// below is the real response, trimmed to the fields this gateway reads;
+    /// the full verbatim capture lives in `nova.rs`.
+    #[tokio::test]
+    async fn classic_v2_envelope_body_resolves_the_real_instance() {
+        const REAL_ID: &str = "d702cf44-7c17-4410-8ac0-6bd3727fe081";
+        let envelope = format!(
+            r#"{{"server":{{"id":"{REAL_ID}","name":"gpu-f3a3f738","status":"ACTIVE",
+               "metadata":{{}},"image":{{"id":"dcbd8815-cb87-4a26-a5b4-992e45269c26"}},
+               "addresses":{{"NET3746":[{{"version":4,"addr":"172.16.46.25",
+               "OS-EXT-IPS:type":"fixed","OS-EXT-IPS-MAC:mac_addr":"fa:16:3e:18:27:7a"}}]}},
+               "accessIPv4":"","accessIPv6":""}}}}"#
+        );
+
+        let base_cell = Arc::new(OnceLock::<String>::new());
+        let base_for_handler = Arc::clone(&base_cell);
+        let mock = MockHttp::start(move |request| {
+            let base = base_for_handler.get().cloned().unwrap_or_default();
+            match request.path.as_str() {
+                "/v3/auth/tokens" => Response::token(
+                    "subject-token",
+                    &token_body("2099-01-01T00:00:00.000000Z", &base),
+                ),
+                path if path.starts_with("/v2.1/servers/") => Response::json(200, &envelope),
+                _ => Response::json(404, "{}"),
+            }
+        });
+        base_cell.set(mock.url("")).expect("base url set");
+
+        let cfg = os_config(&format!(
+            "{}\nnetwork = \"NET3746\"\naddress_family = \"ipv4\"\nprefer = \"fixed\"",
+            urls(&mock.url(""))
+        ));
+        let client = OpenStackClient::new(cfg).expect("client");
+
+        let grant = client.resolve(&req(REAL_ID)).await.expect("resolves");
+
+        assert_eq!(
+            grant.target.host, "172.16.46.25",
+            "the enveloped address must be selected"
+        );
+        assert_eq!(grant.target.port, 22);
+        assert_eq!(grant.target.user, "cloud-user", "default backend user");
+        assert!(grant.policy.agent_forwarding);
     }
 
     #[tokio::test]
