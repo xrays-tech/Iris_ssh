@@ -12,3 +12,6 @@
 __pycache__/
 *.pyc
 
+
+# local OpenStack test credentials (never commit)
+.openstack-test.env
