@@ -1007,3 +1007,311 @@ mock flat）迁入该目录；**逐字保留**（含 `image: ""`）。
 7. **O7c** `tests/fixtures/openstack/servers/*`（迁入 3 抓包 + 新变体）+ 表驱动测试。
 8. **O7d** mock 变体 + `case_openstack_envelope_variants` / `case_openstack_unparseable_loud` + docs。
 9. **提交前门禁**：`fmt`/`clippy`/`test`/`release`/`run_integration.sh`；O6a/O6b/O7a/O7b 经 @oracle 复审。
+
+---
+
+# 附录 C — cross_project（不指定 Project）可选实验室模式（X 系列）
+
+> 状态：设计附录，可实施。基线 `3391d73`（O1..O7 已落地，红线 12 层已复审放行）。
+> 目标：只给 **instance name 或 instance id**、**不指定 Project** 就能解析并连接实例
+> （实验/运维简化）。这是**显式刺眼的实验室模式**，默认关闭，且**依赖平台宽松的
+> Nova 策略**——标准/严格云不适用。
+
+## C.0 现状锚点与已实测的硬约束
+
+- Keystone 认证：`acquire`/`fetch_token`/`auth_body`（`src/openstack/mod.rs:223-358`）；
+  目前仅 `auth_method=application_credential`（默认）与 `token`（静态逃生口）。
+  application credential **不接受请求期 scope**（`mod.rs:351-357`，真机 v3.14 实测 401），
+  因此它对单项目之外天生无能为力。
+- 可见性：Nova `GET /servers/{id}` / `GET /servers?name=` 的可见性由 **token 作用域**限定
+  （`nova_get`，`src/openstack/mod.rs:532-`；`get_server`/`find_server_by_name`）。
+- `OpenStackConfig`（`src/config.rs:262-305`）、`RawOpenStack`（`src/config.rs:633-703`）、
+  `validate_openstack` 认证段（`src/config.rs:1338-1393`）、`parse_auth_method`
+  （`src/config.rs:1644-1652`）。
+- `NovaServer` 字段（`src/openstack/nova.rs`）现无 `tenant_id`；`decode_server` 逐字段提取。
+- 名字全等过滤 + 歧义拒绝：`exact_name_match`（`src/openstack/nova.rs`）；refinement
+  （`src/openstack/mod.rs:481-508`）。
+- **实测（只读，采信勿复探）**：
+  - T_3746 作用域 **admin token** + `GET /v2.1/servers/{e52bce4c…}?all_tenants=1`（该实例属
+    T_3741）→ **200**，body 含 `tenant_id=6bdb5cae…`（＝T_3741）。
+  - `GET /servers?all_tenants=1&name=yunqing_dev` → **200 命中 1 台**。
+  - `alex` 取 **domain/system 作用域 token → 401**（平台不允许非项目作用域）。
+  - application credential **创建即锁单项目**，无法跨项目。
+
+**结论**：cross_project 的唯一可行路径是"**具备 admin 角色的项目作用域 token**" +
+Nova `all_tenants=1`，且该 token 只能通过 **password 认证**取得（app-cred 不行，静态
+token 会过期不适合常驻配置）。
+
+---
+
+## C.1 配置与模式
+
+**新增一个显式模式开关**（不是 auth_method 的副作用，便于审计与校验）：
+
+```toml
+[openstack]
+scope = "single_project"   # 默认，现状零回归 | "cross_project"（实验室）
+```
+
+- `RawOpenStack.scope: String`（`#[serde(default = "default_scope")]` → `"single_project"`）；
+  `OpenStackConfig.scope: OpenStackScope{ SingleProject, CrossProject }`；`Debug` 增字段。
+- `parse_scope`（`src/config.rs`，风格同 `parse_routing`）：`"single_project"` / `"cross_project"`，
+  未知值报 `openstack.scope`；**在 `enabled=false` 短路之前解析**（拼写错误照旧 fail boot）。
+- **`project_id` 在 cross_project 下仍保留**，但语义改变：它是**认证作用域**（admin 角色
+  所在项目），**不是**可见性边界；用于日志上下文。为兼容，`project_id` 继续可空
+  （`*.env` 注入的 password 场景可由 `project_name` 指定 scope）。
+- **组合校验**（`validate_openstack`，新增一段 `match scope`）：
+  - `single_project`：现状完全不变（app-cred / token 二选一，规则照旧）。
+  - `cross_project`：`auth_method` **必须** `"password"`（app-credential / token **显式拒绝**，
+    报 `openstack.auth_method`，reason 直说"application credentials are project-fixed;
+    cross_project needs a project-scoped admin token, which only password auth yields"）。
+- **兼容改动**：`OpenStackScope` 默认值使现有配置**逐字不变**；`Debug` 只增一个字段；
+  校验只在 `cross_project` 分支新增，不动 `single_project` 路径（红线 1）。
+
+---
+
+## C.2 认证：password 回引入（跨项目唯一路径）
+
+### C.2.1 配置字段
+
+```toml
+auth_method = "password"                 # cross_project 必须
+username = "alex"                        # 认证用户名
+password = "…"                           # 或 password_file / $SSHGW_OPENSTACK_PASSWORD
+user_domain_name = "Default"             # user 的 domain（name 形态）
+project_id = "…"                         # admin 角色所在项目 id（scope）
+# project_name = "…"                     # 或 name 形态 + project_domain_name
+project_domain_name = "Default"
+```
+
+- `RawOpenStack` 增 `username`、`password`、`password_file`、`project_name`、
+  `project_domain_name`；`user_domain_name` **此前 O3 作为死配置删除，此处按需回引入**
+  （password 身份/作用域需要它，`single_project` 下不解析、不要求）。
+- secret 注入沿用 `resolve_secret`：`password_file` → 字面量 → `$SSHGW_OPENSTACK_PASSWORD`
+  （`src/config.rs:1494-1533`）；`OpenStackConfig` 手写 `Debug` 把 `password` 渲染为
+  `<redacted>`（与 app-cred secret/token 同规格）。
+- **`single_project` 下 `auth_method=password` 是否允许** → 见 §C.6 待拍板点①。
+
+### C.2.2 auth body（`auth_body` 改 match）
+
+```json
+{"auth":{
+  "identity":{"methods":["password"],
+    "password":{"user":{"name":"<username>",
+                        "domain":{"name":"<user_domain_name>"},
+                        "password":"<password>"}}},
+  "scope":{"project":{"id":"<project_id>"}}      // 或 {"name":…,"domain":{"name":…}}
+}}
+```
+- `project_id` 非空 → 用 id scope；否则用 `project_name` + `project_domain_name`。
+- `user_domain_name` 为空时回退 `"Default"`（Keystone 惯例），但建议必填。
+
+### C.2.3 token 生命周期
+
+- `acquire`（`src/openstack/mod.rs:223-247`）：`Token` 静态分支不变；把
+  `ApplicationCredential` 分支泛化为 **`ApplicationCredential | Password` → 缓存/单飞/`fetch_token`**。
+- `fetch_token`（`mod.rs:250-330`）：**逻辑不变**（`X-Subject-Token`、`expires_at`、
+  catalog、401/403/5xx/429 分类、单飞、401 单次刷新）——password 只是换 body。
+- 401 刷新路径（`nova_get`，`mod.rs:560-573`）对 password 完全复用。
+- 失败日志规范：把 `fetch_token` 里的 "Keystone refused the application credential"
+  文案改为按 `auth_method` 取词（"password" / "application credential"），**不打印凭据**。
+
+### C.2.4 安全评审：为何可接受回引入 password
+
+| 维度 | password（cross_project） | application credential（single_project） |
+|---|---|---|
+| 触发条件 | **仅** `scope="cross_project"` 显式开启，默认关 | 默认，单项目 |
+| 凭据注入 | env / `*_file`，Debug 红act，绝不入日志 | 同 |
+| 用途 | **只用于换一枚项目作用域 admin token**，凭据不经手客户端数据 | 同 |
+| 生命周期 | token 缓存至 `expires_at-skew`；401 单刷 | 同 |
+| 爆炸半径 | **整个 token 可见范围**（由角色 + Nova 策略决定）——比 app-cred 大 | 单一 project |
+| 与 app-cred 取舍 | app-cred 无法跨项目，是**唯一**跨项目路径，非"更方便" | 更安全，单项目首选 |
+
+- **可接受的边界**：password 仅存在于"显式刺眼"的 cross_project 模式；启动打
+  `WARN`（见 §C.4）；文档要求 operator 把凭据 scope 到**藏 admin 角色的那个项目**，
+  并理解"该 admin 能看全云"；凭据只用于解析，网关仍是 agent-only 后端认证、不经手
+  客户端私钥/数据。
+- **不可接受的方向**：把 password 变成默认/单项目推荐路径（app-cred 更安全）；或在
+  cross_project 之外隐式使用。校验层强制"password ⇔ cross_project"（待拍板点①定严格度）。
+
+---
+
+## C.3 Nova 接线
+
+### C.3.1 `all_tenants=1`
+
+- `nova_get`（`src/openstack/mod.rs:532-`）的 `query: Option<(&str,&str)>` 改为
+  `query: &[(&str,&str)]`（list 路由要同时带 `name` 与 `all_tenants`）。
+- 新增 `fn nova_query<'a>(&'a self, extra: &[(&'a str,&'a str)]) -> Vec<(&'a str,&'a str)>`：
+  `cross_project` 时追加 `("all_tenants","1")`，`single_project` 时原样——**只在查询参数层
+  追加**，仍走 `request.query(...)`（reqwest 百分号编码），**SSRF 面不变**（path 仍由本模块
+  构造，客户端串只作 query 值；`all_tenants` 是常量）。
+- `get_server` 调 `nova_get(token, &format!("/servers/{uuid}"), &nova_query(&[]), …)`；
+  `find_server_by_name` 调 `nova_get(…, "/servers", &nova_query(&[("name", name)]), …)`。
+- 平台前置条件：`all_tenants` 是 Nova 扩展，**标准/严格云对非 admin token 会 403/忽略**。
+  文档化；`cross_project` 不得默认开启。
+
+### C.3.2 `tenant_id` 上下文
+
+- `NovaServer` 增 `tenant_id: Option<String>`，`decode_server` 用
+  `string_from_value(doc.get("tenant_id"), "tenant_id", &mut notes)` 提取（宽容，同其它非关键字段）。
+- `build_response` 的 debug/warn 行加 `tenant_id = <…>`（仅日志上下文，**不改 AuditRecord**）。
+- 可选：`resolve` 的 `target=openstack` 结构化日志加 `tenant_id`。
+
+### C.3.3 路由语义
+
+- **UUID 路由**：`decode_server` → 唯一实例 → 直接解析（cross_project 下 `all_tenants` 让
+  非本 scope 项目的实例也可见）。`target.host` 仍只来自 `select_address`。
+- **名字路由**：`find_server_by_name` 的全等过滤现在跨项目。**全云全等 >1 → 拒绝**，
+  reason token 按 scope 区分：
+  - `single_project`：`ambiguous_name`（现状）；
+  - `cross_project`：`ambiguous_name_cross_project`（新增，仅日志，客户端仍是同构 `NotFound`）。
+  - 实现：`exact_name_match` 仍返回 `AmbiguousName`；在 `find_server_by_name` 选 reason 时按
+    `cfg.scope` 映射（不新增 enum 变体，降低 churn）。
+- 解析后 `select_address` + `map_backend_user` + policy 组装**完全复用** `build_response`。
+
+---
+
+## C.4 安全红线（附录 C）
+
+1. **默认 `single_project` 零回归**：`scope` 默认值使现有配置逐字不变；`enabled=false` 不变。
+2. **cross_project = 显式刺眼实验室模式**：启动 `WARN`（对照
+   `allow_any_authenticated_key` 的醒目度），文档化"依赖平台宽松 Nova 策略，标准/严格云
+   不适用，禁止默认开启"。
+3. **失败对客户端恒同构**：cross_project 的所有失败仍是 `Auth::reject`（`NotFound`/`Decode`
+   → reject）；`ambiguous_name_cross_project` 只进日志。
+4. **`target.host` 只来自解析结果**（Nova `addresses`），username/name 绝不携带 host/IP。
+5. **日志只摘要不泄 body**（`summarize_body`，附录 B.4）；password/凭据永不入日志，
+   `Debug` 红act。
+6. **凭据最小化**：admin 凭据只用于换取解析用 token；不参与后端拨号（agent-only 不变）、
+   不经手客户端数据。
+7. **不改** app-credential 语义（`single_project` 路径）、agent 拨号、`AuditRecord` 格式。
+8. 红线 12：X 系列的安全关键层（X1/X2/X3）合并前经 @oracle 复审。
+
+---
+
+## C.5 测试
+
+### C.5.1 mock_openstack.py 多 tenant + all_tenants
+
+- rules 的每个 server 增 `tenant_id`；`State` 记录当前 token 的作用域项目。
+- `POST /v3/auth/tokens`：解析请求 body 的 `scope.project.id`（或 `name`）→ mint token =
+  `mock-subject-token:<project>`；返回 catalog（同现状）。
+- `GET /v2.1/servers/{id}` 与 `?name=`：从 `X-Auth-Token` 解出 token 的项目；**若
+  `all_tenants` 缺失/非 1 → 仅返回 `tenant_id == 本项目` 的实例；若 `all_tenants=1` → 全部**。
+  记录是否带 `all_tenants` 供断言（`/__log` 已记 path，query 也在 path 中）。
+- password 认证：mock 接受 `methods:["password"]`，返回成功（无需真校验密码）。
+- `--pidfile`/SIGTERM 等不变。
+
+### C.5.2 subtopo
+
+- 增 `SUBTOP_OS_SCOPE`（`single_project` 默认；`cross_project` 渲染 `scope` + password 字段）。
+- 增 `SUBTOP_OS_PROJECT_ID` / `SUBTOP_OS_PROJECT_NAME` / `SUBTOP_OS_USERNAME` /
+  `SUBTOP_OS_PASSWORD`（默认从 env 读，测试用固定值），渲染进 `[openstack]`；现有
+  `SUBTOP_OS_ROUTE_BY` 等保持不变。
+- rules 里给实例分配不同 `tenant_id`（如主实例 T_a、跨项目实例 T_b）。
+
+### C.5.3 用例
+
+- `case_openstack_cross_project_uuid`（正例）：cross_project 下登录**他项目**实例 UUID →
+  会话成功；断言 mock 收到 `all_tenants=1`；审计 `resolve_source=openstack`。
+- `case_openstack_cross_project_name`（正例）：跨项目名字唯一 → 解析成功。
+- `case_openstack_cross_project_name_ambiguous`（拒绝）：两项目同名 → 拒绝，
+  日志 `reason=ambiguous_name_cross_project`，无审计，客户端同构。
+- `case_openstack_single_project_default`（回归）：默认 scope 下不追加 `all_tenants`；
+  他项目 UUID 不可见（404 → 拒绝）——证明默认仍是单项目。
+- `case_openstack_cross_project_appcred_rejected`（组合校验）：`scope=cross_project` +
+  `auth_method=application_credential` → 启动期 `openstack.auth_method` 错误。
+- `case_openstack_cross_project_password_env`（注入）：password 经
+  `SSHGW_OPENSTACK_PASSWORD` 注入，配置无明文 → 解析成功。
+- fixtures 补 `tenant_id` 变体（`tenant_id` 缺失/null/非串）到表驱动语料（附录 B.6）。
+
+### C.5.4 真机
+
+- T_3746 admin 凭据 → `scope=cross_project` + password → `all_tenants=1` 解析 T_3741
+  `e52bce4c…`（lookup 已验证）→ 走到 root 登录（登录应通）；记录
+  `dev-docs/openstack-test-env.md`。负例：单项目 scope 下同 UUID 不可见。
+
+---
+
+## C.6 DoD / 分层提交（X 系列）/ 工作量 / 红线 12
+
+### D.6.1 分层提交
+
+- **X1**（默认关，纯新增）：`OpenStackScope` + `scope` 配置/解析/校验骨架 +
+  `single_project` 分支零改动；单测（含 `enabled=false` 短路、未知值、组合骨架）。
+- **X2**（安全审查点）：`auth_method="password"`（配置字段/env 注入/Debug 红act）、
+  `auth_body` 改 match、`acquire` 泛化、fetch 文案按 method；
+  **cross_project ⇔ password 组合校验**；单测（含 401 刷新复用）。
+- **X3**（安全审查点）：`nova_get` query 切片化 + `nova_query`（`all_tenants`）+
+  `NovaServer.tenant_id` + `ambiguous_name_cross_project`；单测（query 断言、tenant 日志）。
+- **X4**：mock 多 tenant + all_tenants + subtopo `SUBTOP_OS_SCOPE`/password 字段 + 6 用例
+  + 真机 T_3746→T_3741。
+- **X5**：文档（config.example `scope`/password 块、ops-runbook §5.8、known-limitations §9、
+  propose §3.1/§3.2 授权例外、本文件标注）。
+- **红线 12**：X2、X3 合并前经 @oracle 复审。
+
+### D.6.2 DoD
+
+- X1–X5 落地；C.5 单测全绿；新用例 + 现有 44 用例全绿；`fmt`/`clippy -D warnings`/`test`/
+  `release`/`run_integration.sh` 全绿；`scope=single_project`（默认）与 `enabled=false`
+  行为不变；真机 cross_project 解析通过；docs 更新；X2/X3 经 @oracle 复审。
+
+### D.6.3 工作量
+
+| 阶段 | 内容 | 估时 |
+|---|---|---|
+| X1 | scope 配置/枚举/校验骨架 + 单测 | 0.5 天 |
+| X2 | password 认证 + 组合校验 + 单测 | 1.5–2 天 |
+| X3 | all_tenants 接线 + tenant_id + 跨项目歧义 + 单测 | 1–1.5 天 |
+| X4 | mock/subtopo + 6 用例 + 真机 | 1.5–2 天 |
+| X5 | docs | 0.5 天 |
+| **合计** | | **~5–6.5 人日 + 复审** |
+
+### D.6.4 风险
+
+| # | 风险 | 严重度 | 缓解 |
+|---|---|---|---|
+| R17 | password 回引入扩大凭据面 | 高 | 仅 cross_project、env 注入、Debug 红act、启动 WARN、@oracle 复审 |
+| R18 | admin token 爆炸半径=全项目 | 高 | 文档要求 scope 到"藏 admin 的项目"；凭据只用于解析 |
+| R19 | 依赖平台宽松 Nova 策略（非标准） | 中 | 文档化硬前置；不得默认开启；单项目默认不受影响 |
+| R20 | 跨项目同名 >1 误连 | 高 | 全等 >1 → `ambiguous_name_cross_project` 拒绝，绝不猜 |
+| R21 | single_project 回归 | 中 | scope 默认值 + 双模式单测 |
+| R22 | password 泄露进日志 | 高 | Debug 红act + 不打印 body/凭据（既有 `summarize_body`） |
+
+---
+
+## C.7 给 fixer 的分层清单
+
+1. **X1** `config.rs:OpenStackScope/default_scope/parse_scope` + `RawOpenStack.scope` +
+   `OpenStackConfig.scope` + `Debug`；`single_project` 路径不变；单测。
+2. **X2** `config.rs`：`RawOpenStack.{username,password,password_file,project_name,project_domain_name,user_domain_name}`
+   + `resolve_secret(password)` + `Debug` 红act + `parse_auth_method` 增 `"password"` +
+   cross_project⇔password 组合校验；`openstack/mod.rs:auth_body` 改 match、`acquire` 泛化、
+   fetch 文案按 method；单测。
+3. **X3** `openstack/mod.rs:nova_query` + `nova_get(query: &[(&str,&str)])` + `get_server`/
+   `find_server_by_name` 调用点 + `ambiguous_name_cross_project`；`nova.rs:NovaServer.tenant_id`
+   + `decode_server` 提取 + `build_response` tenant 日志；单测。
+4. **X4** `scripts/mock_openstack.py` 多 tenant/all_tenants/password + `subtopo.sh`
+   `SUBTOP_OS_SCOPE`/password 字段 + `case_openstack_cross_project_{uuid,name,name_ambiguous,
+   appcred_rejected,password_env}` + `case_openstack_single_project_default` + fixtures
+   `tenant_id` 变体 + 真机 T_3746→T_3741。
+5. **X5** docs（config.example/ops-runbook §5.8/known-limitations §9/propose/本文件）。
+6. **提交前门禁**：`fmt`/`clippy`/`test`/`release`/`run_integration.sh`；X2/X3 经 @oracle 复审。
+
+---
+
+## C.8 待拍板点与建议
+
+1. **`auth_method="password"` 是否也允许在 `single_project` 下使用？**
+   - 建议：**只允许在 `cross_project`**（校验强制 password⇔cross_project）。理由：password
+     是"跨项目唯一路径"的专用机制，callback 只在实验室模式下存在，红线段最干净；单项目继续
+     用更安全的 app-credential 或静态 token。若确有单项目 password 需求，可另开一张票放宽，
+     但需单独安全评审。
+2. **`project_id` 在 cross_project 的语义与命名。**
+   - 建议：保留字段名 `project_id`（兼容），但在文档与启动 WARN 中明确它是**认证 scope**
+     而非可见性边界；可选新增别名 `scope_project_id`（不推荐，徒增歧义）。若采纳别名，需
+     config 校验二选一。
+3. （次要）**`ambiguous_name_cross_project` 的粒度**：建议按 scope 区分 reason token（本条
+   设计）；若认为两 token 冗余，可合并为 `ambiguous_name` + 附加 `scope=` 字段。建议保留独立
+   token，排障更直接。
