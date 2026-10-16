@@ -871,7 +871,7 @@ impl OpenStackClient {
                 route_by = route.as_str(),
                 reason,
                 configured_network = %self.cfg.network,
-                address_kind = self.cfg.address_kind.no_address_reason(),
+                address_kind = self.cfg.address_kind.as_str(),
                 networks = ?networks,
                 "instance address could not be selected"
             );

@@ -294,6 +294,16 @@ pub enum AddressKind {
 }
 
 impl AddressKind {
+    /// The stable token used in `[openstack] address_kind` and in log fields
+    /// (the configured knob, spelled literally — not a failure reason).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AddressKind::Any => "any",
+            AddressKind::Floating => "floating",
+            AddressKind::Fixed => "fixed",
+        }
+    }
+
     /// The `reason` token logged when a strict kind filter leaves no
     /// candidate. `Any` cannot fail this way — the filter is a no-op — but it
     /// still needs a token for exhaustiveness.
@@ -2655,6 +2665,9 @@ mod tests {
                 cfg.openstack.expect("section present").address_kind,
                 expected
             );
+            // `as_str` is what log fields echo back; it must be the same
+            // literal the parser accepts (round-trip, no drift).
+            assert_eq!(expected.as_str(), literal);
         }
     }
 
