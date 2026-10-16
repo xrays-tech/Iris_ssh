@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Deserializer};
 
-use crate::config::{AddressFamily, BackendUserRule, IpPrefer, OnAmbiguous};
+use crate::config::{AddressFamily, AddressKind, BackendUserRule, IpPrefer, OnAmbiguous};
 
 /// A parsed `server.addresses` entry: `{ "net-name": [ {...}, ... ] }`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -524,6 +524,13 @@ pub enum SelectionError {
     NoNetwork,
     /// More than one address survived and `on_ambiguous = "reject"`.
     Ambiguous,
+    /// A strict `address_kind` filter (`"floating"` / `"fixed"`) left no
+    /// candidate. Deliberately distinct from `NoAddress`: a kind filter is a
+    /// policy refusal (the instance *has* addresses, none dialable under the
+    /// configured policy) whereas `NoAddress` means nothing was advertised.
+    /// `mod.rs` maps this to `ControlError::NotFound`, so the client sees the
+    /// same refusal either way — the distinction is log-only.
+    NoKind,
 }
 
 impl SelectionError {
@@ -533,6 +540,7 @@ impl SelectionError {
             SelectionError::NoAddress => "no_address",
             SelectionError::NoNetwork => "no_network",
             SelectionError::Ambiguous => "ambiguous",
+            SelectionError::NoKind => "no_address_kind",
         }
     }
 }
@@ -561,6 +569,10 @@ pub struct AddressSelection<'a> {
     pub family: AddressFamily,
     pub prefer: IpPrefer,
     pub on_ambiguous: OnAmbiguous,
+    /// Strict address-kind filter (appendix D). `Any` preserves the historical
+    /// behaviour exactly; `Floating`/`Fixed` keep only that kind and refuse
+    /// when the instance advertises none of it.
+    pub kind: AddressKind,
 }
 
 /// Expand `server.addresses` into candidates, dropping anything that is not a
@@ -640,6 +652,25 @@ pub fn select_address(
         cands.retain(|c| c.network == sel.network);
     }
     cands.retain(|c| matches_family(c.addr, sel.family));
+
+    // Appendix D: a strict `address_kind` filter runs *after* the network and
+    // family filters but *before* the `access_ips` fallback, so neither the
+    // legacy fields nor a mis-ordered filter can smuggle a forbidden kind past
+    // the policy. `AccessIPv4/6` carry no `OS-EXT-IPS:type`, so they have no
+    // kind and are necessarily excluded when the filter is strict — that is
+    // the point: an unknown-kind address must not be dialed on a floating-only
+    // network. There is deliberately no fallback to the other kind.
+    if sel.kind != AddressKind::Any {
+        let want = match sel.kind {
+            AddressKind::Floating => AddrKind::Floating,
+            AddressKind::Fixed => AddrKind::Fixed,
+            AddressKind::Any => unreachable!("guarded above"),
+        };
+        cands.retain(|c| c.kind == want);
+        if cands.is_empty() {
+            return Err(SelectionError::NoKind);
+        }
+    }
 
     if cands.is_empty() && sel.network.is_empty() {
         for ip in access_ips {
@@ -814,12 +845,14 @@ mod tests {
         family: AddressFamily,
         prefer: IpPrefer,
         on_ambiguous: OnAmbiguous,
+        kind: AddressKind,
     ) -> AddressSelection<'a> {
         AddressSelection {
             network,
             family,
             prefer,
             on_ambiguous,
+            kind,
         }
     }
 
@@ -846,6 +879,7 @@ mod tests {
                 AddressFamily::IPv4,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .expect("one address");
@@ -866,6 +900,7 @@ mod tests {
                 AddressFamily::IPv4,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .unwrap_err();
@@ -903,6 +938,7 @@ mod tests {
                 AddressFamily::IPv4,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .unwrap_err();
@@ -917,6 +953,7 @@ mod tests {
                 AddressFamily::IPv4,
                 IpPrefer::Floating,
                 OnAmbiguous::First,
+                AddressKind::Any,
             ),
         )
         .expect("floating v4 first");
@@ -925,7 +962,13 @@ mod tests {
         let got = select_address(
             &addrs,
             &[],
-            &selection("", AddressFamily::IPv4, IpPrefer::Fixed, OnAmbiguous::First),
+            &selection(
+                "",
+                AddressFamily::IPv4,
+                IpPrefer::Fixed,
+                OnAmbiguous::First,
+                AddressKind::Any,
+            ),
         )
         .expect("fixed v4 first");
         assert_eq!(got, "10.0.0.7".parse::<IpAddr>().unwrap());
@@ -940,11 +983,117 @@ mod tests {
                 AddressFamily::IPv6,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .expect("v6");
         assert_eq!(got, "2001:db8::7".parse::<IpAddr>().unwrap());
     }
+
+    /// Appendix D: with both kinds present, a `floating` filter keeps only the
+    /// floating address — so the default `IpPrefer::Floating` cannot be
+    /// subverted by a fixed address that happens to sort first.
+    #[test]
+    fn address_kind_floating_keeps_only_floating_when_both_exist() {
+        let addrs = map(vec![
+            addr("private", "10.0.0.7", "fixed"),
+            addr("public", "192.0.2.10", "floating"),
+        ]);
+
+        // `IpPrefer::Fixed` would otherwise pick the fixed address; the kind
+        // filter runs after the preference ranking and excludes it.
+        let got = select_address(
+            &addrs,
+            &[],
+            &selection(
+                "",
+                AddressFamily::IPv4,
+                IpPrefer::Fixed,
+                OnAmbiguous::Reject,
+                AddressKind::Floating,
+            ),
+        )
+        .expect("the floating address survives the filter");
+        assert_eq!(got, "192.0.2.10".parse::<IpAddr>().unwrap());
+    }
+
+    /// Appendix D: an instance with *no* floating address is refused rather
+    /// than dialed on its fixed/VXLAN address — the gateway cannot reach it
+    /// and a silent fallback would turn a misconfiguration into a hang.
+    #[test]
+    fn address_kind_floating_refuses_when_only_fixed_addresses_exist() {
+        let addrs = map(vec![
+            addr("private", "10.0.0.7", "fixed"),
+            addr("mgmt", "10.0.1.7", "fixed"),
+        ]);
+
+        let err = select_address(
+            &addrs,
+            &[],
+            &selection(
+                "",
+                AddressFamily::IPv4,
+                IpPrefer::Floating,
+                OnAmbiguous::Reject,
+                AddressKind::Floating,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::NoKind);
+        // Stable reason token — distinct from `no_address`, which means the
+        // instance advertised nothing at all.
+        assert_eq!(err.reason(), "no_address_kind");
+    }
+
+    /// Appendix D: `address_kind = "any"` (the default) is a no-op — a fixed
+    /// address is still dialable, exactly as before the knob existed. (With
+    /// *both* kinds present and no preference between them the selection is
+    /// legitimately ambiguous, so the regression case is a lone fixed address.)
+    #[test]
+    fn address_kind_any_preserves_the_historical_selection() {
+        let addrs = map(vec![addr("private", "10.0.0.7", "fixed")]);
+
+        let got = select_address(
+            &addrs,
+            &[],
+            &selection(
+                "",
+                AddressFamily::Any,
+                IpPrefer::Fixed,
+                OnAmbiguous::Reject,
+                AddressKind::Any,
+            ),
+        )
+        .expect("a fixed address is still dialable by default");
+        assert_eq!(got, "10.0.0.7".parse::<IpAddr>().unwrap());
+    }
+
+    /// Appendix D: the filter composes with `on_ambiguous = "reject"` — two
+    /// floating addresses under a floating-only policy are still ambiguous,
+    /// not "pick one", because the policy says nothing about *which* floating
+    /// address to dial.
+    #[test]
+    fn address_kind_floating_still_rejects_ambiguous_floating_addresses() {
+        let addrs = map(vec![
+            addr("public", "192.0.2.10", "floating"),
+            addr("public2", "192.0.2.11", "floating"),
+        ]);
+
+        let err = select_address(
+            &addrs,
+            &[],
+            &selection(
+                "",
+                AddressFamily::IPv4,
+                IpPrefer::Floating,
+                OnAmbiguous::Reject,
+                AddressKind::Floating,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::Ambiguous);
+    }
+
     #[test]
     fn network_filter_narrows_and_absent_network_fails_loud() {
         let addrs = map(vec![
@@ -959,6 +1108,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .expect("private wins");
@@ -972,6 +1122,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .unwrap_err();
@@ -993,6 +1144,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .unwrap_err();
@@ -1008,6 +1160,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::First,
+                AddressKind::Any,
             ),
         )
         .expect("first mode");
@@ -1028,6 +1181,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::First,
+                AddressKind::Any,
             ),
         )
         .unwrap();
@@ -1039,6 +1193,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::First,
+                AddressKind::Any,
             ),
         )
         .unwrap();
@@ -1071,6 +1226,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .expect("same address twice is one candidate");
@@ -1107,6 +1263,7 @@ mod tests {
                 AddressFamily::IPv4,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .expect("one good address");
@@ -1124,6 +1281,7 @@ mod tests {
                 AddressFamily::IPv4,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .expect("fallback address");
@@ -1139,6 +1297,7 @@ mod tests {
                 AddressFamily::Any,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .unwrap_err();
@@ -1153,6 +1312,7 @@ mod tests {
                 AddressFamily::IPv6,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .unwrap_err();
@@ -1221,6 +1381,7 @@ mod tests {
                 family: AddressFamily::IPv4,
                 prefer: IpPrefer::Fixed,
                 on_ambiguous: OnAmbiguous::Reject,
+                kind: AddressKind::Any,
             },
         )
         .expect("real instance resolves");
@@ -1314,6 +1475,7 @@ mod tests {
                 family: AddressFamily::IPv4,
                 prefer: IpPrefer::Fixed,
                 on_ambiguous: OnAmbiguous::Reject,
+                kind: AddressKind::Any,
             },
         )
         .expect("T_3741 instance resolves");
@@ -1535,6 +1697,7 @@ mod tests {
                 AddressFamily::IPv4,
                 IpPrefer::Floating,
                 OnAmbiguous::Reject,
+                AddressKind::Any,
             ),
         )
         .expect("the literal is what gets dialed");
@@ -1793,6 +1956,7 @@ mod tests {
                     AddressFamily::Any,
                     IpPrefer::Floating,
                     OnAmbiguous::Reject,
+                    AddressKind::Any,
                 ),
             );
             match (fixture.expect, got) {

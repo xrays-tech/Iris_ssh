@@ -270,6 +270,38 @@ pub enum IpPrefer {
     Any,
 }
 
+/// Strict address-*kind* filter for the selected instance address
+/// (plan-openstack appendix D).
+///
+/// Distinct from [`AddressFamily`] (which filters by IP version): this says
+/// which class of address the gateway is allowed to dial at all. `Floating`
+/// exists for the "only floating IPs are reachable from outside" deployments:
+/// a fixed/VXLAN address is *not* an acceptable fallback, because the gateway
+/// would pick it, dial it, and hang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressKind {
+    /// Keep every kind (historical behaviour, the default).
+    #[default]
+    Any,
+    /// Keep only floating (public) addresses; refuse when there is none.
+    Floating,
+    /// Keep only fixed (private) addresses; refuse when there is none.
+    Fixed,
+}
+
+impl AddressKind {
+    /// The `reason` token logged when a strict kind filter leaves no
+    /// candidate. `Any` cannot fail this way — the filter is a no-op — but it
+    /// still needs a token for exhaustiveness.
+    pub fn no_address_reason(&self) -> &'static str {
+        match self {
+            AddressKind::Any => "no_address_kind",
+            AddressKind::Floating => "no_floating",
+            AddressKind::Fixed => "no_fixed",
+        }
+    }
+}
+
 /// What to do when more than one address survives filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OnAmbiguous {
@@ -360,6 +392,9 @@ pub struct OpenStackConfig {
     /// Network name filter; empty accepts any network.
     pub network: String,
     pub address_family: AddressFamily,
+    /// Strict address-kind filter (appendix D): `Any` keeps every kind, while
+    /// `Floating` / `Fixed` refuse instances that have none of that kind.
+    pub address_kind: AddressKind,
     pub prefer: IpPrefer,
     pub on_ambiguous: OnAmbiguous,
 
@@ -405,6 +440,7 @@ impl std::fmt::Debug for OpenStackConfig {
             .field("ca_bundle", &self.ca_bundle)
             .field("network", &self.network)
             .field("address_family", &self.address_family)
+            .field("address_kind", &self.address_kind)
             .field("prefer", &self.prefer)
             .field("on_ambiguous", &self.on_ambiguous)
             .field("default_backend_user", &self.default_backend_user)
@@ -761,6 +797,8 @@ struct RawOpenStack {
     network: String,
     #[serde(default = "default_address_family")]
     address_family: String,
+    #[serde(default = "default_address_kind")]
+    address_kind: String,
     #[serde(default = "default_prefer")]
     prefer: String,
     #[serde(default = "default_on_ambiguous")]
@@ -814,6 +852,9 @@ fn default_interface() -> String {
 }
 fn default_address_family() -> String {
     "ipv4".to_owned()
+}
+fn default_address_kind() -> String {
+    "any".to_owned()
 }
 fn default_prefer() -> String {
     "floating".to_owned()
@@ -1320,6 +1361,7 @@ fn validate_openstack(
     let address_family = parse_address_family(&raw.address_family)?;
     let prefer = parse_prefer(&raw.prefer)?;
     let on_ambiguous = parse_on_ambiguous(&raw.on_ambiguous)?;
+    let address_kind = parse_address_kind(&raw.address_kind)?;
     // Parsed before the `enabled = false` short-circuit, exactly like the
     // enums above: a typo in a line the operator did write must fail the boot
     // rather than lie in wait until the feature is switched on.
@@ -1689,6 +1731,7 @@ fn validate_openstack(
         ca_bundle: PathBuf::from(raw.ca_bundle.trim()),
         network: raw.network.trim().to_owned(),
         address_family,
+        address_kind,
         prefer,
         on_ambiguous,
         default_backend_user,
@@ -1882,6 +1925,21 @@ fn parse_prefer(value: &str) -> std::result::Result<IpPrefer, ConfigError> {
             "openstack.prefer",
             other,
             "\"floating\", \"fixed\" or \"any\"",
+        )),
+    }
+}
+
+/// Parse `[openstack] address_kind` (appendix D): `any` (default), `floating`
+/// or `fixed`. A strict filter that refuses instead of falling back.
+fn parse_address_kind(value: &str) -> std::result::Result<AddressKind, ConfigError> {
+    match value.trim() {
+        "any" => Ok(AddressKind::Any),
+        "floating" => Ok(AddressKind::Floating),
+        "fixed" => Ok(AddressKind::Fixed),
+        other => Err(enum_error(
+            "openstack.address_kind",
+            other,
+            "\"any\", \"floating\" or \"fixed\"",
         )),
     }
 }
@@ -2249,6 +2307,25 @@ mod tests {
         .to_owned()
     }
 
+    /// The `[openstack]` section, optionally carrying extra lines. The body is
+    /// re-wrapped in its own table so appended keys land inside the section
+    /// rather than trailing out of it.
+    fn openstack_section_with(extra: &str) -> String {
+        let extra = if extra.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{extra}")
+        };
+        // `openstack_pure_section` opens with the `[openstack]` header, so the
+        // extra keys belong immediately after it — still inside the table. The
+        // `minimal_toml` prefix supplies the top-level fields validation needs.
+        format!(
+            "{}{}",
+            minimal_toml(),
+            openstack_pure_section().replacen("[openstack]", &format!("[openstack]{extra}"), 1)
+        )
+    }
+
     fn parse_err(toml: &str) -> ConfigError {
         match GatewayConfig::parse(toml).unwrap_err() {
             Error::Config(err) => err,
@@ -2514,6 +2591,46 @@ mod tests {
             base_without_control_plane()
         );
         assert_eq!(invalid_field(&toml), "control_plane");
+    }
+
+    /// Appendix D: `address_kind` defaults to `any` (no filtering) and parses
+    /// into the selection knob the resolver reads.
+    #[test]
+    fn address_kind_defaults_to_any_and_parses_the_strict_values() {
+        let cfg = GatewayConfig::parse(&openstack_section_with("")).expect("valid config");
+        let os = cfg.openstack.expect("section present");
+        assert_eq!(os.address_kind, AddressKind::Any);
+
+        for (literal, expected) in [
+            ("any", AddressKind::Any),
+            ("floating", AddressKind::Floating),
+            ("fixed", AddressKind::Fixed),
+        ] {
+            let toml = openstack_section_with(&format!("address_kind = \"{literal}\""));
+            let cfg = GatewayConfig::parse(&toml).expect("valid config");
+            assert_eq!(
+                cfg.openstack.expect("section present").address_kind,
+                expected
+            );
+        }
+    }
+
+    /// Appendix D: a typo in `address_kind` fails the boot, naming the field
+    /// and the accepted values — never a silent fallback to `any`, which would
+    /// dial an address the operator meant to exclude.
+    #[test]
+    fn address_kind_rejects_unknown_values_and_names_the_field() {
+        let toml = openstack_section_with("address_kind = \"public\"");
+        assert_eq!(invalid_field(&toml), "openstack.address_kind");
+    }
+
+    /// The reason token a strict filter miss produces, per configured kind.
+    /// `Any` cannot fail this way, but the match must stay exhaustive.
+    #[test]
+    fn address_kind_reason_tokens_are_stable_per_kind() {
+        assert_eq!(AddressKind::Any.no_address_reason(), "no_address_kind");
+        assert_eq!(AddressKind::Floating.no_address_reason(), "no_floating");
+        assert_eq!(AddressKind::Fixed.no_address_reason(), "no_fixed");
     }
 
     #[test]

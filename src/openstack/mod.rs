@@ -40,7 +40,8 @@ use crate::types::{
 
 use nova::{
     decode_server, decode_server_list, exact_name_match, map_backend_user, select_address,
-    summarize_body, AddressSelection, NameLookupError, NovaServer, UserMapping, UserSource,
+    summarize_body, AddressSelection, NameLookupError, NovaServer, SelectionError, UserMapping,
+    UserSource,
 };
 
 /// Refresh a token this long before its advertised expiry: a token that dies
@@ -843,6 +844,7 @@ impl OpenStackClient {
             family: self.cfg.address_family,
             prefer: self.cfg.prefer,
             on_ambiguous: self.cfg.on_ambiguous,
+            kind: self.cfg.address_kind,
         };
         let access_ips = server.access_ips();
         let addr = select_address(&server.addresses, &access_ips, &selection).map_err(|err| {
@@ -852,13 +854,24 @@ impl OpenStackClient {
             // configured name next to the names Nova actually advertised makes
             // the two cases (`networks: []` vs `networks: ["other"]`)
             // distinguishable at a glance.
+            //
+            // A strict `address_kind` miss (appendix D) names the *kind* that
+            // was demanded (`no_floating` / `no_fixed`) rather than the generic
+            // `no_address_kind`, so the log says what the deployment needed and
+            // what the instance did not have. The client still sees a refusal
+            // indistinguishable from every other one.
+            let reason = match err {
+                SelectionError::NoKind => self.cfg.address_kind.no_address_reason(),
+                other => other.reason(),
+            };
             let networks: Vec<&str> = server.addresses.keys().map(String::as_str).collect();
             tracing::warn!(
                 target: "openstack",
                 principal,
                 route_by = route.as_str(),
-                reason = err.reason(),
+                reason,
                 configured_network = %self.cfg.network,
+                address_kind = self.cfg.address_kind.no_address_reason(),
                 networks = ?networks,
                 "instance address could not be selected"
             );
