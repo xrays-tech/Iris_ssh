@@ -214,6 +214,20 @@ pub struct GatewayContext {
     pub server_config: Arc<ServerConfig>,
 }
 
+/// The front leg's key algorithms after the E.3 tightening: russh's default
+/// list minus the legacy SHA-1 `ssh-rsa` (`Rsa { hash: None }`). Every other
+/// entry — rsa-sha2-512, rsa-sha2-256, ed25519, ecdsa, sk-* — survives in
+/// order, so the only behaviour change is that a SHA-1 RSA signature can no
+/// longer be negotiated on the front leg. RSA remains reachable through
+/// rsa-sha2 only; the filter names no other algorithm, so a future non-RSA
+/// entry is kept by default (plan-openstack E.3, revertable as this commit).
+fn without_sha1_ssh_rsa(key: &[russh::keys::Algorithm]) -> Vec<russh::keys::Algorithm> {
+    key.iter()
+        .filter(|algo| !matches!(**algo, russh::keys::Algorithm::Rsa { hash: None }))
+        .cloned()
+        .collect()
+}
+
 /// Composition root for subsystem interception (propose.md §3.7, B2 + B3).
 ///
 /// The policy questions ("is SFTP enabled?", "does this grant ask for
@@ -576,6 +590,13 @@ impl GatewayContext {
         let auth_timing =
             auth_rejection_timing(config.limits.auth_timeout, config.limits.auth_rejection_pad);
         let mut server_pref = ServerConfig::default().preferred;
+        // Front-leg SHA-1 tightening (plan-openstack E.3): russh's default
+        // `key` list still carries the legacy `Rsa { hash: None }` ("ssh-rsa",
+        // SHA-1). That entry feeds both the KEX host-key negotiation and the
+        // `server-sig-algs` extension, so dropping it means the front leg will
+        // no longer negotiate a SHA-1 user or host RSA signature; rsa-sha2-512
+        // and rsa-sha2-256 stay. Independent, revertable commit (E.6.1-7).
+        server_pref.key = std::borrow::Cow::Owned(without_sha1_ssh_rsa(&server_pref.key));
         // Optional explicit cipher-order override from `[relay] ciphers` (A/B
         // throughput comparisons; empty = russh default chacha20-first order).
         if !config.relay.ciphers.is_empty() {
@@ -2335,6 +2356,73 @@ mod tests {
             result: Ok(ok_response()),
         }));
         assert_eq!(ctx.server_config.max_auth_attempts, 10);
+    }
+
+    // ---- plan-openstack E.3: front-leg SHA-1 tightening ----
+
+    #[test]
+    fn front_leg_filter_drops_exactly_the_sha1_ssh_rsa_entry() {
+        // russh's own default still carries legacy ssh-rsa (SHA-1); the E.3
+        // filter removes that one entry and nothing else.
+        let default = ServerConfig::default().preferred.key;
+        let filtered = without_sha1_ssh_rsa(&default);
+
+        assert!(
+            !filtered.iter().any(|a| a.to_string() == "ssh-rsa"),
+            "SHA-1 ssh-rsa must be gone from the front leg"
+        );
+        assert_eq!(
+            filtered.len(),
+            default.len() - 1,
+            "exactly one entry is dropped"
+        );
+        assert_eq!(
+            filtered,
+            default
+                .iter()
+                .filter(|a| a.to_string() != "ssh-rsa")
+                .cloned()
+                .collect::<Vec<_>>(),
+            "order and every surviving algorithm are unchanged"
+        );
+        // RSA clients keep rsa-sha2-512/256, so the tightening is not a
+        // blanket RSA ban.
+        assert!(filtered.iter().any(|a| matches!(
+            a,
+            russh::keys::Algorithm::Rsa {
+                hash: Some(russh::keys::HashAlg::Sha512)
+            }
+        )));
+        assert!(filtered.iter().any(|a| matches!(
+            a,
+            russh::keys::Algorithm::Rsa {
+                hash: Some(russh::keys::HashAlg::Sha256)
+            }
+        )));
+    }
+
+    #[test]
+    fn built_server_advertises_no_sha1_ssh_rsa() {
+        // russh renders `server-sig-algs` straight from preferred.key, so
+        // this is exactly what the front leg tells OpenSSH clients about
+        // userauth signatures (E.3's observable contract).
+        let ctx = test_ctx(Arc::new(FixControlPlane {
+            result: Ok(ok_response()),
+        }));
+        let advertised: Vec<String> = ctx
+            .server_config
+            .preferred
+            .key
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert!(
+            !advertised.iter().any(|n| n == "ssh-rsa"),
+            "front leg must not advertise ssh-rsa, got {advertised:?}"
+        );
+        assert!(advertised.iter().any(|n| n == "rsa-sha2-512"));
+        assert!(advertised.iter().any(|n| n == "rsa-sha2-256"));
+        assert!(advertised.iter().any(|n| n == "ssh-ed25519"));
     }
 
     // ---- M3 B5: HA support (stateless replicas can coexist) ----

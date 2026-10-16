@@ -504,6 +504,8 @@ ALL_CASES=(
   case_control_plane_failopen
   case_wire_ordering
   case_client_matrix
+  # plan-openstack appendix E (layer E3): front-leg SHA-1 tightening.
+  case_front_leg_ssh_rsa_rejected
   case_sftp_intercept
   case_hostkey_rotation
   case_host_cert_authority
