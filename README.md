@@ -73,7 +73,7 @@ systemd 参考单元在 `deploy/ssh-gw.service`（已配好优雅排水和基本
    ```
    权限不对会拒绝启动（fail-closed）。
 2. **准备后端授权**：把**终端用户自己的公钥**加进各后端机器的 `authorized_keys`。网关没有自己的后端私钥，也不需要——它拿用户转发来的 ssh-agent 去拨号（`ssh -A` / `-o ForwardAgent=yes`）。
-3. **配置控制面**：网关自己不存"用户名→目标"映射，必须有一个控制面服务响应 `POST /api/v1/resolve`。请求体示例：
+3. **配置路由来源（默认控制面，共三种模式）**：默认方式下网关把用户名发给控制面服务，由它响应 `POST /api/v1/resolve` 返回目标；不想搭控制面可用下方"可选：简单映射表即路由"或"可选：OpenStack 实例即路由"。控制面请求体示例：
 
    ```json
    {"principal": "alex_host1", "client_ip": "203.0.113.7", "key_fp": "SHA256:..."}
@@ -127,11 +127,37 @@ default_backend_user = "ubuntu"  # 或靠实例 metadata / backend_user_map
 - **`scope = "cross_project"`（不指定 Project，实验）**：让网关以 `all_tenants=1` 解析任意项目的实例（UUID 全局唯一可直接命中；名字要求全云唯一）。**必须 `auth_method="password"`**（app-credential 被 Keystone 锁死在单项目），且该 `project_id` 是**认证 scope**（决定 token 带哪些角色）。⚠ 网关将持有能看/能拨其角色覆盖的一切实例的凭据——**仅限内网/实验云且 Nova 策略宽松（允许项目级 admin 用 `all_tenants`），严禁公网/共享**。启动会有 `scope = "cross_project": this is a LAB mode` WARN。
 - **`address_kind = "floating"`（只取浮动 IP）**：当实例只在公网侧可达（fixed/VXLAN 需要手工打通网络）时用。**前置条件：实例已关联浮动 IP**（Neutron 操作）；否则一律 `no_floating` 拒绝。无浮动地址一律拒绝、绝不回退到 fixed。
 
-完整说明、安全边界与已知限制见 `docs/ops-runbook.md` §5.8 与 `docs/known-limitations.md` §9。
+完整说明、安全边界与已知限制见 `docs/ops-runbook.md` §5.8 / §5.9 与 `docs/known-limitations.md` §9 / §11。
+
+### 可选：简单映射表即路由
+
+不想搭控制面、也没有 OpenStack 时，可以把登录用户名直接映射到目标后端。启用后它成为**唯一路由权威**：表内用户名命中即用该行拨号，表外一律拒绝（无回退、无控制面）。
+
+**与 `[control_plane]`、`[openstack]` 互斥**（三者只可同时启用其一）。开启需显式确认 `allow_any_authenticated_key=true`——任何通过前腿验签的 key 都可到达其 principal 映射的后端，仅用于实验室/内网。
+
+```toml
+[mapping]
+enabled = true
+mapping_file = "/etc/ssh-gw/mappings.toml"
+allow_any_authenticated_key = true   # 实验室授权语义，启用时必填
+# recording = false                  # 默认不录；映射会话需显式 recording = true 才录
+```
+
+映射文件（`mappings.toml`）每行一个 `[[entries]]`：
+
+```toml
+[[entries]]
+username = "alex"        # 登录用户名（须满足 principal 语法、表内唯一）
+host = "10.0.0.7"        # 目标后端 host（IP 或可解析名）
+port = 22                # 可选，默认 22
+user = "alex"            # 可选，默认同 username（后端登录用户）
+```
+
+表在启动时一次性加载并常驻内存，**改文件需重启才生效**；文件不可读/损坏/超 4 MiB / 非符号链接/group-other 可写也拒绝启动（fail-closed）。
 
 ## 使用
 
-客户端不用装任何东西，普通 OpenSSH 即可。**必须转发 ssh-agent**（`-A` 或 `-o ForwardAgent=yes`）——网关没有自己的后端私钥，会拿你 agent 里的 key 去拨号。用户名按控制面规则或 OpenStack 路由填。
+客户端不用装任何东西，普通 OpenSSH 即可。**必须转发 ssh-agent**（`-A` 或 `-o ForwardAgent=yes`）——网关没有自己的后端私钥，会拿你 agent 里的 key 去拨号。用户名按控制面规则 / OpenStack 实例路由 / 简单映射表填。
 
 ```bash
 # 控制面：用户名即路由
@@ -144,6 +170,9 @@ sftp -o ForwardAgent=yes -P 2222 alex_host1@gw.example.com
 ssh -A -p 2222 550e8400-e29b-41d4-a716-446655440000@gw.example.com
 # OpenStack：实例名（小写）即用户名（需 route_by=["uuid","name"]）
 ssh -A -p 2222 web-1@gw.example.com
+
+# 简单映射：映射表里的用户名即路由（需 [mapping] enabled）
+ssh -A -p 2222 mapped_alex@gw.example.com
 ```
 
 被连载的会话行为和直连后端基本一致；端口转发（`direct-tcpip`）一律拒绝——网关不是出站跳板，也没有任何配置能放开它。
