@@ -557,6 +557,10 @@ ALL_CASES=(
   case_openstack_no_floating_rejected
   # the `any` default must stay opt-in: a fixed-only instance still connects.
   case_openstack_address_kind_default
+  # plan-mapping §6.2: the mapping table is the sole routing authority — a
+  # mapped principal runs on the agent-key-only backend, an unmapped one is
+  # refused, and the audit names `mapping` as the source.
+  case_mapping_route
 )
 
 resolve_case_path() {

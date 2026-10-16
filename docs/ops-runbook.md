@@ -87,6 +87,10 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `address_kind` | `any` | `any`（默认，= 现状零回归）\| `floating`\| `fixed`：**硬过滤**（在 `prefer` 排序前按地址种类过滤候选）。`floating` 只取浮动 IP、实例无浮动 → 拒绝 `reason="no_floating"`（**绝不回退 fixed**）；`fixed` 镜像（`no_fixed`）。公网可达部署用 `floating`，避免网关拨到不可达的 VXLAN 私网地址 |
 | | `default_backend_user` / `backend_user_metadata_key` | — / `""` | 后端登录用户：metadata 命中 → 映射规则 → `default_backend_user`（enabled 时必填） |
 | | `ssh_port` | `22` | 所有实例的 SSH 端口（实例文档里不带端口） |
+| `[mapping]` | `enabled` | `false` | **默认关**：缺本节或 `enabled=false` 时行为与旧版完全一致（路由谓词对所有 principal 都答"控制面"）。启用时映射表成为**唯一**路由权威——表内用户名按行解析，表外一律拒绝（`reason=not_found`）。**启用即要求 `[openstack]` 非启用**（两个 live 路由权威 → 配置错误）**且 `[control_plane]` 整节省失**（该节在此模式下是死配置、永不被咨询，存在即拒绝启动）——即三者只可同时启用其一 |
+| | `mapping_file` | — | 映射表文件路径（TOML，`[[entries]]` 行）。启动时一次性加载并常驻内存，**改文件需重启**才生效 |
+| | `allow_any_authenticated_key` | — | **必须为 `true`**（启用态）：授权仍是 agent 穿透的实验室模式，任意通过前腿验签的 key 可达其 principal 映射的后端。启用即启动告警，见 §5.9 |
+| | `recording` | `false` | 映射会话是否录制；默认 `false`（不录）。`true` 且全局 `[recording] dir` 已配置才生效 |
 | `[limits]` | `max_sessions` / `max_sessions_per_ip` | `10000` / `20` | 准入 |
 | | `auth_timeout` | `30s` | 首个 "none" 认证探测的 backoff 上限（实际延迟 = `min(auth_timeout, auth_rejection_pad)`；`0s` 关闭每连接 initial backoff，**保留每次拒绝的持续 pad**，公钥/证书为主的生产可用；非整个认证期预算） |
 | | `auth_rejection_pad` | `1s` | 每次认证拒绝的恒时填充（防时间泄露） |
@@ -255,6 +259,47 @@ ssh_port = 22
 | 探测阶段有 `sshgw_auth_offered_total`、零 Nova 请求 | 预认证探测按设计不联网 | 属预期（MUST1），不是"解析没生效" |
 
 **可观测**：`sshgw_openstack_resolve_{ok,err}_total`、`sshgw_openstack_resolve_latency_seconds`（与既有 `sshgw_resolve_*` 分开，两条源的健康度不可混淆）；审计记录带 `resolve_source="openstack"`；pre-auth 失败没有会话也没有审计记录，只有一条 `target=resolve` 的结构化 WARN（含 principal / client_ip / source / reason）。
+
+### 5.9 简单映射模式（`[mapping]`，本地表路由）
+
+**定位**：显式实验室/内网 PoC 模式，不是生产路由方案。它去掉控制面这条依赖，让"本地 `mappings.toml` 表本身就是路由"：客户端用 `username@gw` 登录，网关查本地表拿到 `host` / `port` / `user`，再用转发来的 agent 签名拨进目标后端。默认关闭；不写 `[mapping]` 节时行为与旧版完全一致（路由谓词对所有 principal 都答"控制面"）。
+
+**启用条件（缺一不可）**
+```toml
+[mapping]
+enabled = true
+mapping_file = "/etc/ssh-gateway/mappings.toml"
+allow_any_authenticated_key = true   # 必须显式置 true，接受其实验室语义
+recording = false                   # 默认不录映射会话；true 且全局 [recording] dir 已配才生效
+```
+此时 `[control_plane]` 与 `[openstack]` 整节都不必写——**启用态三者只可同时启用其一**（与 `[control_plane]`、`[openstack]` 互斥，无控制面、无 OpenStack 回退）。启动日志会打 `target=mapping` 的 WARN（`[mapping] allow_any_authenticated_key = true: … This is a lab mode, not a production control.`），看到它才说明模式确实打开了。
+
+**安全语义（写进变更单）**
+- 任意通过前腿验签的密钥，只要其用户名在表里，就能登进表指向的后端，**范围仅受映射表覆盖的用户名限制**。表是本地文件，谁能读/改它决定了爆炸半径——**启动时权限门：非 group/other 可写、无符号链接，fail-closed**。
+- 表外用户名一律拒绝（客户端收到同构 SSH auth reject）。目标 host **只能**来自表，用户名里出现 host/IP 是不可能的（SSRF 红线）。
+- 表在启动时一次性加载并常驻内存；**改文件不热加载，需重启**才生效。
+
+**表格式（TOML，`[[entries]]`）**
+```toml
+[[entries]]
+username = "alice"            # 该行的 SSH 登录 principal
+host = "10.0.0.12"           # 后端 host（IP 或可解析名）
+port = 22                   # 后端端口（默认 22）
+user = "alice"              # 后端登录 user（默认同 username）
+```
+启动时校验（任一失败 → 拒绝启动）：TOML 良构、`username` 非空且**唯一**（重复即 `duplicate username` 错误）、`port` ∈ `[1,65535]`、`user` 缺省 = `username`；不可读/越界文件、符号链接、>4 MiB、坏 TOML 同样 fail-closed。
+
+**排障**
+| 症状 / 日志关键字 | 含义 | 处置 |
+|---|---|---|
+| `config error: mapping_file: …`（启动即拒） | 表加载失败：缺失/不可读/不可写/符号链接/越界/坏 TOML/重复 username/端口越界 | 修文件与权限（`stat`、`ls -l`），重启 |
+| `target=resolve` WARN，`reason="not_found"` | principal 不在表里（或含不可解析的 `@` 等） | 确认 `username` 在 `[[entries]]`；表外按设计拒绝，不是 bug |
+| `target=mapping` WARN：`the [mapping] table is empty` | 表为空，所有人被拒 | 填 `[[entries]]` 或临时关 `[mapping]` |
+| 表内但登录失败 | 后端 `authorized_keys` / `user` 不匹配 | 看 `user` 字段与后端 `authorized_keys` |
+| 改表后路由不变 | 设计不热加载 | 重启网关 |
+| `sshgw_mapping_resolve_miss_total` 增长 | 有人在用表外用户名登录（被拒） | 属预期，可结合 `resolve_source` 审计 |
+
+**可观测**：`sshgw_mapping_resolve_{ok,miss}_total`、`sshgw_mapping_resolve_latency_seconds`（与既有 `sshgw_resolve_*` 分开，两条源的健康度不可混淆）；审计记录带 `resolve_source="mapping"`，`target_host` / `target_port` / `target_user` 来自表行；pre-auth 失败没有会话也没有审计记录，只有一条 `target=resolve` 的结构化 WARN。
 
 ---
 

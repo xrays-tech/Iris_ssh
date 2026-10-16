@@ -18,14 +18,20 @@ ssh alex_host1@gw.example.com
 
 ## 功能
 
-- **用户名即路由（控制面 / OpenStack 二选一）**
+- **用户名即路由（控制面 / OpenStack / 简单映射 三选一）**
   - 控制面：`POST /api/v1/resolve` 按用户名返回目标后端 `{host, port, user}` 和策略；拒绝 403，未知 404。
   - **OpenStack（默认关，见下）**：规范形式的实例 UUID（或实例名）由 Nova 解析成目标地址和登录用户。
+  - **简单映射（默认关）**：本地 `mappings.toml` 表把登录用户名直接映射到目标后端 `{host, port, user}`，无需控制面或 OpenStack。
 - **OpenStack 路由（实验室模式）**：开启 `[openstack]` 后（当前唯一可启用组合是 `routing="openstack_only"` + `authorization="openstack_only"` + `allow_any_authenticated_key=true`）——
   - `route_by = ["uuid"]`（默认）按实例 UUID 解析；加 `"name"` 可再按**实例名**（小写）解析，重名实例拒绝不猜；
   - `scope = "single_project"`（默认）只解析本项目的实例；`"cross_project"` 用 `all_tenants=1` 解析**任意项目**的实例（不指定 Project，凭条件见部署）；
   - `address_kind = "any"（默认）| "floating" | "fixed"`：`"floating"` 只取浮动 IP（公网可达前提），无浮动地址即拒绝、绝不回退 fixed；
   - 后端登录用户按 实例 metadata → `[[openstack.backend_user_map]]` 规则 → `default_backend_user` 解析。
+- **简单映射模式（实验室模式，默认关）**：开启 `[mapping]` 后——
+  - 路由唯一依据是本地 `mappings.toml`：`[[entries]]` 每行把一个 `username` 映射到 `host` / `port`（默认 22）/ `user`（默认同 `username`）；表内用户名命中即用该行，**表外一律拒绝**；
+  - 与 `[control_plane]`、`[openstack]` **互斥**（三者只可同时启用其一），无控制面、无 OpenStack 回退；
+  - 授权仍是 `allow_any_authenticated_key=true`：任何通过前腿验签的 key 都可到达其 principal 映射的后端，仅用于实验室/内网；
+  - 表在启动时一次性加载并常驻内存，**改文件需重启才生效**；`recording` 默认 false（映射会话默认不录，需显式 `recording = true`）。
 - **双会话中继**：终结客户端 SSH（server 腿）+ 拨号后端（client 腿），双向转发；上行有窗口熔断（`outbound_guard`）防止缓冲无限增长。
 - **认证**：客户端 → 网关支持公钥 / CA 签发的用户证书；网关 → 后端只有一种方式——转发客户端的 ssh-agent（`ssh -A` 语义）。签名算法对齐当前 SSH 生态：**后端 RSA 拨号走 `rsa-sha2-512`（默认，可配 `[backend] rsa_signature_hash="sha256"`）**，ed25519 / ecdsa 原生支持；**前腿与后端 host-key 协商都不再包含 `ssh-rsa`（SHA-1）**。
 - **防爆破 / 防时序**：每次认证拒绝有恒定时间填充（`auth_rejection_pad`），尝试次数上限（`max_auth_attempts`），每 IP 并发上限。

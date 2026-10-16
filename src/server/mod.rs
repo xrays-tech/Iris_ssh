@@ -3149,6 +3149,92 @@ mod tests {
         );
     }
 
+    /// A minimal pure-mapping-mode config: `[mapping]` is enabled, the table
+    /// file is the routing authority, and neither `[control_plane]` nor
+    /// `[openstack]` is present (both are mutually exclusive with a live
+    /// mapping, plan-mapping §3.1). `addr = "127.0.0.1:0"` lets the test bind
+    /// an ephemeral port, mirroring `openstack_pure_toml`.
+    fn mapping_pure_toml(host_key: &str, mapping_file: &str) -> String {
+        format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [{{ path = "{host_key}", state = "active" }}]
+            [backend]
+            host_key_policy = "accept-new"
+            [mapping]
+            enabled = true
+            mapping_file = "{mapping_file}"
+            allow_any_authenticated_key = true
+        "#,
+            host_key = host_key,
+            mapping_file = mapping_file
+        )
+    }
+
+    #[test]
+    fn mapping_bad_table_file_refuses_boot() {
+        // A [mapping] section whose file does not exist must stop the boot:
+        // the table is loaded once, fail-closed, at build time (plan-mapping
+        // §3.4), not lazily on the first login.
+        let mut keys = TestKeyGuard::new();
+        let host_key = keys.add_key();
+        let missing = std::env::temp_dir().join(format!(
+            "sshgw-mapping-{}-missing-{}.toml",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let missing_str = missing.to_string_lossy();
+        let config = GatewayConfig::parse(&mapping_pure_toml(&host_key, &missing_str)).unwrap();
+        // Extract the error without `unwrap_err()`: `GatewayContext` is not
+        // `Debug`, so the `Result<Arc<GatewayContext>, _>` error path must be
+        // reached by value instead.
+        let err = match GatewayContext::build(config) {
+            Err(e) => e,
+            Ok(_) => panic!("a nonexistent mapping file must refuse the boot"),
+        };
+        assert!(
+            matches!(err, Error::Config(_)),
+            "the refusal must be a config error, not a runtime panic: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mapping_file"),
+            "the error must name the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn mapping_empty_table_warns_and_still_boots() {
+        // An empty [mapping] table is legal: it boots, but every login is refused
+        // (plan-mapping §6.4 — the boot warning names this; tracing is not
+        // captured in unit tests, so we assert the observable behaviour instead:
+        // the table is the sole routing authority, so every principal goes to it).
+        let mut keys = TestKeyGuard::new();
+        let host_key = keys.add_key();
+        let empty_path = std::env::temp_dir().join(format!(
+            "sshgw-mapping-{}-empty-{}.toml",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        // A comment-only file: valid TOML, zero entries.
+        std::fs::write(&empty_path, "# empty mapping table\n").unwrap();
+        let empty_str = empty_path.to_string_lossy();
+        let config = GatewayConfig::parse(&mapping_pure_toml(&host_key, &empty_str)).unwrap();
+        let ctx = GatewayContext::build(config)
+            .expect("an empty mapping table must still boot (it just refuses everyone)");
+        assert_eq!(
+            ctx.router.route("mapped_user"),
+            crate::resolve::ResolveRoute::Mapping,
+            "the mapping table is the sole routing authority"
+        );
+        assert_eq!(
+            ctx.router.route("anyone_else"),
+            crate::resolve::ResolveRoute::Mapping
+        );
+    }
+
     /// A control-plane client that only counts how often it was asked.
     struct CountingResolve {
         calls: Arc<std::sync::atomic::AtomicU64>,

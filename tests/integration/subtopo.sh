@@ -114,6 +114,20 @@ SUBTOP_OS_EXTRA="${SUBTOP_OS_EXTRA:-}"
 # the password, so a placeholder value is fine.
 SUBTOP_OS_SCOPE="${SUBTOP_OS_SCOPE:-}"
 
+# --- Simple mapping mode (plan-mapping §6.2) ------------------------------
+# SUBTOP_MAPPING          non-empty => render a [mapping] section AND write the
+#                           local mapping table; suppress [control_plane] (the
+#                           table is the routing authority). Empty keeps today's
+#                           topology byte-for-byte, which is what "default off"
+#                           means.
+# SUBTOP_MAPPING_FILE     path to a pre-written mappings.toml. Empty => a
+#                           default single-entry file built from $PRINCIPAL and
+#                           $BACKEND_USER.
+# SUBTOP_MAPPING_RECORD   "true"/"false" -> [mapping] recording (default false).
+SUBTOP_MAPPING="${SUBTOP_MAPPING:-}"
+SUBTOP_MAPPING_FILE="${SUBTOP_MAPPING_FILE:-}"
+SUBTOP_MAPPING_RECORD="${SUBTOP_MAPPING_RECORD:-false}"
+
 # toml_arr "a b c" -> ["a","b","c"]  (empty -> [])
 toml_arr() {
   local out='[' first=1 v
@@ -196,10 +210,11 @@ subtopo_start() {
   # No [backend] credential: the gateway signs for the backend leg with the
   # client's forwarded agent (plan-agent-only D3), so [backend] carries only the
   # host-key policy.
-  # [control_plane] disappears in OpenStack pure mode: the gateway has to boot
-  # with no control plane at all there, and every OpenStack case re-proves it.
+  # [control_plane] disappears in OpenStack pure mode (every OpenStack case
+  # re-proves it) AND in simple mapping mode: the table is the routing
+  # authority, so the gateway has to boot with no control plane there too.
   local _cp_toml=""
-  if [ -z "$SUBTOP_OPENSTACK" ] || [ "$SUBTOP_OPENSTACK_PURE" = "0" ]; then
+  if [ -z "$SUBTOP_MAPPING" ] && { [ -z "$SUBTOP_OPENSTACK" ] || [ "$SUBTOP_OPENSTACK_PURE" = "0" ]; }; then
     _cp_toml="$(printf '[control_plane]\nurl="http://127.0.0.1:%s/api/v1/resolve"\ncache_ttl="%s"\ntimeout="2s"\nfail_open=%s\ncache_ttl_jitter="%s"\n' \
       "$ST_CP_PORT" "$SUBTOP_CACHE_TTL" "$SUBTOP_FAIL_OPEN" "$SUBTOP_TTL_JITTER")"
   fi
@@ -223,10 +238,25 @@ subtopo_start() {
       "$_os_scope" "$_os_route_by" "$SUBTOP_OS_EXTRA")"
   fi
 
-  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n%s%s\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
+  # Simple mapping mode: the local table is the routing authority. The file is
+  # written here so the gateway's fail-closed loader can read it at boot; the
+  # table is then immutable in memory (no per-session re-read).
+  local _mapping_toml=""
+  if [ -n "$SUBTOP_MAPPING" ]; then
+    if [ -n "$SUBTOP_MAPPING_FILE" ]; then
+      cp "$SUBTOP_MAPPING_FILE" "$SUBTOPO_DIR/mappings.toml" || return 1
+    else
+      printf '[[entries]]\nusername="%s"\nhost="127.0.0.1"\nport=%s\nuser="%s"\n' \
+        "$PRINCIPAL" "$ST_SSHD_PORT" "$BACKEND_USER" > "$SUBTOPO_DIR/mappings.toml"
+    fi
+    _mapping_toml="$(printf '[mapping]\nenabled = true\nmapping_file="%s"\nallow_any_authenticated_key = true\nrecording = %s\n' \
+      "$SUBTOPO_DIR/mappings.toml" "$SUBTOP_MAPPING_RECORD")"
+  fi
+
+  printf '[listen]\naddr="127.0.0.1:%s"\n[host_keys]\nkeys=[{path="%s",state="active"}]\n[relay]\nwindow_size="%s"\nmax_packet="32KB"\noutbound_guard=true\n%s\n[backend]\nhost_key_policy="accept-new"\n[pool]\nenabled=false\nkeepalive_interval="%s"\nkeepalive_max_miss=%s\n%s%s%s\n[limits]\nauth_timeout="0s"\n[metrics]\naddr="127.0.0.1:%s"\n' \
     "$ST_GW_PORT" "$SUBTOP_HOSTKEY" "$SUBTOP_WINDOW" "$_env_al" \
     "$SUBTOP_KEEPALIVE_INTERVAL" "$SUBTOP_KEEPALIVE_MAX_MISS" \
-    "$_cp_toml" "$_os_toml" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
+    "$_cp_toml" "$_os_toml" "$_mapping_toml" "$ST_MET_PORT" > "$SUBTOPO_DIR/gw.toml"
 
   # B3 sftp-intercept section (defaults are inert; older gateways that predate
   # these fields simply ignore the unknown sections).
@@ -388,6 +418,24 @@ openstack_topo_start() {
   # Second argument is the instance table, not a mode: SUBTOP_OPENSTACK is the
   # on/off switch (anything non-empty), SUBTOP_OPENSTACK_RULES is the table.
   [ -n "${2:-}" ] && SUBTOP_OPENSTACK_RULES="$2"
+  subtopo_start
+}
+
+# mapping_topo_start <authorized_keys-file> [mappings-toml-file]
+#
+# Sub-topology with an agent-key-only backend *and* simple mapping mode
+# (plan-mapping §6.2): the gateway resolves the SSH username through the local
+# table — no control plane, no OpenStack (both are mutually exclusive — and
+# reaches the backend only by asking the client's forwarded agent to sign.
+# No [control_plane] is rendered, so a green case also proves the gateway boots
+# with no control plane at all.
+mapping_topo_start() {
+  SUBTOP_SSHD_AUTHORIZED_KEYS="$1"
+  SUBTOP_AGENT_FORWARDING="true"
+  SUBTOP_MAPPING="1"
+  # Second argument is the mapping table (if any); otherwise a default
+  # single-entry table is built from $PRINCIPAL and $BACKEND_USER.
+  [ -n "${2:-}" ] && SUBTOP_MAPPING_FILE="$2"
   subtopo_start
 }
 

@@ -185,6 +185,53 @@ timeout = "2s"
 #
 # ssh_port = 22          # every instance's SSH port — instances do not carry one
 
+# --- Simple mapping mode (plan-mapping §6.2) -------------------------------
+# DISABLED BY DEFAULT: with this section absent or `enabled = false` the
+# gateway behaves exactly as before, which is what keeps the feature
+# byte-for-byte inert — and `enabled = false` is accepted whatever the other
+# fields say.
+#
+# ⚠ When enabled, the local mapping table is the *sole* routing authority:
+# every SSH username that appears in the table is routed to the target it
+# names, and every other username is refused outright. There is NO control
+# plane and NO OpenStack fallback — the section is mutually exclusive with
+# both of them: enabling it while a `[control_plane]` section is present at
+# all (dead config, never consulted) or while `[openstack]` is enabled
+# (two live routing authorities) is a config error.
+#
+# The mapping grant's only credential is the forwarded agent identity, so
+# authorization is the gateway's `allow_any_authenticated_key` lab mode: any
+# key that passes front-leg signature verification can reach the backend its
+# principal maps to. That is why the validator demands `allow_any_authenticated_key
+# = true` explicitly and the gateway warns at startup. Never enable it on a
+# shared or internet-facing gateway; see `docs/known-limitations.md`.
+#
+# The example below is the enabled shape, commented out. `recording` defaults
+# to false: mapped sessions are NOT recorded unless you opt in here (and the
+# global [recording] dir is configured), so a globally-disabled recording
+# stays disabled for mapped sessions too.
+#
+# [mapping]
+# enabled = true
+# mapping_file = "/etc/ssh-gateway/mappings.toml"
+# allow_any_authenticated_key = true
+# recording = false        # opt-in: default false (mapped sessions are not
+#                          # recorded unless you set this to true)
+#
+# The table is a TOML file of `[[entries]]` rows; each row maps a login
+# username to a backend destination:
+#
+#     [[entries]]
+#     username = "alice"           # the SSH principal this row answers for
+#     host = "10.0.0.12"           # backend host (IP or resolvable name)
+#     port = 22                   # backend port (default 22)
+#     user = "alice"              # backend login user (default = username)
+#
+# The file is loaded ONCE at boot, fail-closed (well-formed TOML, no duplicate
+# usernames, not group/other-writable, no symlinks, ≤ 4 MiB), and then held
+# immutable in memory — editing the file does NOT reload it, so a change to
+# the table takes effect only on the next gateway restart.
+
 [limits]
 max_sessions = 10000
 max_sessions_per_ip = 20
