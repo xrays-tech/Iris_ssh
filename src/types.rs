@@ -284,6 +284,37 @@ impl HostKeyPolicy {
     }
 }
 
+/// The RSA signature hash the gateway asks the forwarded agent to sign with on
+/// the backend leg (plan-openstack E.1).
+///
+/// Both variants are rsa-sha2; the legacy SHA-1 `ssh-rsa` is deliberately not
+/// representable, so no configuration can ask for it (red line 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RsaSignatureHash {
+    /// `rsa-sha2-512`. OpenSSH's own first choice, and the strongest option;
+    /// servers that only accept `-256` date to OpenSSH 7.2/7.3 (2016).
+    #[default]
+    Sha512,
+    /// `rsa-sha2-256`, for those rare older servers.
+    Sha256,
+}
+
+impl RsaSignatureHash {
+    /// Parse the textual `[backend] rsa_signature_hash` value.
+    pub fn parse(value: &str) -> Result<Self, crate::error::ConfigError> {
+        match value {
+            "sha512" => Ok(RsaSignatureHash::Sha512),
+            "sha256" => Ok(RsaSignatureHash::Sha256),
+            other => Err(crate::error::ConfigError::Invalid {
+                field: "backend.rsa_signature_hash".into(),
+                reason: format!(
+                    "unknown RSA signature hash {other:?} (expected \"sha512\" or \"sha256\")"
+                ),
+            }),
+        }
+    }
+}
+
 /// A monotonic, time-ordered session identifier (UUIDv7) that ties the client
 /// leg and backend leg audit/log lines together.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

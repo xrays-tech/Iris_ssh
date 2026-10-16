@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::{ConfigError, Error, Result};
-use crate::types::HostKeyPolicy;
+use crate::types::{HostKeyPolicy, RsaSignatureHash};
 
 /// Fully validated, ready-to-use gateway configuration.
 #[derive(Debug, Clone)]
@@ -94,6 +94,10 @@ pub struct RelayConfig {
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
     pub host_key_policy: HostKeyPolicy,
+    /// rsa-sha2 hash for backend publickey auth. Defaults to
+    /// [`RsaSignatureHash::Sha512`]; only `sha256` overrides it, for servers
+    /// that predate rsa-sha2-512 support (plan-openstack E.1).
+    pub rsa_signature_hash: RsaSignatureHash,
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +664,12 @@ struct RawRelay {
 #[derive(Debug, Deserialize)]
 struct RawBackend {
     host_key_policy: String,
+    #[serde(default = "default_rsa_signature_hash")]
+    rsa_signature_hash: String,
+}
+
+fn default_rsa_signature_hash() -> String {
+    "sha512".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1144,7 +1154,11 @@ impl GatewayConfig {
         };
 
         let host_key_policy = HostKeyPolicy::parse(raw.backend.host_key_policy.trim())?;
-        let backend = BackendConfig { host_key_policy };
+        let rsa_signature_hash = RsaSignatureHash::parse(raw.backend.rsa_signature_hash.trim())?;
+        let backend = BackendConfig {
+            host_key_policy,
+            rsa_signature_hash,
+        };
 
         // The gateway never shares a backend connection across sessions: its
         // identity is per-session (the end user's own forwarded agent), so a
@@ -1992,6 +2006,34 @@ fn parse_route_by(values: &[String]) -> std::result::Result<Vec<RouteKind>, Conf
 mod tests {
     use super::*;
 
+    /// `[backend] rsa_signature_hash` exists to reach servers that predate
+    /// rsa-sha2-512 support (OpenSSH 7.2/7.3). sha512 is the default; sha256
+    /// is the only override, and the key itself is absent from the TOML.
+    #[test]
+    fn parses_rsa_signature_hash_and_defaults_to_sha512() {
+        let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
+        assert_eq!(cfg.backend.rsa_signature_hash, RsaSignatureHash::Sha512);
+
+        let toml = minimal_toml().replace(
+            "host_key_policy = \"pinned\"",
+            "host_key_policy = \"pinned\"\nrsa_signature_hash = \"sha256\"",
+        );
+        let cfg = GatewayConfig::parse(&toml).expect("valid config");
+        assert_eq!(cfg.backend.rsa_signature_hash, RsaSignatureHash::Sha256);
+    }
+
+    /// Anything other than sha512/sha256 is refused, naming the field: the
+    /// backend leg has no SHA-1 fallback, so a typo must not silently become
+    /// one.
+    #[test]
+    fn rejects_unknown_rsa_signature_hash() {
+        let toml = minimal_toml().replace(
+            "host_key_policy = \"pinned\"",
+            "host_key_policy = \"pinned\"\nrsa_signature_hash = \"sha1\"",
+        );
+        assert_eq!(invalid_field(&toml), "backend.rsa_signature_hash");
+    }
+
     fn minimal_toml() -> String {
         r#"
             [listen]
@@ -2038,6 +2080,7 @@ mod tests {
         assert_eq!(cfg.host_keys.len(), 2);
         assert_eq!(cfg.host_keys[0].state, HostKeyState::Active);
         assert_eq!(cfg.backend.host_key_policy, HostKeyPolicy::Pinned);
+        assert_eq!(cfg.backend.rsa_signature_hash, RsaSignatureHash::Sha512);
         assert!(!cfg.pool.enabled);
         assert_eq!(cfg.pool.channels_per_conn, 8);
         assert_eq!(

@@ -257,8 +257,8 @@ pub struct BackendDialer {
     metrics: Metrics,
     dial_timeout: Duration,
     /// The RSA signature hash the forwarded agent is asked to sign with.
-    /// `HashAlg::Sha512` (plan-openstack E.1); non-RSA keys ignore it (see
-    /// [`signature_hash_alg`]).
+    /// `HashAlg::Sha512` unless `[backend] rsa_signature_hash` says otherwise;
+    /// non-RSA keys ignore it (see [`signature_hash_alg`]).
     rsa_signature_hash: HashAlg,
     /// Per-target dial circuit breaker (§3.8): after `threshold` consecutive
     /// dial failures a target is short-circuited so repeated channel opens don't
@@ -332,7 +332,10 @@ impl BackendDialer {
             verifier,
             client_config: Arc::new(client_config),
             metrics,
-            rsa_signature_hash: HashAlg::Sha512,
+            rsa_signature_hash: match config.backend.rsa_signature_hash {
+                crate::types::RsaSignatureHash::Sha512 => HashAlg::Sha512,
+                crate::types::RsaSignatureHash::Sha256 => HashAlg::Sha256,
+            },
             // A control plane's timeout doubles as the dial deadline; in
             // OpenStack pure mode there is no control plane, so fall back to
             // the OpenStack request timeout and finally the 2s default.
@@ -721,7 +724,48 @@ mod tests {
         assert!(dialer.dial_breaker.allows(&key_b), "B is unaffected by A");
     }
 
-    // --- backend RSA signature hash (plan-openstack E.1 / E.5.1) -----------
+    // --- backend RSA signature hash (plan-openstack E.1 / E.2 / E.5.1) -----
+
+    fn dialer_with_backend_toml(extra: &str) -> BackendDialer {
+        let assets = std::env::temp_dir().join(format!(
+            "sshgw-dialer-{}-{}",
+            std::process::id(),
+            unique_nonce("r")
+        ));
+        std::fs::create_dir_all(&assets).unwrap();
+        let host = assets.join("host");
+        let mut rng = rand::rng();
+        let key = PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+        let body = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        {
+            let f = std::fs::File::create(&host).unwrap();
+            let _ = f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        }
+        std::fs::write(&host, body).unwrap();
+        let toml = format!(
+            r#"
+            [listen]
+            addr = "127.0.0.1:0"
+            [host_keys]
+            keys = [ {{ path = "{}", state = "active" }} ]
+            [backend]
+            host_key_policy = "accept-new"
+            {extra}
+            [control_plane]
+            url = "http://127.0.0.1:1"
+            [pool]
+            enabled = false
+        "#,
+            host.to_string_lossy(),
+        );
+        let config = crate::config::GatewayConfig::parse(&toml).expect("config parses");
+        let verifier = Arc::new(HostKeyVerifier::new(HostKeyPolicy::AcceptNew, Vec::new()));
+        let dialer = BackendDialer::new(&config, verifier, Metrics::default(), None);
+        drop(std::fs::remove_dir_all(&assets));
+        dialer
+    }
 
     /// One OpenSSH public-key line per key type, the same way a forwarded
     /// identity reaches the gateway. The sk-* keys are hand-built (they are not
@@ -776,5 +820,45 @@ mod tests {
                 key.algorithm()
             );
         }
+    }
+
+    /// The RSA test key, taken from `TEST_PUBKEYS`.
+    fn rsa_test_key() -> russh::keys::PublicKey {
+        pubkey(TEST_PUBKEYS.last().expect("RSA entry").0)
+    }
+
+    /// RSA follows the configured hash; the default is Sha512 (E.8①).
+    #[test]
+    fn rsa_hash_follows_the_configured_value() {
+        let key = rsa_test_key();
+
+        let sha512 = dialer_with_backend_toml(r#"rsa_signature_hash = "sha512""#);
+        assert_eq!(sha512.rsa_signature_hash, HashAlg::Sha512);
+        assert_eq!(
+            signature_hash_alg(&key, sha512.rsa_signature_hash),
+            Some(HashAlg::Sha512),
+            "rsa-sha2-512 is the default posture"
+        );
+
+        let sha256 = dialer_with_backend_toml(r#"rsa_signature_hash = "sha256""#);
+        assert_eq!(sha256.rsa_signature_hash, HashAlg::Sha256);
+        assert_eq!(
+            signature_hash_alg(&key, sha256.rsa_signature_hash),
+            Some(HashAlg::Sha256),
+            "the sha256 override reaches the agent signing call"
+        );
+    }
+
+    /// Omitting the key entirely must give the same Sha512 default — the
+    /// default lives in the config parser, not in each construction site.
+    #[test]
+    fn rsa_hash_defaults_to_sha512_when_unconfigured() {
+        let key = rsa_test_key();
+        let dialer = dialer_with_backend_toml("");
+        assert_eq!(dialer.rsa_signature_hash, HashAlg::Sha512);
+        assert_eq!(
+            signature_hash_alg(&key, dialer.rsa_signature_hash),
+            Some(HashAlg::Sha512)
+        );
     }
 }
