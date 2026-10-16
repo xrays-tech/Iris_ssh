@@ -506,6 +506,8 @@ ALL_CASES=(
   case_client_matrix
   # plan-openstack appendix E (layer E3): front-leg SHA-1 tightening.
   case_front_leg_ssh_rsa_rejected
+  # plan-openstack appendix E (layer E4): backend signs rsa-sha2 via agent.
+  case_backend_rsa_signer
   case_sftp_intercept
   case_hostkey_rotation
   case_host_cert_authority

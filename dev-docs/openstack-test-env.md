@@ -145,6 +145,27 @@ ssh_port = 22
   `case_openstack_no_floating_rejected`（仅 fixed → 拒绝、`reason="no_floating"`、
   `resolve_ok=0`）与 `case_openstack_address_kind_default`（`any` 默认零回归：
   仅 fixed 实例仍可连接，日志无 kind 拒绝）。全量 test 304+4、集成 53P/0F/2S。
+ 2026-10-16  **附录 E 后端 RSA 签名真机验收（E4）**：
+            - 端用户密钥全程 RSA：`~/test-key.pem`（公钥已在 FLT-TEST-01 root 的
+              `authorized_keys`，直接 `ssh -i ~/test-key.pem root@172.16.31.27`
+              验证可登录——§6b 原"缺 key"仅指 `/tmp/gw-t3741-key` 那把 ed25519）。
+            - 脚本 `/tmp/run_flt_test01_e4_rsa.sh`（appendix D 脚本的 RSA 变体：
+              agent 与前腿均换 `test-key.pem`，正反馈断言 `RSA_OK` + 网关 debug
+              证据行；原 `/tmp/run_flt_test01.sh` 保留作附录 D 记录）。
+            - 结果：`RSA_OK / flt-test-01 / root`、e2e exit=0；网关 debug
+              `backend publickey auth user=root key_type=ssh-rsa
+              hash_alg=Some(Sha512)` —— E1 默认 sha512 生效，SHA-1 `ssh-rsa`
+              签名全程未出现（instance 现代 sshd 只收 rsa-sha2，若网关仍回退
+              SHA-1 此处必失败）。
+            - 审计 `resolve_source=openstack target_host=172.16.31.27
+              target_user=root auth_kind=agent agent_signatures=1
+              fingerprint=SHA256:NcEC…`；metrics `resolve_ok=1/err=0`、
+              `by_uuid=1`、`auth accept=1/reject=0`。原附录 D 失败点
+              `backend authentication as "root" failed` 已消失（失败根因是
+              ed25519 key 缺失，与签名算法无关；RSA key 路径直接闭环）。
+            - 附录 D floating-only 解析结论不变（fixed `192.168.3.219` 未出现在
+              任何日志行）。集成侧对应 `case_backend_rsa_signer`（本地 harness：
+              sshd posture 断言 + 会话 + `hash_alg=Some(Sha512)` 日志）。
 ```
 
 ## 6b. 剩余缺口
@@ -153,10 +174,11 @@ ssh_port = 22
   测试公钥已放 `authorized_keys`、`ssh -A <uuid>` 经网关完整登录成功（见 §6）。
 - 若要对 **T_3746** 那批实例（172.16.46.x）实测：仍需一台能到达该网段的网关机 +
   对应实例的登录用户/公钥部署（本机到达不了 172.16.46.x）。
-- **FLT-TEST-01 登录缺 key**（2026-10-16）：floating-only 解析已通（`target_host=
-  172.16.31.27`），但实例 `authorized_keys` 尚无 `/tmp/gw-t3741-key` 公钥 → root 后端
-  认证被拒。补 key 后重跑 `/tmp/run_flt_test01.sh` 即可完成目标②；不影响附录 D 的
-  解析验证结论。
+- **FLT-TEST-01 登录已闭环（RSA 路径，2026-10-16 E4）**：floating-only 解析已通
+  （`target_host=172.16.31.27`），RSA key `~/test-key.pem` 经网关完整登录 root
+  （`RSA_OK`，见 §6 附录 E E4 条目）。若另需 ed25519 key 路径（`/tmp/gw-t3741-key`
+  公钥仍不在实例 `authorized_keys`），补 key 后重跑 `/tmp/run_flt_test01.sh` 即可；
+  不影响附录 D/E 的既有结论。
 - 持久生产配置建议：`auth_method="application_credential"`（凭据 scope 到目标项目；
   T_3741 需另建一把 T_3741 作用域的 app-credential）+ `region="RegionOne"` +
   `nova_endpoint` 或 catalog 发现均可。
