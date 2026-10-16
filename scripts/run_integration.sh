@@ -546,6 +546,13 @@ ALL_CASES=(
   case_openstack_cross_project_disabled_default
   case_openstack_cross_project_requires_password
   case_openstack_password_not_in_single_project
+  # plan-openstack appendix D: address_kind="floating" is a strict filter —
+  # it picks the floating address when both kinds exist, and refuses (rather
+  # than falls back to fixed) when the instance has none.
+  case_openstack_floating_only
+  case_openstack_no_floating_rejected
+  # the `any` default must stay opt-in: a fixed-only instance still connects.
+  case_openstack_address_kind_default
 )
 
 resolve_case_path() {
