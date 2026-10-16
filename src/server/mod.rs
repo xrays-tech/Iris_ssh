@@ -525,8 +525,7 @@ impl GatewayContext {
         let mapping_cfg = config.mapping.as_ref();
         let mapping_enabled = mapping_cfg.is_some();
         let control_plane_needed =
-            !mapping_enabled
-                && (!openstack_enabled || routing == OpenStackRouting::Hybrid);
+            !mapping_enabled && (!openstack_enabled || routing == OpenStackRouting::Hybrid);
 
         let cp_resolver = match (config.control_plane.as_ref(), control_plane) {
             (Some(cp_cfg), Some(client)) => Some(Arc::new(Resolver::new(
@@ -619,7 +618,10 @@ impl GatewayContext {
         // configuration that intentionally opens up any key, and an empty table
         // refuses everyone. Both are operator-visible at boot.
         if mapping_enabled {
-            if mapping_cfg.as_ref().is_some_and(|cfg| cfg.allow_any_authenticated_key) {
+            if mapping_cfg
+                .as_ref()
+                .is_some_and(|cfg| cfg.allow_any_authenticated_key)
+            {
                 tracing::warn!(
                     target: "mapping",
                     "[mapping] allow_any_authenticated_key = true: any key that passes front-leg \

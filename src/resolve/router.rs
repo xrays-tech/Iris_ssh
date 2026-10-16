@@ -469,7 +469,7 @@ mod router_dispatch_tests {
 
     use crate::mapping::{MappingClient, MappingTable};
     use crate::resolve::{ControlError, ControlPlaneClient, ResolveRequest, ResolveResponse};
-    use crate::types::{Policy, Target, ResolveSource};
+    use crate::types::{Policy, ResolveSource, Target};
 
     use super::*;
 
@@ -804,9 +804,9 @@ mod router_dispatch_tests {
             Duration::from_secs(5),  // negative cache
             Duration::from_secs(1),  // transient coalesce
             Duration::from_secs(1),  // jitter
-            false,                    // fail-closed
-            threshold,                // breaker threshold
-            Duration::from_secs(60),  // breaker reset
+            false,                   // fail-closed
+            threshold,               // breaker threshold
+            Duration::from_secs(60), // breaker reset
             Duration::from_secs(3),  // per-request timeout
         ))
     }
@@ -818,12 +818,12 @@ mod router_dispatch_tests {
         // mapping enabled flips `route()` to always return Mapping.
         ResolveRouter::new(
             OpenStackRouting::Hybrid, // routing is irrelevant once mapping is on
-            false,                     // openstack disabled
+            false,                    // openstack disabled
             vec![RouteKind::Uuid],
-            true,                      // mapping enabled
-            None,                      // no control plane
-            None,                      // no openstack
-            m,                         // the mapping resolver (or absent)
+            true, // mapping enabled
+            None, // no control plane
+            None, // no openstack
+            m,    // the mapping resolver (or absent)
             Metrics::default(),
         )
     }
@@ -928,11 +928,7 @@ mod router_dispatch_tests {
         );
 
         let err = router
-            .authorize(
-                &Principal::parse("bob").unwrap(),
-                "SHA256:fp",
-                "127.0.0.1",
-            )
+            .authorize(&Principal::parse("bob").unwrap(), "SHA256:fp", "127.0.0.1")
             .await
             .expect_err("bob is not mapped");
 
@@ -950,10 +946,12 @@ mod router_dispatch_tests {
     }
 
     #[tokio::test]
-    async fn a_tripped_mapping_breaker_leaves_nothing_else_to_leak_into() {
-        // Failure-domain isolation: the mapping resolver has its own breaker,
-        // so a dead table cannot affect the (absent) control plane, and a
-        // mapping failure is recorded under the mapping counters only.
+    async fn repeated_mapping_misses_count_only_under_mapping_counters() {
+        // Failure-domain isolation, observed at the counters: a miss on the
+        // mapping route is recorded under the mapping counters only (no
+        // control-plane or openstack counter moves), and repeated misses never
+        // trip the mapping breaker (NotFound is a definitive success for the
+        // breakers — plan-mapping §6.3), so no other route is affected either.
         let table = mapping_table_from_content(
             "[[entries]]\nusername = \"alice\"\nhost = \"10.0.0.9\"\nport = 2222\n",
         );
@@ -976,11 +974,7 @@ mod router_dispatch_tests {
         // a failure that reaches the client.
         for _ in 0..3 {
             let err = router
-                .authorize(
-                    &Principal::parse("bob").unwrap(),
-                    "SHA256:fp",
-                    "127.0.0.1",
-                )
+                .authorize(&Principal::parse("bob").unwrap(), "SHA256:fp", "127.0.0.1")
                 .await
                 .expect_err("an unmapped user is refused");
             assert!(matches!(err, ResolveError::NotFound { .. }), "{err:?}");

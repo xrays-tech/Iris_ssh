@@ -20,9 +20,7 @@ use serde::Deserialize;
 
 use crate::error::ConfigError;
 use crate::resolve::{ControlError, ControlPlaneClient};
-use crate::types::{
-    parse_principal, Principal, Policy, ResolveRequest, ResolveResponse, Target,
-};
+use crate::types::{parse_principal, Policy, Principal, ResolveRequest, ResolveResponse, Target};
 
 /// Load-time cap on the mapping file: the whole file is parsed at boot, so an
 /// unbounded file is a boot-time memory foot-gun.
@@ -139,13 +137,14 @@ impl MappingTable {
         for raw in raw_entries {
             // The username must already be a wire-routable opaque token, so
             // every key that could route is actually reachable (design §4).
-            let principal = parse_principal(&raw.username).map_err(|error| ConfigError::Invalid {
-                field: "mapping_file".into(),
-                reason: format!(
-                    "mapping entry username {:?} is not a valid principal: {}",
-                    raw.username, error
-                ),
-            })?;
+            let principal =
+                parse_principal(&raw.username).map_err(|error| ConfigError::Invalid {
+                    field: "mapping_file".into(),
+                    reason: format!(
+                        "mapping entry username {:?} is not a valid principal: {}",
+                        raw.username, error
+                    ),
+                })?;
             let entry = validate_entry(&raw, &principal)?;
             // Duplicate usernames are a load error: the destination would be
             // ambiguous (design §4).
@@ -180,11 +179,9 @@ impl MappingTable {
 
 /// Validate one raw entry against the mapping-file rules (design §4).
 fn validate_entry(raw: &RawEntry, principal: &Principal) -> Result<MappingEntry, ConfigError> {
-    let invalid = |field: &str, reason: &str| {
-        ConfigError::Invalid {
-            field: "mapping_file".into(),
-            reason: format!("mapping entry {:?}: {} is {}", raw.username, field, reason),
-        }
+    let invalid = |field: &str, reason: &str| ConfigError::Invalid {
+        field: "mapping_file".into(),
+        reason: format!("mapping entry {:?}: {} is {}", raw.username, field, reason),
     };
 
     if raw.host.is_empty() {
@@ -209,7 +206,10 @@ fn validate_entry(raw: &RawEntry, principal: &Principal) -> Result<MappingEntry,
     }
     // The user defaults to the principal, which the grammar already
     // guarantees non-empty; the explicit check only guards `user = ""`.
-    let user = raw.user.clone().unwrap_or_else(|| principal.as_str().to_owned());
+    let user = raw
+        .user
+        .clone()
+        .unwrap_or_else(|| principal.as_str().to_owned());
     if user.is_empty() {
         return Err(invalid("user", "must not be empty"));
     }
@@ -241,10 +241,7 @@ impl MappingClient {
 
     /// Look up `req.principal` in the table and map the hit to a
     /// `ResolveResponse` the generic `Resolver` consumes unchanged.
-    fn resolve_inner(
-        &self,
-        req: &ResolveRequest,
-    ) -> Result<ResolveResponse, ControlError> {
+    fn resolve_inner(&self, req: &ResolveRequest) -> Result<ResolveResponse, ControlError> {
         // The client's only user-controlled input is the principal, and it must
         // already be a wire-routable opaque token. A parse failure is folded
         // into `NotFound`: it is the same uniform refusal shape as a table
@@ -292,11 +289,7 @@ impl ControlPlaneClient for MappingClient {
         &'a self,
         req: &'a ResolveRequest,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<ResolveResponse, ControlError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<ResolveResponse, ControlError>> + Send + 'a>,
     > {
         let result = self.resolve_inner(req);
         Box::pin(async move { result })
@@ -306,9 +299,9 @@ impl ControlPlaneClient for MappingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ResolveSource;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
-    use crate::types::ResolveSource;
 
     /// Deterministic-enough nonce for unique temp paths in tests
     /// (same style as backend/mod.rs).
@@ -453,7 +446,7 @@ mod tests {
     fn invalid_principal_username_is_a_load_error() {
         let cases = ["Bad", "-lead", "has space", ""];
         for username in cases {
-            let content = entry_toml(&username, "10.0.0.7", None, None);
+            let content = entry_toml(username, "10.0.0.7", None, None);
             let temp = TempFile::create("bad-principal", &content);
             let err = MappingTable::load(temp.path()).unwrap_err();
             assert!(
@@ -567,10 +560,7 @@ mod tests {
 
     #[test]
     fn symlink_is_rejected() {
-        let target = TempFile::create(
-            "symlink-target",
-            &entry_toml("a1", "1.2.3.4", None, None),
-        );
+        let target = TempFile::create("symlink-target", &entry_toml("a1", "1.2.3.4", None, None));
         let link_path = std::env::temp_dir().join(format!(
             "sshgw-mapping-{}-symlink-{}",
             std::process::id(),
@@ -631,7 +621,10 @@ mod tests {
         let table = MappingTable::load(temp.path()).unwrap();
         let client = mapping_client(table, true);
 
-        let resp = client.resolve(&req_for("alex")).await.expect("hit resolves");
+        let resp = client
+            .resolve(&req_for("alex"))
+            .await
+            .expect("hit resolves");
         assert_eq!(
             resp.target,
             Target {
@@ -679,7 +672,10 @@ mod tests {
         let table = MappingTable::load(temp.path()).unwrap();
         let client = mapping_client(table, false);
 
-        let resp = client.resolve(&req_for("alex")).await.expect("hit resolves");
+        let resp = client
+            .resolve(&req_for("alex"))
+            .await
+            .expect("hit resolves");
         assert!(
             !resp.policy.recording,
             "recording = false must never enable per-grant recording"

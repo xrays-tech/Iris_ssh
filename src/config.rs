@@ -1264,23 +1264,18 @@ impl GatewayConfig {
         // Runs after `validate_openstack` so the mutual-exclusion rules can
         // inspect both the validated OpenStack result and the raw control
         // plane section.
-        let mapping = validate_mapping(
-            raw.mapping,
-            &openstack,
-            raw.control_plane.as_ref(),
-        )?;
+        let mapping = validate_mapping(raw.mapping, &openstack, raw.control_plane.as_ref())?;
 
         // `[control_plane]` is required in every routing mode except:
         // - the OpenStack pure mode, where the gateway talks to no control
         //   plane at all (plan-openstack §0-7); and
         // - simple mapping mode, where the mapping table *is* the routing
         //   authority (plan-mapping §3.1) and no control plane is consulted.
-        let control_plane_required =
-            !mapping_enabled(&mapping)
-                && !matches!(
-                    &openstack,
-                    Some(os) if os.routing == OpenStackRouting::OpenStackOnly
-                );
+        let control_plane_required = !mapping_enabled(&mapping)
+            && !matches!(
+                &openstack,
+                Some(os) if os.routing == OpenStackRouting::OpenStackOnly
+            );
         let control_plane = match raw.control_plane {
             None if control_plane_required => {
                 return Err(ConfigError::Invalid {
@@ -2635,7 +2630,10 @@ mod tests {
         );
         let cfg = GatewayConfig::parse(&toml).expect("disabled is valid");
         assert!(cfg.mapping.is_none(), "disabled = None");
-        assert!(cfg.control_plane.is_some(), "a disabled [mapping] still needs a control plane");
+        assert!(
+            cfg.control_plane.is_some(),
+            "a disabled [mapping] still needs a control plane"
+        );
     }
 
     #[test]
@@ -2693,7 +2691,10 @@ mod tests {
     #[test]
     fn mapping_parses_and_takes_the_control_plane_s_place() {
         let cfg = GatewayConfig::parse(&mapping_base()).expect("live mapping must parse");
-        assert!(cfg.control_plane.is_none(), "mapping mode needs no control plane");
+        assert!(
+            cfg.control_plane.is_none(),
+            "mapping mode needs no control plane"
+        );
         let m = cfg.mapping.expect("mapping configured");
         assert!(m.enabled);
         assert_eq!(m.mapping_file, PathBuf::from("/etc/ssh-gw/mappings.toml"));
