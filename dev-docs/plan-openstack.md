@@ -1377,3 +1377,225 @@ project_domain_name = "Default"
 ## D.5 工作量
 
 S（约 0.5–1 人日 + 复审）：配置枚举/校验、`select_address` 加 kind 过滤、reason token、单测×3、集成×2~3、docs。
+
+---
+
+# 附录 E — 后端认证的 SSH 签名算法集支持
+
+> 状态：设计（2026-10-16），待实施，**ORSOLid 后续交 fixer**。默认行为对 ed25519/ecdsa 零回归；本附录只补齐 **RSA 端用户密钥**用现代签名算法（rsa-sha2-*）经网关登录后端的能力。目标语义：**"支持全算法集" = 全现代集**（绝不含 SHA-1 的 `ssh-rsa`）。
+
+## E.0 现状锚点与已钉死的事实
+
+- 后端拨号唯一入口 `BackendDialer::connect`（`src/backend/mod.rs:441-462`），在
+  `authenticate_publickey_with(&grant.target.user, public_key, None, signer)` 里传
+  **`hash_alg = None`**（第 455 行）；其上方的注释（451-453）"让 russh 走默认"是
+  **本附录要改掉的错误前提**。
+- `authenticate_publickey_with`（russh 0.64.1 `src/client/mod.rs:503`）：`hash_alg` 流入
+  `Signer::auth_sign(key, hash_alg, data)`——RSA 私钥据此产出 `rsa-sha2-512`/`rsa-sha2-256`；
+  非 RSA 密钥忽略该值（算法由密钥类型决定）。
+- `HashAlg`（ssh-key 0.7.0-rc.11）= `Sha256（default）| Sha512`。
+- 调用点：`src/relay/agent.rs:1174-1178` —— `public_key = identities[index].public_key().into_owned()`，
+  再 `dialer.connect(grant, public_key, &mut agent)`。**`public_key` 是 `russh::keys::PublicKey`
+  （= ssh_key::PublicKey），有 `.algorithm() -> ssh_key::Algorithm`。**
+- 类型可用：`russh::keys::{Algorithm, EcdsaCurve, HashAlg, PublicKey}` 均已 re-export
+  （`russh/src/keys/mod.rs:78`）；`Algorithm::Rsa { hash: Option<HashAlg> }`
+  （ssh-key `algorithm.rs:92`），RSA 公钥走 `Algorithm::Rsa { .. }`。
+- **KEX 层无缺口**：russh client/server 默认 `Preferred.key`
+  （`russh/src/negotiation.rs:210`）已列
+  `Ed25519, Ecdsa(P256/P384/P521), Rsa{Sha512}, Rsa{Sha256}, Rsa{None}`。
+  前腿（server）与后端腿（client）**协商层本身已通告现代集**；缺口仅在 `connect` 的签名 hash。
+- 失败现象（已采信）：RSA 端用户密钥 → `hash_alg=None` → 旧式 `ssh-rsa`（SHA-1）→
+  Ubuntu 24.04 sshd（OpenSSH ≥8.8 默认 `PubkeyAcceptedAlgorithms` 无 `ssh-rsa`）拒绝 →
+  审计 `signature_algorithm="ssh-rsa"`、后端 `"as root" failed`。ed25519 经网关成功。
+
+## E.1 算法选择矩阵（后端 agent 认证）
+
+**纯函数**（`src/backend/mod.rs`）：
+```rust
+/// The RSA signature hash this gateway uses when the end-user's forwarded agent
+/// signs for the backend. Non-RSA keys get `None` (their scheme is fixed by the
+/// key type). RSA gets a modern rsa-sha2 hash — never SHA-1 (see E.2).
+pub fn signature_hash_alg(key: &russh::keys::PublicKey, rsa_hash: HashAlg) -> Option<HashAlg> {
+    match key.algorithm() {
+        russh::keys::Algorithm::Rsa { .. } => Some(rsa_hash),
+        _ => None,
+    }
+}
+```
+
+| 端用户公钥类型 | `hash_alg` | 结果签名算法 |
+|---|---|---|
+| RSA | `Some(rsa_hash)`，默认 `HashAlg::Sha512` | `rsa-sha2-512`（可配 `sha256`） |
+| Ed25519 | `None` | `ssh-ed25519` |
+| ECDSA P-256/384/521 | `None` | `ecdsa-sha2-nistp{256,384,521}` |
+| sk-ecdsa / sk-ed25519 | `None` | `sk-...`（走 russh 默认；失败即报，不承诺） |
+| DSA / ed448 / 其它 | `None` | 交给 russh；不支持即协议层失败，不做特判 |
+
+**RSA 默认 = Sha512，理由**：
+1. 与 OpenSSH 客户端自身的 RSA 偏好一致（`PubkeyAcceptedAlgorithms` 首推
+   `rsa-sha2-512`，其次 `rsa-sha2-256`）；
+2. 更强（SHA-512 > SHA-256）；
+3. "只支持 256 不支持 512"的服务器仅存在于 OpenSSH 7.2/7.3（2016 年），2026 年可忽略。
+
+**每次尝试只签一个 hash**：russh 不做逐请求的算法回退。因此**默认选一个**，不自动重试、
+不降级（红线段 E.6）。为覆盖极少数只接受 `rsa-sha2-256` 的老服务器，**建议**提供可选
+配置（见 E.8 待拍板点①）：`[backend] rsa_signature_hash = "sha512"（默认）| "sha256"`。
+
+**实现落点**：
+- `BackendDialer` 增字段 `rsa_signature_hash: HashAlg`（`BackendDialer::new` 从
+  `config.backend.rsa_signature_hash` 取；无配置时 `HashAlg::Sha512`）。
+- `connect`（`src/backend/mod.rs:441`）：
+  ```rust
+  let hash_alg = signature_hash_alg(&public_key, self.rsa_signature_hash);
+  tracing::debug!(target: "backend", user = %grant.target.user,
+      key_type = %public_key.algorithm(), ?hash_alg, "backend publickey auth");
+  let outcome = handle
+      .authenticate_publickey_with(&grant.target.user, public_key, hash_alg, signer)
+      .await
+      ...
+  ```
+  失败时把 `hash_alg` 拼进 `BackendError::Auth` 的 `user` 上下文（便于排障："RSA + sha512 被拒"）。
+- **不改** `relay/agent.rs` 的身份匹配/单签名面（红线 4 不变）。
+
+## E.2 旧式 `ssh-rsa`（SHA-1）
+
+**裁决：默认不支持，且不提供开关——永不回溯。**
+- 语义约束："支持全算法集 = 全现代集"。SHA-1 已被 OpenSSH ≥8.8 默认移除、属已知破哈希；
+  提供 `allow_legacy_ssh_rsa` 会**把不安全默认正常化**并扩大降级面（攻击者可诱导降级）。
+- `hash_alg=None` 对 RSA 在 russh 里即产 `ssh-rsa`；E.1 的映射保证 RSA **永远**拿到
+  `Some(...)`，因此 **SHA-1 在这条路径上不可达**。
+- 若未来确需连接"博物馆级"老服务器，那是**另一个安全评审过的独立票**，不在 E 的语义内。
+  （附录 D 的 `allow_any_authenticated_key` 那种"刺眼开关"也不适用于此：那是可见性放大，
+  这是密码学降级——性质不同。）
+
+## E.3 服务器腿（client → gateway）"全算法集"确认
+
+- **已支持现代集**：前腿用 `ServerConfig::default().preferred`
+  （`src/server/mod.rs:build_with_clients`，当前仅按配置覆盖 `cipher`），其 `key` 已含
+  ed25519/ecdsa/rsa-sha2-512/rsa-sha2-256/ssh-rsa。**协商层无缺口**，仅文档说明。
+- **前腿 SHA-1 姿态（建议收紧，待拍板点②）**：当前 `Preferred.key` 末项 `Rsa { hash: None }`
+  意味着**前腿接受 SHA-1 的 `ssh-rsa` 用户签名**。建议在 `build_with_clients` 里把该项从
+  server 侧 `preferred.key` 过滤掉：
+  ```rust
+  server_pref.key = std::borrow::Cow::Owned(
+      server_pref.key.iter()
+          .filter(|a| !matches!(a, Algorithm::Rsa { hash: None }))
+          .cloned().collect());
+  ```
+  这样前腿也只认现代集（与后端腿语义对称）。**这是行为变更**（拒绝仅会用 ssh-rsa 的老客户端），
+  故列为待拍板；若采纳，须配一个负例断言 `ssh -o PubkeyAcceptedAlgorithms=ssh-rsa` 被拒。
+- **client 腿 host-key 侧**（后端 sshd 呈现的 host key 算法）：`BackendDialer::new` 的
+  `client::Config.preferred.key` 同样可去掉 `Rsa{hash:None}`（host key 认证靠 fingerprint/CA，
+  非签名方案；去掉纯属卫生）。低优先。
+
+## E.4 直连私钥路径（备注）
+
+本仓后端认证**只用 agent**（`connect_agent` 是唯一形态，plan-agent-only D3），无直连私钥路径。
+若未来重新引入，同样必须在构造 `PrivateKeyWithHashAlg::new(key, signature_hash_alg(key, rsa))`
+时按算法选 hash——**复用一个 `signature_hash_alg`，不得各处各写**。本条仅备注，不在本次实现。
+
+## E.5 测试
+
+### E.5.1 单元（`src/backend/mod.rs`）
+- `signature_hash_alg` 纯函数表驱动：
+  - `Algorithm::Rsa { hash: None }` 公钥（`ssh-keygen -t rsa` 产出的公钥其 `algorithm()`
+    即此形态）→ `Some(Sha512)`（默认）、`Some(Sha256)`（配置为 sha256 时）；
+  - Ed25519 → `None`；
+  - Ecdsa P-256/384/521 → `None`；
+  - （可选）`SkEd25519`/`SkEcdsaSha2NistP256` → `None`。
+- 配置解析（若采纳 E.8①）：`rsa_signature_hash` 默认 `sha512`、`"sha256"` 可解析、未知值报
+  `backend.rsa_signature_hash`、`Debug` 呈现。
+
+### E.5.2 集成
+- **新用例 `case_backend_rsa_signer`**：端用户持有 **RSA** 密钥（用例内 `ssh-keygen -t rsa -b 3072`），
+  其 `.pub` 写入后端 `authorized_keys`；`ssh -A` 以该 RSA 密钥做前腿登录，断言会话成功。
+  - 后端 sshd **必须在默认 `PubkeyAcceptedAlgorithms` 下拒绝 `ssh-rsa`**：`subtopo.sh` 的手写
+    `sshd.cfg` 不设该指令，故沿用 OpenSSH 编译默认（Fedora 44 含 `rsa-sha2-512,rsa-sha2-256`、
+    不含 `ssh-rsa`）。用例启动时可 `sshd -T -f <cfg> | grep -i pubkeyaccepted` 断言含
+    `rsa-sha2-`、不含 `ssh-rsa`，作为前提证明。
+  - 断言：会话跑通（若网关仍签 SHA-1 则 sshd 必拒——用例本身即证明）；网关 debug 日志含
+    `hash_alg=Sha512`；可选 grep 后端 `sshd.log`（`-e` 记 INFO；如需算法证据把该用例 sshd 配
+    `LogLevel DEBUG` 后 grep `rsa-sha2-512`）。
+  - 回归：现有 ed25519 agent 用例（`case_agent_auth` 等）不变。
+- 环境既有 53P/0F/2S 基线不得回归。
+
+### E.5.3 真机（验收）
+- `FLT-TEST-01`（`bb45a399…`）：用 `~/test-key.pem`（RSA）经网关
+  `ssh -A bb45a399…@127.0.0.1`（`address_kind="floating"` + `scope="cross_project"`，root）。
+  **直连已 OK、网关解析/浮动选择（附录 D）已 OK**，本附录的验收目标是**后端认证成功**：会话
+  跑通、`resolve_ok=1`、后端 `Accepted publickey`（RSA）、无 `"as root" failed`。
+  记录追加到 `dev-docs/openstack-test-env.md`（含 `hash_alg=Sha512` 证据）。
+
+## E.6 红线 / DoD / 分层（E 系列）/ 工作量
+
+### E.6.1 红线
+1. **RSA 恒用现代 rsa-sha2，绝不放 SHA-1**；不自动重试、不降级（无 SHA-1 兜底路径）。
+2. **非 RSA 密钥 `hash_alg=None`**，行为与改动前字节一致。
+3. `signature_hash_alg` 是**纯函数**、表驱动单测；任何密钥材料/签名不进日志。
+4. **签名面不扩大**：仍只对唯一匹配的 agent 身份签一次（红线 4 不变）。
+5. **失败协议原生**：后端拒绝即 `BackendError::Auth` 硬失败，绝不换更弱算法再试。
+6. 默认零回归：ed25519/ecdsa 路径、既有审计/指标格式不变。
+7. 前腿 SHA-1 收紧（若采纳）是**独立、可回退**的行为变更，需自己的负例测试与文档。
+8. **红线 12**：E1、E2 的 diff 合并前经 @oracle 复审。
+
+### E.6.2 分层提交
+- **E1**（安全审查点）：`signature_hash_alg` + `connect` 接线（默认 Sha512）+ 单测 + debug 日志。
+- **E2**：`[backend] rsa_signature_hash` 配置（若采纳）+ 解析/校验/Debug + 单测。
+- **E3**：前腿 SHA-1 收紧（若采纳）+ 负例测试。
+- **E4**：`case_backend_rsa_signer` 集成用例 + 真机 FLT-TEST-01 验收 + `openstack-test-env.md`。
+- **E5**：docs（config.example/ops-runbook/known-limitations/本文件标注）。
+
+### E.6.3 DoD
+- E1–E5（E2/E3 视待拍板）落地；E.5.1 单测全绿；`case_backend_rsa_signer` + 现有 53 用例全绿；
+  `fmt`/`clippy -D warnings`/`test`/`release`/`run_integration.sh` 全绿；真机 RSA 登录通过；
+  docs 更新；E1/E2 经 @oracle 复审。
+
+### E.6.4 工作量
+| 阶段 | 内容 | 估时 |
+|---|---|---|
+| E1 | `signature_hash_alg` + 接线 + 单测 | 0.25 天 |
+| E2 | 可选配置 + 单测 | 0.25 天 |
+| E3 | 前腿 SHA-1 收紧 + 负例 | 0.25 天 |
+| E4 | 集成用例 + 真机 + 记录 | 0.5–0.75 天 |
+| E5 | docs | 0.25 天 |
+| **合计** | | **~1.5–1.75 人日 + 复审** |
+
+### E.6.5 风险
+| # | 风险 | 严重度 | 缓解 |
+|---|---|---|---|
+| R23 | 默认选错 RSA hash（512 vs 256）致个别服务器拒绝 | 低 | 默认 512 + 可选 `sha256` 开关；不自动重试 |
+| R24 | 误引入 SHA-1 兜底 | 高 | 映射保证 RSA 恒 `Some`；红线 E.6.1；E2 只允许 sha256/512 |
+| R25 | 非 RSA 键被误传 `Some(hash)` 致失败 | 中 | 表驱动单测覆盖 ed25519/ecdsa→None |
+| R26 | 前腿收紧拒绝老客户端 | 中 | 列为待拍板 + 负例 + 文档；可回退单 commit |
+| R27 | 测试 sshd 默认恰好接受 ssh-rsa 使用例空转 | 低 | 用例先 `sshd -T` 断言默认不含 ssh-rsa |
+
+## E.7 给 fixer 的分层清单
+
+1. **E1** `src/backend/mod.rs`：`pub fn signature_hash_alg(&PublicKey, HashAlg)->Option<HashAlg>`；
+   `BackendDialer` 增 `rsa_signature_hash`（默认 `Sha512`）；`connect` 用其结果替换 `None` +
+   debug 日志 + 失败上下文；改掉 451-453 的过时注释；单测（RSA→Some(Sha512)、ed25519/ecdsa→None）。
+2. **E2**（若采纳）`src/config.rs`：`RawBackend.rsa_signature_hash`（默认 `"sha512"`）+
+   `BackendConfig.rsa_signature_hash: HashAlg` + 解析/校验/`Debug`；单测。
+3. **E3**（若采纳）`src/server/mod.rs:build_with_clients`：过滤 server `preferred.key` 的
+   `Rsa{hash:None}`；负例集成用例。
+4. **E4** `tests/integration/case_backend_rsa_signer.sh`（RSA 密钥 + 断言 sshd 默认不含 ssh-rsa +
+   会话成功 + `hash_alg=Sha512`）；`run_integration.sh` 注册；真机 FLT-TEST-01；
+   `dev-docs/openstack-test-env.md` 记录。
+5. **E5** docs（config.example `[backend]` 段、ops-runbook、known-limitations、本附录标注）。
+6. **门禁**：`fmt`/`clippy`/`test`/`release`/`run_integration.sh`；E1/E2 经 @oracle 复审。
+
+## E.8 待拍板点与建议
+
+1. **RSA 默认 hash（512 vs 256）与是否加配置开关。**
+   - 建议：**默认 `Sha512`**（对齐 OpenSSH、更强），**并加 `[backend] rsa_signature_hash =
+     "sha512"|"sha256"`**。理由：RSA 服务器粒度差异（极老的 7.2/7.3 只认 256）无法在编译期消除，
+     一个低成本开关避免"换个服务器要重新部署"；不自动重试，保持签名面最小。
+2. **前腿是否默认禁 SHA-1（`ssh-rsa`）。**
+   - 建议：**是**（E3）——让"全现代集"语义前后对称，SHA-1 用户签名是明确的降级面。以独立 commit
+     提交、附负例测试与 known-limitations 说明，可单独回退；若维护者担心拒绝老客户端，则**本附录
+     只文档说明、把收紧留独立票**。
+3. **后端是否保留任何 SHA-1 逃生口。**
+   - 建议：**否**（E.2）——永不回溯；确需连博物馆服务器属独立安全评审票。
+
+> 一句话验收：RSA 端用户密钥（`~/test-key.pem`）经网关 `ssh -A <uuid>` 在现代 sshd 上登录成功，
+> 且网关从不签 SHA-1。
