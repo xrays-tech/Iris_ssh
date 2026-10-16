@@ -442,7 +442,9 @@ impl GatewayContext {
             }
             None => None,
         };
-        Self::build_with_clients(config, control_plane, None)
+        // No mapping client is injected in production: it is built from
+        // `[mapping]` inside `build_with_clients`.
+        Self::build_with_clients(config, control_plane, None, None)
     }
 
     /// [`build`] with an injected control-plane client (production uses
@@ -452,16 +454,20 @@ impl GatewayContext {
         config: GatewayConfig,
         control_plane: Arc<dyn ControlPlaneClient>,
     ) -> Result<Arc<GatewayContext>> {
-        Self::build_with_clients(config, Some(control_plane), None)
+        // No mapping client is injected here: `build_with_clients` builds it
+        // from `[mapping]` when the section is enabled.
+        Self::build_with_clients(config, Some(control_plane), None, None)
     }
 
-    /// [`build`] with both sources injectable. The OpenStack client is built
-    /// from config when none is supplied, so production goes through this path
-    /// too and tests can assert "no request happened" against a counting fake.
+    /// [`build`] with all three sources injectable. The OpenStack and mapping
+    /// clients are built from config when none is supplied, so production goes
+    /// through this path too and tests can assert "no request happened" against
+    /// a counting fake.
     pub fn build_with_clients(
         config: GatewayConfig,
         control_plane: Option<Arc<dyn ControlPlaneClient>>,
         openstack_client: Option<Arc<dyn ControlPlaneClient>>,
+        mapping_client: Option<Arc<dyn ControlPlaneClient>>,
     ) -> Result<Arc<GatewayContext>> {
         let metrics = Metrics::default();
 
@@ -511,8 +517,16 @@ impl GatewayContext {
         let route_by = openstack_cfg
             .map(|os| os.route_by.clone())
             .unwrap_or_else(|| vec![RouteKind::Uuid]);
-        // The control-plane route is live everywhere except pure mode.
-        let control_plane_needed = !openstack_enabled || routing == OpenStackRouting::Hybrid;
+        // Simple mapping mode (plan-mapping §6.2): when the section is enabled,
+        // the mapping table is the sole routing authority. It is mutually
+        // exclusive with [openstack] at parse time, so `openstack_enabled` is
+        // already false here; the mapping resolver takes the place of the
+        // control plane (so `control_plane_needed` becomes false).
+        let mapping_cfg = config.mapping.as_ref();
+        let mapping_enabled = mapping_cfg.is_some();
+        let control_plane_needed =
+            !mapping_enabled
+                && (!openstack_enabled || routing == OpenStackRouting::Hybrid);
 
         let cp_resolver = match (config.control_plane.as_ref(), control_plane) {
             (Some(cp_cfg), Some(client)) => Some(Arc::new(Resolver::new(
@@ -558,12 +572,77 @@ impl GatewayContext {
             )) as Arc<Resolver>
         });
 
+        // --- [mapping]: the local table is the routing authority -----------
+        // When the section is enabled, build the table + client. If an injected
+        // client is supplied (tests) use it; otherwise load from config so the
+        // boot failure names the exact mapping-file problem (do NOT stringify,
+        // plan-mapping §3.4). The returned `Option<bool>` is the table's
+        // emptiness, known at load time so the boot warning is accurate.
+        let (mapping_client, mapping_table_empty) = match (mapping_cfg, mapping_client) {
+            // Config absent/None: no mapping resolver at all.
+            (None, _) => (None, None),
+            // Section enabled: an injected client wins (tests). No table was
+            // loaded, so we do not know (or care about) its emptiness.
+            (Some(_), Some(client)) => (Some(client), None),
+            // Section enabled, no injection: build from the validated config.
+            (Some(cfg), None) => {
+                let table = crate::mapping::MappingTable::load(&cfg.mapping_file)?;
+                let empty = table.is_empty();
+                (
+                    Some(Arc::new(crate::mapping::MappingClient::new(
+                        Arc::new(table),
+                        cfg.recording,
+                    )) as Arc<dyn ControlPlaneClient>),
+                    Some(empty),
+                )
+            }
+        };
+        // The mapping resolver gets a fixed, sensible tuning: the table is
+        // in-memory and immutable, so caching it across principals is cheap and
+        // there is no per-request upstream latency to tune against (plan-mapping
+        // §6.3). Fail-closed, same breaker shape as the other resolvers.
+        let mapping_resolver = mapping_client.map(|client| {
+            Arc::new(Resolver::new(
+                client,
+                Duration::from_secs(30), // positive TTL
+                Duration::from_secs(5),  // negative cache
+                Duration::from_secs(1),  // transient coalesce
+                Duration::from_secs(1),  // expiry spread; no config knob
+                false,                   // fail-closed
+                5,                       // breaker failure threshold
+                Duration::from_secs(90), // breaker reset (3 * positive TTL)
+                Duration::from_secs(3),  // per-request timeout
+            )) as Arc<Resolver>
+        });
+
+        // Startup warnings (plan-mapping §6.4): the mapping mode is a lab
+        // configuration that intentionally opens up any key, and an empty table
+        // refuses everyone. Both are operator-visible at boot.
+        if mapping_enabled {
+            if mapping_cfg.as_ref().is_some_and(|cfg| cfg.allow_any_authenticated_key) {
+                tracing::warn!(
+                    target: "mapping",
+                    "[mapping] allow_any_authenticated_key = true: any key that passes front-leg \
+                     signature verification can reach the backend its principal maps to \
+                     (plan-mapping §5). This is a lab mode, not a production control."
+                );
+            }
+            if mapping_table_empty == Some(true) {
+                tracing::warn!(
+                    target: "mapping",
+                    "the [mapping] table is empty: every user will be refused"
+                );
+            }
+        }
+
         let router = ResolveRouter::new(
             routing,
             openstack_enabled,
             route_by,
+            mapping_enabled,
             cp_resolver,
             os_resolver,
+            mapping_resolver,
             metrics.clone(),
         );
         // Belt and braces on top of config validation: a route that could be
@@ -583,6 +662,13 @@ impl GatewayContext {
             return Err(ConfigError::Invalid {
                 field: "openstack".into(),
                 reason: "[openstack] is enabled but its resolver could not be built".into(),
+            }
+            .into());
+        }
+        if mapping_enabled && !router.can_serve(ResolveRoute::Mapping) {
+            return Err(ConfigError::Invalid {
+                field: "mapping".into(),
+                reason: "[mapping] is enabled but its resolver could not be built".into(),
             }
             .into());
         }
@@ -3101,6 +3187,7 @@ mod tests {
             config,
             None,
             Some(canary as Arc<dyn ControlPlaneClient>),
+            None, // no mapping client in this test
         )
         .expect("context");
 

@@ -33,6 +33,10 @@ pub struct GatewayConfig {
     /// section is absent or `enabled = false` — the default, which leaves the
     /// gateway byte-for-byte unchanged.
     pub openstack: Option<OpenStackConfig>,
+    /// Simple mapping mode (plan-mapping §3.1). `None` when the section is
+    /// absent or `enabled = false` — the default, which is byte-for-byte inert.
+    /// Mutually exclusive with `[openstack]` and `[control_plane]` while enabled.
+    pub mapping: Option<MappingConfig>,
     pub limits: LimitsConfig,
     /// Certificate authority (B1: host/user CA).
     pub ca: CaConfig,
@@ -466,6 +470,22 @@ impl std::fmt::Debug for OpenStackConfig {
     }
 }
 
+/// Validated `[mapping]` section (plan-mapping §3.1).
+///
+/// A static, operator-authored `username → target` table. Unlike OpenStack this
+/// holds no credentials, so `Debug` is plain derive (nothing to redact).
+#[derive(Debug, Clone)]
+pub struct MappingConfig {
+    pub enabled: bool,
+    /// The on-disk table, loaded once at build (fail-closed).
+    pub mapping_file: PathBuf,
+    /// Lab-mode flag: any key that passes front-leg verification reaches
+    /// whatever backend the table maps its principal to.
+    pub allow_any_authenticated_key: bool,
+    /// Whether mapped sessions are recorded (per-grant; default off).
+    pub recording: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct LimitsConfig {
     pub max_sessions: usize,
@@ -565,6 +585,8 @@ struct RawConfig {
     control_plane: Option<RawControlPlane>,
     #[serde(default)]
     openstack: Option<RawOpenStack>,
+    #[serde(default)]
+    mapping: Option<RawMapping>,
     #[serde(default)]
     limits: RawLimits,
     #[serde(default)]
@@ -743,6 +765,21 @@ fn default_cp_timeout() -> String {
 }
 fn default_cache_ttl_jitter() -> String {
     "3s".to_owned()
+}
+
+// --- [mapping] raw shape (plan-mapping §3.1) --------------------------------
+// Permissive like `RawOpenStack`: an unknown key is ignored here, so a
+// hand-edited file cannot wedge the boot with a typo in a field nobody reads.
+#[derive(Debug, Deserialize, Default)]
+struct RawMapping {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    mapping_file: Option<String>,
+    #[serde(default)]
+    allow_any_authenticated_key: bool,
+    #[serde(default)]
+    recording: bool,
 }
 
 // --- [openstack] raw shape (plan-openstack §3.6) ---------------------------
@@ -1223,11 +1260,27 @@ impl GatewayConfig {
         // can keep an operator from switching it back off.
         let openstack = validate_openstack(raw.openstack, host_key_policy)?;
 
-        // `[control_plane]` is required in every routing mode except the
-        // OpenStack pure mode, where the gateway talks to no control plane at
-        // all (plan-openstack §0-7).
+        // --- [mapping]: simple mapping mode (plan-mapping §3.1) -----------
+        // Runs after `validate_openstack` so the mutual-exclusion rules can
+        // inspect both the validated OpenStack result and the raw control
+        // plane section.
+        let mapping = validate_mapping(
+            raw.mapping,
+            &openstack,
+            raw.control_plane.as_ref(),
+        )?;
+
+        // `[control_plane]` is required in every routing mode except:
+        // - the OpenStack pure mode, where the gateway talks to no control
+        //   plane at all (plan-openstack §0-7); and
+        // - simple mapping mode, where the mapping table *is* the routing
+        //   authority (plan-mapping §3.1) and no control plane is consulted.
         let control_plane_required =
-            !matches!(&openstack, Some(os) if os.routing == OpenStackRouting::OpenStackOnly);
+            !mapping_enabled(&mapping)
+                && !matches!(
+                    &openstack,
+                    Some(os) if os.routing == OpenStackRouting::OpenStackOnly
+                );
         let control_plane = match raw.control_plane {
             None if control_plane_required => {
                 return Err(ConfigError::Invalid {
@@ -1345,6 +1398,7 @@ impl GatewayConfig {
             pool,
             control_plane,
             openstack,
+            mapping,
             limits,
             ca,
             intercept,
@@ -1762,6 +1816,97 @@ fn validate_openstack(
         backend_user_metadata_key,
         backend_user_map,
         ssh_port,
+        recording: raw.recording,
+    }))
+}
+
+/// Whether a validated `[mapping]` result is live. Absent/`None` or
+/// `enabled = false` both mean the feature is off and the gateway is
+/// byte-for-byte unchanged.
+fn mapping_enabled(mapping: &Option<MappingConfig>) -> bool {
+    mapping.as_ref().is_some_and(|m| m.enabled)
+}
+
+/// Validate the whole `[mapping]` section (plan-mapping §3.1).
+///
+/// Returns `Ok(None)` when the section is absent or disabled — no mapping
+/// resolver exists and (red line) nothing about existing behaviour changes.
+///
+/// The combination rules run on the *validated* `openstack` result and the raw
+/// `[control_plane]` section, so this must be called after `validate_openstack`
+/// (a disabled OpenStack section is already folded to `None`, and an enabled
+/// one is the only shape that can collide with a live mapping).
+fn validate_mapping(
+    raw: Option<RawMapping>,
+    openstack: &Option<OpenStackConfig>,
+    raw_cp: Option<&RawControlPlane>,
+) -> std::result::Result<Option<MappingConfig>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    // `enabled = false` short-circuits, exactly like [openstack]: the section
+    // is inert and a leftover field can never block re-enabling.
+    if !raw.enabled {
+        return Ok(None);
+    }
+
+    // --- combination rules (all only while the feature is on) -------------
+    // 1. The table path is the whole feature: without a file there is no
+    //    mapping resolver to build.
+    let mapping_file = raw.mapping_file.unwrap_or_default().trim().to_owned();
+    if mapping_file.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "mapping.mapping_file".into(),
+            reason: "must be set to a non-empty path when [mapping] is enabled: the \
+                     mapping table is the routing authority and is loaded once at \
+                     build (plan-mapping §3.1)"
+                .into(),
+        });
+    }
+
+    // 2. Explicit danger flag (mirror of openstack.rs:1436 wording): any key
+    //    that passes front-leg verification reaches the backend the table
+    //    maps its principal to, so the lab mode must be opted into on purpose.
+    if !raw.allow_any_authenticated_key {
+        return Err(ConfigError::Invalid {
+            field: "mapping.allow_any_authenticated_key".into(),
+            reason: "must be set to true explicitly: mapping authorization means any \
+                     key that passes front-leg signature verification can reach the \
+                     backend its principal maps to (plan-mapping §5)"
+                .into(),
+        });
+    }
+
+    // 3. Two routing authorities at once: [mapping] and [openstack] are
+    //    mutually exclusive while enabled.
+    if openstack.is_some() {
+        return Err(ConfigError::Invalid {
+            field: "mapping".into(),
+            reason: "cannot be enabled together with [openstack]: both are routing \
+                     authorities and a single gateway may not have two \
+                     (plan-mapping §3.1)"
+                .into(),
+        });
+    }
+
+    // 4. Two authorities, the other way: [mapping] replaces the control plane,
+    //    so a [control_plane] section alongside it is dead config — it would
+    //    lie in the file while nothing ever consults it.
+    if raw_cp.is_some() {
+        return Err(ConfigError::Invalid {
+            field: "mapping".into(),
+            reason: "cannot be enabled together with [control_plane]: the mapping \
+                     table is the routing authority and the control plane is \
+                     never consulted in this mode (plan-mapping §3.1)"
+                .into(),
+        });
+    }
+
+    Ok(Some(MappingConfig {
+        enabled: true,
+        mapping_file: PathBuf::from(mapping_file),
+        allow_any_authenticated_key: raw.allow_any_authenticated_key,
         recording: raw.recording,
     }))
 }
@@ -2454,6 +2599,116 @@ mod tests {
         let cfg = GatewayConfig::parse(&toml).expect("both sections may coexist");
         assert!(cfg.control_plane.is_some(), "an unused CP is tolerated");
         assert!(cfg.openstack.is_some());
+    }
+
+    // ---- [mapping] section (plan-mapping §3.1) ---------------------------
+
+    /// A live `[mapping]` section body (the `[mapping]` header is spliced
+    /// into the minimal TOML by the tests below).
+    const MAPPING_SECTION: &str = r#"
+            [mapping]
+            enabled = true
+            mapping_file = "/etc/ssh-gw/mappings.toml"
+            allow_any_authenticated_key = true
+            recording = true
+        "#;
+
+    /// `base_without_control_plane` + a live `[mapping]` section, for the
+    /// happy-path and the "mapping takes the control plane's place" case.
+    fn mapping_base() -> String {
+        format!("{}{}", base_without_control_plane(), MAPPING_SECTION)
+    }
+
+    #[test]
+    fn mapping_is_absent_by_default_and_byte_inert() {
+        // No `[mapping]` section at all: the gateway is unchanged.
+        let cfg = GatewayConfig::parse(&minimal_toml()).expect("valid config");
+        assert!(cfg.mapping.is_none(), "absent = None");
+        assert!(cfg.control_plane.is_some(), "control plane still required");
+
+        // A disabled section is equally inert: on an otherwise-valid base
+        // (control plane present), adding [mapping] enabled=false changes
+        // nothing — mapping stays None and the control plane is still required.
+        let toml = format!(
+            "{}\n            [mapping]\n            enabled = false\n",
+            minimal_toml()
+        );
+        let cfg = GatewayConfig::parse(&toml).expect("disabled is valid");
+        assert!(cfg.mapping.is_none(), "disabled = None");
+        assert!(cfg.control_plane.is_some(), "a disabled [mapping] still needs a control plane");
+    }
+
+    #[test]
+    fn mapping_enabled_without_a_file_is_a_config_error() {
+        let toml = format!(
+            "{}\n            [mapping]\n            enabled = true\n            \
+             allow_any_authenticated_key = true\n",
+            base_without_control_plane()
+        );
+        let err = invalid_field(&toml);
+        assert_eq!(err, "mapping.mapping_file");
+    }
+
+    #[test]
+    fn mapping_enabled_without_the_danger_flag_is_a_config_error() {
+        let toml = format!(
+            "{}\n            [mapping]\n            enabled = true\n            \
+             mapping_file = \"/etc/ssh-gw/mappings.toml\"\n",
+            base_without_control_plane()
+        );
+        let err = invalid_field(&toml);
+        assert_eq!(err, "mapping.allow_any_authenticated_key");
+    }
+
+    #[test]
+    fn mapping_is_mutually_exclusive_with_openstack() {
+        // A live [mapping] AND a live [openstack] section in one file: two
+        // routing authorities, which the parser must refuse.
+        let toml = format!(
+            "{}{}{}",
+            base_without_control_plane(),
+            MAPPING_SECTION,
+            openstack_pure_section()
+        );
+        let err = GatewayConfig::parse(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be enabled together with [openstack]"),
+            "mapping+openstack must be refused: {msg}"
+        );
+    }
+
+    #[test]
+    fn mapping_is_mutually_exclusive_with_the_control_plane() {
+        // A live [mapping] alongside a [control_plane] section: dead config.
+        let toml = format!("{}{}", minimal_toml(), MAPPING_SECTION);
+        let err = GatewayConfig::parse(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be enabled together with [control_plane]"),
+            "mapping+control_plane must be refused: {msg}"
+        );
+    }
+
+    #[test]
+    fn mapping_parses_and_takes_the_control_plane_s_place() {
+        let cfg = GatewayConfig::parse(&mapping_base()).expect("live mapping must parse");
+        assert!(cfg.control_plane.is_none(), "mapping mode needs no control plane");
+        let m = cfg.mapping.expect("mapping configured");
+        assert!(m.enabled);
+        assert_eq!(m.mapping_file, PathBuf::from("/etc/ssh-gw/mappings.toml"));
+        assert!(m.allow_any_authenticated_key);
+        assert!(m.recording);
+    }
+
+    #[test]
+    fn mapping_enabled_relieves_the_control_plane_requirement() {
+        // No [control_plane] AND no [openstack]: a live mapping is the sole
+        // routing authority, so the config must validate.
+        let cfg = GatewayConfig::parse(&mapping_base()).expect("mapping alone is valid");
+        assert!(cfg.control_plane.is_none());
+        assert!(cfg.openstack.is_none());
+        assert!(cfg.mapping.is_some());
     }
 
     #[test]

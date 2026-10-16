@@ -27,6 +27,9 @@ pub enum ResolveRoute {
     /// OpenStack Nova, keyed by the instance UUID (or, when the name route is
     /// enabled, the instance name) in the username.
     OpenStack,
+    /// The local mapping table (plan-mapping §6.2): when the feature is on,
+    /// *every* principal goes here — the mapping is the sole routing authority.
+    Mapping,
     /// No route at all: reject before any network call is made.
     Reject,
 }
@@ -233,32 +236,44 @@ pub struct ResolveRouter {
     /// `[openstack] route_by`: which principal shapes the OpenStack route
     /// accepts (default `["uuid"]`, plan-openstack appendix A.1).
     route_by: Vec<RouteKind>,
+    /// When true (mapping mode, plan-mapping §6.2) every principal routes to
+    /// the mapping table regardless of shape — it is the sole authority.
+    mapping_enabled: bool,
     control_plane: Option<Arc<Resolver>>,
     openstack: Option<Arc<Resolver>>,
+    /// The mapping-table resolver (present only when `mapping_enabled`).
+    mapping: Option<Arc<Resolver>>,
     metrics: Metrics,
 }
 
 impl ResolveRouter {
     /// Assemble the router. `control_plane` is `None` only in OpenStack pure
-    /// mode, `openstack` only when `[openstack]` is absent or disabled.
+    /// mode, `openstack` only when `[openstack]` is absent or disabled, and
+    /// `mapping` only when the mapping feature is on.
     ///
     /// `route_by` is the validated `[openstack] route_by`; the gateway passes
     /// the configured list (which defaults to `["uuid"]`), tests may pass
-    /// whatever they are asserting.
+    /// whatever they are asserting. `mapping_enabled` short-circuits routing:
+    /// when true the answer is always `Mapping` (plan-mapping §6.2).
+    #[allow(clippy::too_many_arguments)] // one knob per route/source; a new source is expected to add one
     pub fn new(
         routing: OpenStackRouting,
         openstack_enabled: bool,
         route_by: Vec<RouteKind>,
+        mapping_enabled: bool,
         control_plane: Option<Arc<Resolver>>,
         openstack: Option<Arc<Resolver>>,
+        mapping: Option<Arc<Resolver>>,
         metrics: Metrics,
     ) -> Self {
         ResolveRouter {
             routing,
             openstack_enabled,
             route_by,
+            mapping_enabled,
             control_plane,
             openstack,
+            mapping,
             metrics,
         }
     }
@@ -267,6 +282,12 @@ impl ResolveRouter {
     /// pre-authentication `auth_publickey_offered` probe (MUST: that phase
     /// must never reach the network).
     pub fn route(&self, principal: &str) -> ResolveRoute {
+        // Mapping mode is the sole routing authority: once it is on, every
+        // principal — regardless of shape — goes to the mapping table
+        // (plan-mapping §6.2). The shape-based decision below is inert.
+        if self.mapping_enabled {
+            return ResolveRoute::Mapping;
+        }
         route_for(
             principal,
             self.routing,
@@ -283,6 +304,10 @@ impl ResolveRouter {
     pub fn can_serve(&self, route: ResolveRoute) -> bool {
         match route {
             ResolveRoute::ControlPlane => self.control_plane.is_some(),
+            ResolveRoute::Mapping => {
+                // The mapping table is the only thing this route needs.
+                self.mapping.is_some()
+            }
             ResolveRoute::OpenStack | ResolveRoute::Reject => {
                 // `Reject` is served *by* refusing: it needs no upstream at all.
                 route == ResolveRoute::Reject || self.openstack.is_some()
@@ -307,11 +332,23 @@ impl ResolveRouter {
             // A refused principal in `openstack_only` mode is the OpenStack
             // route declining: it belongs to that source's counters and logs.
             ResolveRoute::OpenStack | ResolveRoute::Reject => ResolveSource::OpenStack,
+            // The mapping table is its own source: a miss and a hit both live
+            // in its counters (plan-mapping §3.3).
+            ResolveRoute::Mapping => ResolveSource::Mapping,
             ResolveRoute::ControlPlane => ResolveSource::ControlPlane,
         };
         let started = Instant::now();
 
         let outcome = match route {
+            // Mapping mode: the table resolver does the whole job. A miss
+            // surfaces as `ResolveError::NotFound` from the resolver, exactly
+            // the uniform refusal shape the caller already maps.
+            ResolveRoute::Mapping => match &self.mapping {
+                Some(resolver) => resolver.authorize(principal, fingerprint, client_ip).await,
+                None => Err(ResolveError::Unavailable {
+                    principal: principal.as_str().to_owned(),
+                }),
+            },
             ResolveRoute::ControlPlane => match &self.control_plane {
                 Some(resolver) => resolver.authorize(principal, fingerprint, client_ip).await,
                 None => Err(ResolveError::Unavailable {
@@ -354,6 +391,31 @@ impl ResolveRouter {
                         reason = reason_of(err),
                         error = %err,
                         "openstack resolve failed before authentication completed"
+                    );
+                }
+            }
+        }
+
+        // Mapping route: a hit increments ok, a miss (the only possible
+        // refusal for an immutable table) increments its own miss counter, and
+        // either way the latency histogram is recorded (plan-mapping §3.3).
+        if source == ResolveSource::Mapping {
+            self.metrics.mapping_resolve_latency(started.elapsed());
+            match &outcome {
+                Ok(_) => self.metrics.mapping_resolve_ok(),
+                Err(err) => {
+                    self.metrics.mapping_resolve_miss();
+                    // Same structured line as the OpenStack arm: pre-auth
+                    // failures have no session and no AuditRecord, so this is
+                    // where the reason is visible to an operator.
+                    tracing::warn!(
+                        target: "resolve",
+                        %principal,
+                        %client_ip,
+                        source = source.as_str(),
+                        reason = reason_of(err),
+                        error = %err,
+                        "mapping resolve failed before authentication completed"
                     );
                 }
             }
@@ -405,12 +467,23 @@ mod router_dispatch_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use crate::mapping::{MappingClient, MappingTable};
     use crate::resolve::{ControlError, ControlPlaneClient, ResolveRequest, ResolveResponse};
-    use crate::types::{Policy, Target};
+    use crate::types::{Policy, Target, ResolveSource};
 
     use super::*;
 
     const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// Deterministic-enough nonce for unique temp paths in tests
+    /// (same style as backend/mod.rs and the mapping module).
+    fn unique_nonce(seed: &str) -> u64 {
+        seed.len() as u64
+            + std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0)
+    }
 
     /// A control-plane client that counts its calls and can be told to fail.
     struct CountingClient {
@@ -486,13 +559,16 @@ mod router_dispatch_tests {
         os: Option<Arc<Resolver>>,
     ) -> ResolveRouter {
         // Every existing router test asserts the UUID route; the name route
-        // gets its own test with its own router.
+        // gets its own test with its own router. Mapping is off, so the
+        // routing decision is exactly as before.
         ResolveRouter::new(
             routing,
             enabled,
             vec![RouteKind::Uuid],
+            false, // mapping disabled
             cp,
             os,
+            None, // no mapping resolver
             Metrics::default(),
         )
     }
@@ -534,8 +610,10 @@ mod router_dispatch_tests {
             OpenStackRouting::OpenStackOnly,
             true,
             vec![RouteKind::Uuid, RouteKind::Name],
+            false, // mapping off
             Some(cp),
             Some(os),
+            None, // no mapping resolver
             metrics.clone(),
         );
 
@@ -590,8 +668,10 @@ mod router_dispatch_tests {
             OpenStackRouting::OpenStackOnly,
             true,
             vec![RouteKind::Uuid, RouteKind::Name],
+            false, // mapping off
             Some(cp),
             Some(os),
+            None, // no mapping resolver
             metrics.clone(),
         );
 
@@ -695,5 +775,226 @@ mod router_dispatch_tests {
         let hybrid = router(OpenStackRouting::Hybrid, true, Some(cp), None);
         assert!(hybrid.can_serve(ResolveRoute::ControlPlane));
         assert!(!hybrid.can_serve(ResolveRoute::OpenStack));
+    }
+
+    // ---- mapping route (plan-mapping §6.2) ---------------------------------
+
+    /// Build a real `MappingTable` from a temp TOML file (the only way to
+    /// obtain one, since it is immutable and built solely by `load`).
+    fn mapping_table_from_content(content: &str) -> Arc<MappingTable> {
+        let path = std::env::temp_dir().join(format!(
+            "sshgw-router-mapping-{}-{}",
+            std::process::id(),
+            unique_nonce(content)
+        ));
+        std::fs::write(&path, content).unwrap();
+        let table = MappingTable::load(&path).expect("mapping table loads");
+        let _ = std::fs::remove_file(&path);
+        Arc::new(table)
+    }
+
+    fn mapping_resolver(
+        table: Arc<MappingTable>,
+        recording: bool,
+        threshold: u32,
+    ) -> Arc<Resolver> {
+        Arc::new(Resolver::new(
+            Arc::new(MappingClient::new(table, recording)),
+            Duration::from_secs(30), // positive TTL
+            Duration::from_secs(5),  // negative cache
+            Duration::from_secs(1),  // transient coalesce
+            Duration::from_secs(1),  // jitter
+            false,                    // fail-closed
+            threshold,                // breaker threshold
+            Duration::from_secs(60),  // breaker reset
+            Duration::from_secs(3),  // per-request timeout
+        ))
+    }
+
+    /// A router with mapping on and the given mapping resolver. The control
+    /// plane and OpenStack are absent (mapping mode needs no [control_plane]
+    /// and is mutually exclusive with [openstack]).
+    fn mapping_router(m: Option<Arc<Resolver>>) -> ResolveRouter {
+        // mapping enabled flips `route()` to always return Mapping.
+        ResolveRouter::new(
+            OpenStackRouting::Hybrid, // routing is irrelevant once mapping is on
+            false,                     // openstack disabled
+            vec![RouteKind::Uuid],
+            true,                      // mapping enabled
+            None,                      // no control plane
+            None,                      // no openstack
+            m,                         // the mapping resolver (or absent)
+            Metrics::default(),
+        )
+    }
+
+    #[test]
+    fn mapping_enabled_routes_every_principal_to_mapping() {
+        let table = mapping_table_from_content(
+            "[[entries]]\nusername = \"alice\"\nhost = \"10.0.0.9\"\nport = 2222\n",
+        );
+        let resolver = mapping_resolver(table, false, 5);
+        let router = mapping_router(Some(resolver));
+
+        for principal in ["alice", "bob", "yunqing_dev", UUID] {
+            assert_eq!(
+                router.route(principal),
+                ResolveRoute::Mapping,
+                "mapping mode sends {principal:?} to the mapping table"
+            );
+            assert!(router.can_serve(ResolveRoute::Mapping));
+        }
+    }
+
+    #[test]
+    fn can_serve_mapping_reflects_the_built_resolver() {
+        let table = mapping_table_from_content(
+            "[[entries]]\nusername = \"alice\"\nhost = \"10.0.0.9\"\nport = 2222\n",
+        );
+        let resolver = mapping_resolver(table, false, 5);
+
+        let with = mapping_router(Some(resolver));
+        assert!(with.can_serve(ResolveRoute::Mapping));
+        // The shape-based routes are inert, but can_serve must still be truthful.
+        assert!(!with.can_serve(ResolveRoute::ControlPlane));
+        assert!(!with.can_serve(ResolveRoute::OpenStack));
+
+        let without = mapping_router(None);
+        assert!(!without.can_serve(ResolveRoute::Mapping));
+    }
+
+    #[tokio::test]
+    async fn mapping_hit_is_stamped_and_reaches_the_mapped_target() {
+        let table = mapping_table_from_content(
+            "[[entries]]\nusername = \"alice\"\nhost = \"10.0.0.9\"\nport = 2222\n",
+        );
+        let metrics = Metrics::default();
+        let resolver = mapping_resolver(table, false, 5);
+        let router = ResolveRouter::new(
+            OpenStackRouting::Hybrid,
+            false,
+            vec![RouteKind::Uuid],
+            true,
+            None,
+            None,
+            Some(resolver),
+            metrics.clone(),
+        );
+
+        let grant = router
+            .authorize(
+                &Principal::parse("alice").unwrap(),
+                "SHA256:fp",
+                "127.0.0.1",
+            )
+            .await
+            .expect("alice is mapped");
+
+        assert_eq!(grant.target.host, "10.0.0.9");
+        assert_eq!(grant.target.port, 2222);
+        assert_eq!(grant.target.user, "alice");
+        assert_eq!(grant.resolve_source, ResolveSource::Mapping);
+        assert!(grant.policy.agent_forwarding, "agent leg is synthesized");
+        assert!(!grant.policy.recording, "mapping recording is off");
+
+        let text = metrics.render_prometheus();
+        assert!(
+            text.contains("sshgw_mapping_resolve_ok_total 1"),
+            "the ok counter fired:\n{text}"
+        );
+        assert!(
+            text.contains("sshgw_mapping_resolve_latency_seconds_count 1"),
+            "the latency histogram fired:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mapping_miss_is_a_not_found_and_counts_as_a_miss() {
+        let table = mapping_table_from_content(
+            "[[entries]]\nusername = \"alice\"\nhost = \"10.0.0.9\"\nport = 2222\n",
+        );
+        let metrics = Metrics::default();
+        let resolver = mapping_resolver(table, false, 5);
+        // Pass the router this test's metrics so the counter renders below.
+        let router = ResolveRouter::new(
+            OpenStackRouting::Hybrid,
+            false,
+            vec![RouteKind::Uuid],
+            true,
+            None,
+            None,
+            Some(resolver),
+            metrics.clone(),
+        );
+
+        let err = router
+            .authorize(
+                &Principal::parse("bob").unwrap(),
+                "SHA256:fp",
+                "127.0.0.1",
+            )
+            .await
+            .expect_err("bob is not mapped");
+
+        assert!(matches!(err, ResolveError::NotFound { .. }), "{err:?}");
+
+        let text = metrics.render_prometheus();
+        assert!(
+            text.contains("sshgw_mapping_resolve_miss_total 1"),
+            "the miss counter fired:\n{text}"
+        );
+        assert!(
+            text.contains("sshgw_mapping_resolve_ok_total 0"),
+            "no hit was recorded:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tripped_mapping_breaker_leaves_nothing_else_to_leak_into() {
+        // Failure-domain isolation: the mapping resolver has its own breaker,
+        // so a dead table cannot affect the (absent) control plane, and a
+        // mapping failure is recorded under the mapping counters only.
+        let table = mapping_table_from_content(
+            "[[entries]]\nusername = \"alice\"\nhost = \"10.0.0.9\"\nport = 2222\n",
+        );
+        let metrics = Metrics::default();
+        let resolver = mapping_resolver(table, false, 1); // threshold 1
+        let router = ResolveRouter::new(
+            OpenStackRouting::Hybrid,
+            false,
+            vec![RouteKind::Uuid],
+            true,
+            None,
+            None,
+            Some(resolver),
+            metrics.clone(),
+        );
+
+        // "alice" resolves (cached). Then the breaker's first *failure* for a
+        // fresh principal... but the mapping table never fails on a present key,
+        // so exercise the breaker with a repeated miss instead: each miss is
+        // a failure that reaches the client.
+        for _ in 0..3 {
+            let err = router
+                .authorize(
+                    &Principal::parse("bob").unwrap(),
+                    "SHA256:fp",
+                    "127.0.0.1",
+                )
+                .await
+                .expect_err("an unmapped user is refused");
+            assert!(matches!(err, ResolveError::NotFound { .. }), "{err:?}");
+        }
+
+        let text = metrics.render_prometheus();
+        // Three misses, no hits, all under the mapping counters.
+        assert!(
+            text.contains("sshgw_mapping_resolve_miss_total 3"),
+            "the miss counter saw all three:\n{text}"
+        );
+        assert!(
+            text.contains("sshgw_mapping_resolve_ok_total 0"),
+            "no hit leaked:\n{text}"
+        );
     }
 }

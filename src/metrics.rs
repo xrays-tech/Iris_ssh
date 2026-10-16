@@ -56,6 +56,13 @@ struct MetricsInner {
     openstack_resolve_by_uuid_total: AtomicU64,
     openstack_resolve_by_name_total: AtomicU64,
 
+    // Mapping-source resolve counters (plan-mapping §3.3): the third routing
+    // source, kept separate so the three can never be conflated in an alert.
+    mapping_resolve_ok_total: AtomicU64,
+    // The only error outcome for an immutable table: a refused login, worth its
+    // own counter so an operator can tell "unknown user" from "table is fine".
+    mapping_resolve_miss_total: AtomicU64,
+
     // relay / flow-control
     window_exhausted_total: AtomicU64,
     backend_dial_ok_total: AtomicU64,
@@ -105,6 +112,8 @@ struct MetricsInner {
     resolve_latency_us: Histogram,
     /// Latency of the OpenStack route only (`sshgw_openstack_resolve_latency_seconds`).
     openstack_resolve_latency_us: Histogram,
+    /// Latency of the mapping route only (`sshgw_mapping_resolve_latency_seconds`).
+    mapping_resolve_latency_us: Histogram,
     backend_dial_latency_us: Histogram,
 }
 
@@ -306,6 +315,28 @@ impl Metrics {
     pub fn openstack_resolve_latency(&self, latency: std::time::Duration) {
         self.inner
             .openstack_resolve_latency_us
+            .observe_us(latency.as_micros() as u64);
+    }
+
+    /// A resolution that went through the mapping route and succeeded.
+    pub fn mapping_resolve_ok(&self) {
+        self.inner
+            .mapping_resolve_ok_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A resolution that went through the mapping route and was refused: a
+    /// miss in the immutable table (the only error outcome for a static table).
+    pub fn mapping_resolve_miss(&self) {
+        self.inner
+            .mapping_resolve_miss_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Latency of the mapping route only.
+    pub fn mapping_resolve_latency(&self, latency: std::time::Duration) {
+        self.inner
+            .mapping_resolve_latency_us
             .observe_us(latency.as_micros() as u64);
     }
 
@@ -531,6 +562,16 @@ impl Metrics {
         );
         push_counter(
             &mut out,
+            "sshgw_mapping_resolve_ok_total",
+            &self.inner.mapping_resolve_ok_total,
+        );
+        push_counter(
+            &mut out,
+            "sshgw_mapping_resolve_miss_total",
+            &self.inner.mapping_resolve_miss_total,
+        );
+        push_counter(
+            &mut out,
             "sshgw_window_exhausted_total",
             &self.inner.window_exhausted_total,
         );
@@ -630,6 +671,9 @@ impl Metrics {
         self.inner
             .openstack_resolve_latency_us
             .render("sshgw_openstack_resolve_latency_seconds", &mut out);
+        self.inner
+            .mapping_resolve_latency_us
+            .render("sshgw_mapping_resolve_latency_seconds", &mut out);
         self.inner
             .backend_dial_latency_us
             .render("sshgw_backend_dial_latency_seconds", &mut out);
