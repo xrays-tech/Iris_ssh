@@ -2,7 +2,7 @@
 
 一个 SSH 网关，用 Rust 和 [russh](https://github.com/Eugeny/russh) 写的。
 
-它做的事：你在外面用 SSH 连机器时，先连到网关，网关验证你的身份、决定你"应该"连到哪台后端机器，然后帮你把连接转发过去。客户端这边的用法不变——`ssh 用户名@网关地址`，差别只在"用户名"在这里是路由信息：网关拿这个用户名去问控制面，查到你实际要登录的后端地址和账号，再替你拨过去。
+它做的事：你在外面用 SSH 连机器时，先连到网关，网关验证你的身份、决定你"应该"连到哪台后端机器，然后帮你把连接转发过去。客户端这边的用法不变——`ssh 用户名@网关地址`，差别只在"用户名"在这里是路由信息：网关拿这个用户名去问控制面（或按 OpenStack 解析），查出你实际要登录的后端地址和账号，再替你拨过去。
 
 ```
 ssh alex_host1@gw.example.com
@@ -14,17 +14,23 @@ ssh alex_host1@gw.example.com
   后端 sshd（目标机器）
 ```
 
-数据是纯转发的，网关默认不落盘（会话录制由控制面按 grant 开启，见「功能」）。认证、审计、访问控制都发生在网关这一侧；后端机器唯一的配置是把**终端用户的公钥**放进 `authorized_keys`——网关不持有任何后端私钥，它是靠转发用户的 ssh-agent 去拨号的。
+数据是纯转发的，网关默认不落盘（会话录制由控制面按 grant 开启）。认证、审计、访问控制都发生在网关这一侧；后端机器唯一的配置是把**终端用户的公钥**放进 `authorized_keys`——网关不持有任何后端私钥，它是靠转发用户的 ssh-agent 去拨号的。
 
 ## 功能
 
-- **用户名即路由**：控制面接口 `POST /api/v1/resolve` 根据用户名返回目标后端 `{host, port, user}` 和策略；拒绝返回 403，未知返回 404。
-- **可选的 OpenStack 路由**（默认关）：写 `[openstack]` 节后，规范形式的实例 UUID 由 Nova 解析成 `{地址, 后端登录用户}`。**当前唯一可启用的组合就是实验室模式**——`routing="openstack_only"` + `authorization="openstack_only"` + `allow_any_authenticated_key = true`：没有控制面回退，且任意通过前腿验签的密钥 + 已知 UUID 即可达该实例。`routing="hybrid"` 与"控制面授权"（方案 A）解析通过但**启用即被配置校验拒绝**，因为后者尚未实现。见 `config.example.toml` 注释、`docs/ops-runbook.md` §5.8 与 `docs/known-limitations.md` §9。
-- **双会话中继**：终结客户端 SSH（server 腿）+ 拨号后端（client 腿），双向转发。上行有窗口熔断（`outbound_guard`）防止缓冲无限增长。
-- **认证**：客户端 → 网关支持公钥 / CA 签发的用户证书；网关 → 后端只有一种方式——转发客户端的 ssh-agent（`ssh -A` 语义）。
+- **用户名即路由（控制面 / OpenStack 二选一）**
+  - 控制面：`POST /api/v1/resolve` 按用户名返回目标后端 `{host, port, user}` 和策略；拒绝 403，未知 404。
+  - **OpenStack（默认关，见下）**：规范形式的实例 UUID（或实例名）由 Nova 解析成目标地址和登录用户。
+- **OpenStack 路由（实验室模式）**：开启 `[openstack]` 后（当前唯一可启用组合是 `routing="openstack_only"` + `authorization="openstack_only"` + `allow_any_authenticated_key=true`）——
+  - `route_by = ["uuid"]`（默认）按实例 UUID 解析；加 `"name"` 可再按**实例名**（小写）解析，重名实例拒绝不猜；
+  - `scope = "single_project"`（默认）只解析本项目的实例；`"cross_project"` 用 `all_tenants=1` 解析**任意项目**的实例（不指定 Project，凭条件见部署）；
+  - `address_kind = "any"（默认）| "floating" | "fixed"`：`"floating"` 只取浮动 IP（公网可达前提），无浮动地址即拒绝、绝不回退 fixed；
+  - 后端登录用户按 实例 metadata → `[[openstack.backend_user_map]]` 规则 → `default_backend_user` 解析。
+- **双会话中继**：终结客户端 SSH（server 腿）+ 拨号后端（client 腿），双向转发；上行有窗口熔断（`outbound_guard`）防止缓冲无限增长。
+- **认证**：客户端 → 网关支持公钥 / CA 签发的用户证书；网关 → 后端只有一种方式——转发客户端的 ssh-agent（`ssh -A` 语义）。签名算法对齐当前 SSH 生态：**后端 RSA 拨号走 `rsa-sha2-512`（默认，可配 `[backend] rsa_signature_hash="sha256"`）**，ed25519 / ecdsa 原生支持；**前腿与后端 host-key 协商都不再包含 `ssh-rsa`（SHA-1）**。
 - **防爆破 / 防时序**：每次认证拒绝有恒定时间填充（`auth_rejection_pad`），尝试次数上限（`max_auth_attempts`），每 IP 并发上限。
-- **会话语义完整**：exec / shell / scp / sftp / stderr（extended data）/ exit status / rekey / 信号全部按 SSH 协议原样透传；不伪造成功、不注入协议行为（I4）。
-- **审计与录制**：字节计数与操作事件写审计；按通道录制抓包（`.srec`），由控制面每个 grant 的 `policy.recording` 按会话开启，配置里的 `[recording] max_bytes_per_session` 只是预算上限（默认 64 MiB，设 0 整体禁用）。
+- **会话语义完整**：exec / shell / scp / sftp / stderr（extended data）/ exit status / rekey / 信号全部按 SSH 协议原样透传；不伪造成功、不注入协议行为。
+- **审计与录制**：字节计数与操作事件写审计；按通道录制抓包（`.srec`），由控制面每个 grant 的 `policy.recording` 按会话开启，`[recording] max_bytes_per_session` 只是预算上限（默认 64 MiB，设 0 整体禁用）。
 - **SFTP 命令级拦截**（默认关）：可拒绝特定命令（如 `REMOVE`/`RENAME`）并按路径前缀控制。
 - **可观测**：`/healthz`、`/readyz`、`/metrics`（Prometheus 文本格式）。
 - **优雅停机**：SIGTERM 排水后向客户端发协议级 `DISCONNECT[BY_APPLICATION]`。
@@ -60,7 +66,7 @@ systemd 参考单元在 `deploy/ssh-gw.service`（已配好优雅排水和基本
    chmod 600 /etc/ssh-gw/host_ed25519
    ```
    权限不对会拒绝启动（fail-closed）。
-2. **准备后端授权**：把**终端用户自己的公钥**加进各后端机器的 `authorized_keys`。网关没有自己的后端私钥，也不需要——它拿用户转发来的 ssh-agent 去拨号（`ssh -A` / `-o ForwardAgent=yes`）。`ssh-agent -k` 之后重启会话即可轮换。
+2. **准备后端授权**：把**终端用户自己的公钥**加进各后端机器的 `authorized_keys`。网关没有自己的后端私钥，也不需要——它拿用户转发来的 ssh-agent 去拨号（`ssh -A` / `-o ForwardAgent=yes`）。
 3. **配置控制面**：网关自己不存"用户名→目标"映射，必须有一个控制面服务响应 `POST /api/v1/resolve`。请求体示例：
 
    ```json
@@ -72,25 +78,66 @@ systemd 参考单元在 `deploy/ssh-gw.service`（已配好优雅排水和基本
    ```json
    {"target": {"host": "db.internal", "port": 22, "user": "alex"}, "policy": {"agent_forwarding": true, "recording": false, "ttl": 60}}
    ```
-   拒绝返回 `{"status":403,...}`，未知 `{"status":404,...}`。`policy.agent_forwarding` 为 `true` 才会建立后端会话；缺省或 `false` 一律拒绝（网关没有可回落的凭据）。`policy.recording` 为 `true` 时按会话开启 `.srec` 抓包（缺省 `false`，不录）。不想搭真实服务的话，仓库里有 [scripts/mock_control_plane.py](scripts/mock_control_plane.py)（按一条 JSON 规则表应答，用于本地联调）。
+   拒绝返回 `{"status":403,...}`，未知 `{"status":404,...}`。`policy.agent_forwarding` 为 `true` 才会建立后端会话；缺省或 `false` 一律拒绝（网关没有可回落的凭据）。不想搭真实服务的话，仓库里有 [scripts/mock_control_plane.py](scripts/mock_control_plane.py)（按一条 JSON 规则表应答，用于本地联调）。
 4. **后端 host key 信任**：生产用 `host_key_policy="pinned"`（首次固化指纹）；初次联调可先 `accept-new` 再尽快 pin。
+
+### 可选：OpenStack 实例即路由
+
+不启用 `[openstack]` 时网关行为与上述控制面模式完全一致。启用后，规范形式的实例 UUID（以及可选的名字）由 Nova 解析成目标实例。
+
+**当前唯一可启用组合就是实验室/内网 PoC 模式**：`routing="openstack_only"` + `authorization="openstack_only"` + `allow_any_authenticated_key=true`——没有控制面回退，任意通过前腿验签的密钥 + 已知 UUID 即可达该实例（名字路由同样）。`routing="hybrid"` 与"控制面授权"（方案 A）解析通过但启用即被配置校验拒绝（尚未实现）。
+
+最小配置（截取自 `config.example.toml`，字段全注释）：
+
+```toml
+[openstack]
+enabled = true
+routing = "openstack_only"
+authorization = "openstack_only"
+allow_any_authenticated_key = true
+
+route_by = ["uuid"]           # 加 "name" 启用实例名路由；UUID 形态永远优先
+scope = "single_project"       # 默认；"cross_project" = 不指定 Project（见下）
+address_kind = "any"           # any | floating（只取浮动 IP）| fixed
+
+# Keystone v3 认证：application_credential（推荐）| password（仅 cross_project）| token（仅测试）
+auth_url = "https://keystone.example.internal:5000/v3"
+application_credential_id = "..."
+application_credential_secret = "..."   # 或 _file / $SSHGW_OPENSTACK_APPLICATION_CREDENTIAL_SECRET
+project_id = "..."              # single_project：可见性边界；cross_project：认证 scope
+region = "RegionOne"
+interface = "public"
+# nova_endpoint = "https://nova:8774/v2.1"   # 跳过 catalog 发现（测试/内网云）
+
+# 地址与登录用户
+# network = "私有网络名"         # 多网络时必填
+# prefer = "floating"            # floating | fixed | any
+# on_ambiguous = "reject"        # reject（默认）| first
+default_backend_user = "ubuntu"  # 或靠实例 metadata / backend_user_map
+```
+
+**两个需先想清楚的开关**：
+
+- **`scope = "cross_project"`（不指定 Project，实验）**：让网关以 `all_tenants=1` 解析任意项目的实例（UUID 全局唯一可直接命中；名字要求全云唯一）。**必须 `auth_method="password"`**（app-credential 被 Keystone 锁死在单项目），且该 `project_id` 是**认证 scope**（决定 token 带哪些角色）。⚠ 网关将持有能看/能拨其角色覆盖的一切实例的凭据——**仅限内网/实验云且 Nova 策略宽松（允许项目级 admin 用 `all_tenants`），严禁公网/共享**。启动会有 `scope = "cross_project": this is a LAB mode` WARN。
+- **`address_kind = "floating"`（只取浮动 IP）**：当实例只在公网侧可达（fixed/VXLAN 需要手工打通网络）时用。**前置条件：实例已关联浮动 IP**（Neutron 操作）；否则一律 `no_floating` 拒绝。无浮动地址一律拒绝、绝不回退到 fixed。
+
+完整说明、安全边界与已知限制见 `docs/ops-runbook.md` §5.8 与 `docs/known-limitations.md` §9。
 
 ## 使用
 
-客户端不用装任何东西，普通 OpenSSH 即可。**必须转发 ssh-agent**（`-A` 或 `-o ForwardAgent=yes`）——网关没有自己的后端私钥，会拿你 agent 里的 key 去拨号。用户名按控制面的规则填。
+客户端不用装任何东西，普通 OpenSSH 即可。**必须转发 ssh-agent**（`-A` 或 `-o ForwardAgent=yes`）——网关没有自己的后端私钥，会拿你 agent 里的 key 去拨号。用户名按控制面规则或 OpenStack 路由填。
 
 ```bash
-# 登录（用户名即路由；-A 转发 agent，后端认证靠它）
+# 控制面：用户名即路由
 ssh -A -p 2222 alex_host1@gw.example.com
-
-# 执行单条命令
 ssh -A -p 2222 alex_host1@gw.example.com 'uptime'
-
-# 复制文件（scp 走 sftp/exec 语义，按 SSH 协议转发）
 scp -o ForwardAgent=yes -P 2222 build.tar alex_host1@gw.example.com:/tmp/
-
-# 交互式 sftp
 sftp -o ForwardAgent=yes -P 2222 alex_host1@gw.example.com
+
+# OpenStack：实例 UUID 即用户名
+ssh -A -p 2222 550e8400-e29b-41d4-a716-446655440000@gw.example.com
+# OpenStack：实例名（小写）即用户名（需 route_by=["uuid","name"]）
+ssh -A -p 2222 web-1@gw.example.com
 ```
 
 被连载的会话行为和直连后端基本一致；端口转发（`direct-tcpip`）一律拒绝——网关不是出站跳板，也没有任何配置能放开它。
@@ -125,11 +172,11 @@ curl http://127.0.0.1:9090/metrics    # 指标
 ```bash
 make lint          # fmt + clippy
 make test          # 单元测试
-make integration   # 黑盒集成套件（本地 sshd + mock 控制面，全自动）
-make bench         # 网关 vs 直连 性能对比
+make integration   # 黑盒集成套件（本地 sshd + mock 控制面/OpenStack，全自动）
+make bench         # 吞吐基准（benchmark v2：A 每连接成本 / B 复用连接数据面 / C 记录）
 ```
 
-集成套件自包含：起一个本地 sshd 当后端 + 一个 mock 控制面，不需要外网。全部落盘细节、已知限制分别见 [docs/ops-runbook.md](docs/ops-runbook.md) 和 [docs/known-limitations.md](docs/known-limitations.md)。
+集成套件自包含：起一个本地 sshd 当后端 + mock 控制面/OpenStack，不需要外网。全部落盘细节、已知限制分别见 [docs/ops-runbook.md](docs/ops-runbook.md) 和 [docs/known-limitations.md](docs/known-limitations.md)。
 
 ## 许可
 
