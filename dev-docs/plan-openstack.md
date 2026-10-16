@@ -1354,7 +1354,7 @@ project_domain_name = "Default"
 
 ## D.2 交互
 
-- `network` / `address_family` / `on_ambiguous` / `scope=cross_project` **全部正交**：floating 过滤后再按这些筛选。
+- `network` / `address_family` / `on_ambiguous` / `scope=cross_project` **全部正交**。**筛选顺序与实现一致：`network` 先、`address_family` 次之、`kind` 在后**（之后才是 `prefer` 排序与 `access_ips` 兜底）——三者都是对候选集的交集，**先后不改最终集合，只改错误 token 的优先级**：谁先把集合清空谁报自己的 token（`network` 不在网络清单 → `no_network`；`network`/family 交集为空 → `no_address`，即便配置了严格 kind；候选存在但无所需 kind → `no_floating`/`no_fixed`）。客户端始终同构 `NotFound`。
 - ⚠ **`network` 过滤器注意**：浮动 IP 的归属网络是"浮动端口所在网络"（Neutron 关联），通常**与实例 fixed 网络不同名**；若同时配 `network`（如按 fixed 网名 `NET3741`），可能把 floating 候选过滤光 → `no_floating`。文档需提示：floating-only 模式下 `network` 应指向浮动网络名或留空。
 - 日志/审计：`reason` token 进 `target=openstack` 日志；`target.host` 只来自解析；`AuditRecord` 格式不变。
 
