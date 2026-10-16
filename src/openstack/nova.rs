@@ -528,8 +528,10 @@ pub enum SelectionError {
     /// candidate. Deliberately distinct from `NoAddress`: a kind filter is a
     /// policy refusal (the instance *has* addresses, none dialable under the
     /// configured policy) whereas `NoAddress` means nothing was advertised.
-    /// `mod.rs` maps this to `ControlError::NotFound`, so the client sees the
-    /// same refusal either way — the distinction is log-only.
+    /// Emitted only when a pre-filter candidate set existed — an already-empty
+    /// set short-circuits to `NoAddress` before the filter runs. `mod.rs`
+    /// maps this to `ControlError::NotFound`, so the client sees the same
+    /// refusal either way — the distinction is log-only.
     NoKind,
 }
 
@@ -661,6 +663,17 @@ pub fn select_address(
     // the point: an unknown-kind address must not be dialed on a floating-only
     // network. There is deliberately no fallback to the other kind.
     if sel.kind != AddressKind::Any {
+        // Nothing left to filter? Then this is O7's legal empty `no_address`,
+        // not a policy refusal: `NoKind` would claim the instance *has*
+        // addresses and none of them matches the demanded kind. The strict
+        // filter only gets to speak when a pre-filter candidate set existed.
+        // Returning here also keeps the `access_ips` fallback below (which
+        // sits after this filter) from ever feeding an `Unknown`-kind legacy
+        // address into a strict-kind decision: zero usable candidates stay
+        // `no_address` whether or not `accessIPv4/6` is populated.
+        if cands.is_empty() {
+            return Err(SelectionError::NoAddress);
+        }
         let want = match sel.kind {
             AddressKind::Floating => AddrKind::Floating,
             AddressKind::Fixed => AddrKind::Fixed,
@@ -1043,6 +1056,88 @@ mod tests {
         // Stable reason token — distinct from `no_address`, which means the
         // instance advertised nothing at all.
         assert_eq!(err.reason(), "no_address_kind");
+    }
+
+    /// Appendix D / O7: the `NoAddress` vs `NoKind` split. A strict kind
+    /// policy only refuses *kind-wise* when candidates existed; an already
+    /// empty set (nothing advertised) is the legal empty `no_address`, even
+    /// under `address_kind = "floating"`.
+    #[test]
+    fn address_kind_strict_on_a_zero_address_instance_is_no_address() {
+        let err = select_address(
+            &map(vec![]),
+            &[],
+            &selection(
+                "",
+                AddressFamily::Any,
+                IpPrefer::Floating,
+                OnAmbiguous::Reject,
+                AddressKind::Floating,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::NoAddress);
+        assert_eq!(err.reason(), "no_address");
+    }
+
+    /// Same split one step later: the family filter can empty the set too
+    /// ("network/family 后 0 个"). An IPv6-only instance under
+    /// `address_family = "ipv4"` + `address_kind = "floating"` advertised
+    /// addresses, but none was even a candidate — still `no_address`, not a
+    /// kind-policy refusal.
+    #[test]
+    fn address_kind_strict_after_the_family_filter_is_no_address() {
+        let addrs = map(vec![addr("private", "2001:db8::7", "fixed")]);
+        let err = select_address(
+            &addrs,
+            &[],
+            &selection(
+                "",
+                AddressFamily::IPv4,
+                IpPrefer::Floating,
+                OnAmbiguous::Reject,
+                AddressKind::Floating,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::NoAddress);
+    }
+
+    /// The `access_ips` fallback sits *after* the kind filter, so under a
+    /// strict policy it must never resurrect a zero-candidate instance as an
+    /// `Unknown`-kind legacy address: the empty set short-circuits first and
+    /// the result stays `no_address`.
+    #[test]
+    fn address_kind_strict_never_dials_the_access_ips_fallback() {
+        let fallback: Vec<IpAddr> = vec!["203.0.113.9".parse().unwrap()];
+        let err = select_address(
+            &map(vec![]),
+            &fallback,
+            &selection(
+                "",
+                AddressFamily::Any,
+                IpPrefer::Floating,
+                OnAmbiguous::Reject,
+                AddressKind::Floating,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err, SelectionError::NoAddress);
+        // With the default `any` policy the very same fallback *is* honoured
+        // (pre-existing behaviour, pinned here so the split cannot drift).
+        let got = select_address(
+            &map(vec![]),
+            &fallback,
+            &selection(
+                "",
+                AddressFamily::Any,
+                IpPrefer::Floating,
+                OnAmbiguous::Reject,
+                AddressKind::Any,
+            ),
+        )
+        .expect("legacy accessIPv4 still dials under the default policy");
+        assert_eq!(got, "203.0.113.9".parse::<IpAddr>().unwrap());
     }
 
     /// Appendix D: `address_kind = "any"` (the default) is a no-op — a fixed
