@@ -124,6 +124,27 @@ ssh_port = 22
            - O7 四层解析（独立解码/灰度回退/响亮失败/真实 body 语料）落地，
              `case_openstack_no_address` 的"空 vs 不可用"语义保留。全量 test 282+4、
              集成 44P/0F/2S，oracle 红线 12 复审 GO。
+2026-10-16  **附录 D floating-only 真机验证（FLT-TEST-01）**：
+           - 实例 `bb45a399-848e-45da-b16b-d82d246274bd`（name `FLT-TEST-01`，
+             tenant `851ae91b26214106b39a1f5e7a031a76`，非凭据自身项目 T_3746）同时
+             携带 fixed `192.168.3.219`（TEST-NET01）与 floating `172.16.31.27`。
+           - 网关配置：`scope="cross_project"` + `auth_method="password"`（alex，
+             `user_domain_name="Default"`，`project_id=a070dab7…`=T_3746）+
+             `network="TEST-NET01"` + **`address_kind="floating"`** + `route_by=["uuid"]`。
+             密码经 0600 `password_file=/tmp/oss-pass` 注入（脚本/配置/日志均不含）。
+           - **目标①（核心）：解析选中 floating。** debug `instance address resolved`
+             `addr=172.16.31.27`、`tenant_id=851ae91b…`、`instance_name=FLT-TEST-01`；
+             审计 `resolve_source="openstack" target_host=172.16.31.27
+             target_user=root auth_kind=agent`。fixed `192.168.3.219` **未出现在任何
+             日志行**（kind 过滤在选择前丢弃，不产生候选＝有意为之）。
+           - **目标②：登录未通。** 后端回 `backend authentication as "root" failed`
+             （agent 签名被拒）→ 该实例 authorized_keys 尚无 /tmp/gw-t3741-key 公钥。
+             **这是"解析成功但缺 key"，非解析失败**：`sshgw_openstack_resolve_ok_total=1`
+             且 `resolve_err_total=0`，拨号目标 172.16.31.27:22 已 TCP 可达。
+- 集成回归：新增 `case_openstack_floating_only`（both-kinds → 选 floating 会话建立）、
+  `case_openstack_no_floating_rejected`（仅 fixed → 拒绝、`reason="no_floating"`、
+  `resolve_ok=0`）与 `case_openstack_address_kind_default`（`any` 默认零回归：
+  仅 fixed 实例仍可连接，日志无 kind 拒绝）。全量 test 304+4、集成 53P/0F/2S。
 ```
 
 ## 6b. 剩余缺口
@@ -132,6 +153,10 @@ ssh_port = 22
   测试公钥已放 `authorized_keys`、`ssh -A <uuid>` 经网关完整登录成功（见 §6）。
 - 若要对 **T_3746** 那批实例（172.16.46.x）实测：仍需一台能到达该网段的网关机 +
   对应实例的登录用户/公钥部署（本机到达不了 172.16.46.x）。
+- **FLT-TEST-01 登录缺 key**（2026-10-16）：floating-only 解析已通（`target_host=
+  172.16.31.27`），但实例 `authorized_keys` 尚无 `/tmp/gw-t3741-key` 公钥 → root 后端
+  认证被拒。补 key 后重跑 `/tmp/run_flt_test01.sh` 即可完成目标②；不影响附录 D 的
+  解析验证结论。
 - 持久生产配置建议：`auth_method="application_credential"`（凭据 scope 到目标项目；
   T_3741 需另建一把 T_3741 作用域的 app-credential）+ `region="RegionOne"` +
   `nova_endpoint` 或 catalog 发现均可。

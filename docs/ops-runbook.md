@@ -83,6 +83,7 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `nova_endpoint` | 空 | 显式 Nova base URL（跳过 catalog 发现；测试/内网云用） |
 | | `timeout` / `cache_ttl` / `fail_open` | `3s` / `30s` / `false` | 独立于 `[control_plane]` 的缓存与超时；`fail_open=true` 才允许在 TTL 过期后用旧地址（且须配合 `host_key_policy="pinned"`） |
 | | `network` / `address_family` / `prefer` / `on_ambiguous` | `""` / `ipv4` / `floating` / `reject` | 地址选择；多网络实例不配 `network` 且候选 >1 → 拒绝（`on_ambiguous="reject"`） |
+| | `address_kind` | `any` | `any`（默认，= 现状零回归）\| `floating`\| `fixed`：**硬过滤**（在 `prefer` 排序前按地址种类过滤候选）。`floating` 只取浮动 IP、实例无浮动 → 拒绝 `reason="no_floating"`（**绝不回退 fixed**）；`fixed` 镜像（`no_fixed`）。公网可达部署用 `floating`，避免网关拨到不可达的 VXLAN 私网地址 |
 | | `default_backend_user` / `backend_user_metadata_key` | — / `""` | 后端登录用户：metadata 命中 → 映射规则 → `default_backend_user`（enabled 时必填） |
 | | `ssh_port` | `22` | 所有实例的 SSH 端口（实例文档里不带端口） |
 | `[limits]` | `max_sessions` / `max_sessions_per_ip` | `10000` / `20` | 准入 |

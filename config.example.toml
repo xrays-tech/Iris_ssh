@@ -138,6 +138,11 @@ timeout = "2s"
 # address_family = "ipv4" # ipv4 | ipv6 | any
 # prefer = "floating"     # floating | fixed | any
 # on_ambiguous = "reject" # reject (default) | first
+# address_kind = "any"    # any (default) | floating | fixed
+#                        # Strict filter, no fallback: "floating" dials only a
+#                        # floating (public) address and refuses outright when
+#                        # the instance has none, instead of dialing a fixed
+#                        # one that a floating-only network cannot reach.
 #
 # # --- which principal shapes this route accepts -----------------------------
 # # route_by = ["uuid"]  # (default) canonical instance UUID only — existing

@@ -1320,7 +1320,11 @@ project_domain_name = "Default"
 
 # 附录 D — 只取浮动 IP（floating-only address selection）
 
-> 状态：设计（2026-10-15），待实施。**启用前置条件：实例须已关联浮动 IP（Neutron 操作）；未关联前开启会让所有实例解析失败。**
+> 状态：**已实施（2026-10-16），待 oracle 红线 12 复审。** 默认 `any` 零回归；`floating` 需实例先关联浮动 IP（Neutron 操作），未关联前开启会让该实例解析失败为 `no_floating`。
+>
+> 实施落点：`AddressKind` 枚举 + `AddressSelection.kind` 硬过滤 + `SelectionError::NoKind` → `no_floating`/`no_fixed` reason token（`mod.rs` 按 `cfg.address_kind` 映射，客户端恒同构 `NotFound`）+ `config` 解析/Default/Debug + 7 个单元测试 + `case_openstack_floating_only` /
+`case_openstack_no_floating_rejected` / `case_openstack_address_kind_default` 三个集成用例。
+真机 FLT-TEST-01 验证见 `dev-docs/openstack-test-env.md`。
 
 ## D.0 需求与现状（已真机验证）
 
@@ -1358,7 +1362,10 @@ project_domain_name = "Default"
 
 - 单元（`nova.rs` 表驱动）：同实例 fixed+floating → floating-only 选 floating；仅 fixed → 拒绝 `no_floating`；floating-only + 多 floating → `on_ambiguous` 生效；`any`（默认）字节不变回归；`fixed` 镜像。
 - 集成：`case_openstack_floating_only`（mock 实例带 floating，拨 floating）、`case_openstack_no_floating_rejected`（仅 fixed → 拒绝、reason=no_floating、0 拨号）、`case_openstack_address_kind_default`（any=现状回归）。
-- 真机：待 T_3746 空闲浮动 IP（DOWN 三枚之一）由云侧 float 到实例端口后验证（**前置条件**）。
+- 真机（2026-10-16，FLT-TEST-01 `bb45a399…`，同网同时携带 fixed `192.168.3.219` +
+  floating `172.16.31.27`）：`address_kind="floating"` + `scope="cross_project"` 下解析
+  选中 **floating**，审计 `target_host=172.16.31.27`；仅 fixed 的拒绝路径见集成用例。
+  记录见 `dev-docs/openstack-test-env.md` §6。
 
 ## D.4 红线 / DoD
 
