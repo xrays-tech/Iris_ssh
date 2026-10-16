@@ -256,6 +256,10 @@ pub struct BackendDialer {
     client_config: Arc<client::Config>,
     metrics: Metrics,
     dial_timeout: Duration,
+    /// The RSA signature hash the forwarded agent is asked to sign with.
+    /// `HashAlg::Sha512` (plan-openstack E.1); non-RSA keys ignore it (see
+    /// [`signature_hash_alg`]).
+    rsa_signature_hash: HashAlg,
     /// Per-target dial circuit breaker (§3.8): after `threshold` consecutive
     /// dial failures a target is short-circuited so repeated channel opens don't
     /// pile onto a dead backend.
@@ -328,6 +332,7 @@ impl BackendDialer {
             verifier,
             client_config: Arc::new(client_config),
             metrics,
+            rsa_signature_hash: HashAlg::Sha512,
             // A control plane's timeout doubles as the dial deadline; in
             // OpenStack pure mode there is no control plane, so fall back to
             // the OpenStack request timeout and finally the 2s default.
@@ -448,14 +453,27 @@ impl BackendDialer {
         let started = std::time::Instant::now();
         let mut handle = self.connect_inner(grant, &key).await?;
 
-        // Hash algorithm: let russh pick the default (`None`). Non-RSA keys
-        // ignore it entirely; RSA falls back to its legacy default, so the agent
-        // path introduces no new algorithm policy.
+        // RSA needs an explicit rsa-sha2 hash: passing `None` makes russh emit
+        // the legacy SHA-1 `ssh-rsa` signature, which OpenSSH >= 8.8 rejects by
+        // default. Non-RSA keys ignore the argument entirely, so they see no
+        // behaviour change at all (plan-openstack E.1).
+        let hash_alg = signature_hash_alg(&public_key, self.rsa_signature_hash);
+        tracing::debug!(
+            target: "backend",
+            user = %grant.target.user,
+            key_type = %public_key.algorithm(),
+            ?hash_alg,
+            "backend publickey auth"
+        );
+
         let outcome = handle
-            .authenticate_publickey_with(&grant.target.user, public_key, None, signer)
+            .authenticate_publickey_with(&grant.target.user, public_key, hash_alg, signer)
             .await
             .map_err(|e| BackendError::Auth {
-                user: format!("{} ({e})", grant.target.user),
+                // The hash goes in the context, not as a retry: a backend that
+                // rejects rsa-sha2-512 fails here, loudly, rather than being
+                // retried with a weaker algorithm (red line 1).
+                user: format!("{} ({e}, rsa_hash={:?})", grant.target.user, hash_alg),
             });
 
         self.settle_auth(&key, started, handle, &grant.target.user, outcome)
@@ -478,6 +496,26 @@ impl BackendDialer {
                 source: Box::new(crate::error::Error::Ssh(err)),
             },
         }
+    }
+}
+
+/// The RSA signature hash this gateway uses when the end-user's forwarded
+/// agent signs for the backend.
+///
+/// RSA keys get `rsa_hash` (default `HashAlg::Sha512`, plan-openstack E.1).
+/// Everything else gets `None`: their signature scheme is fixed by the key
+/// type, and russh ignores the argument entirely for non-RSA keys — so passing
+/// `None` here is byte-for-byte the pre-E.1 behaviour for ed25519/ecdsa/sk-*
+/// (red line 2).
+///
+/// The match deliberately names no non-RSA variant: `None` is the answer for
+/// every key type other than RSA, including ones this build does not know
+/// about. RSA never reaches that arm, so SHA-1 (`ssh-rsa`) is unreachable on
+/// the backend leg (red line 1) — there is no fallback path to fall back to.
+pub fn signature_hash_alg(key: &russh::keys::PublicKey, rsa_hash: HashAlg) -> Option<HashAlg> {
+    match key.algorithm() {
+        russh::keys::Algorithm::Rsa { .. } => Some(rsa_hash),
+        _ => None,
     }
 }
 
@@ -681,5 +719,62 @@ mod tests {
         dialer.dial_breaker.record_failure(&key_a);
         assert!(!dialer.dial_breaker.allows(&key_a), "A's breaker is open");
         assert!(dialer.dial_breaker.allows(&key_b), "B is unaffected by A");
+    }
+
+    // --- backend RSA signature hash (plan-openstack E.1 / E.5.1) -----------
+
+    /// One OpenSSH public-key line per key type, the same way a forwarded
+    /// identity reaches the gateway. The sk-* keys are hand-built (they are not
+    /// supported by `ssh-keygen`); everything else is a `ssh-keygen` line.
+    const TEST_PUBKEYS: &[(&str, Option<HashAlg>)] = &[
+        (
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGB0tNwSXLXP/LrkgydkuUqloGCMgC0MOK1L4KvP7wPH",
+            None,
+        ),
+        (
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBIyYs/0Zbpv7DjpHAtlPr1uWWx4PiMKe7biy6XS682Nd/Dens6Cqq/SY59CtGrinJE+9Dtc2gs6EwfNdzZf5VLo=",
+            None,
+        ),
+        (
+            "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBB58K459l2kZDIvIPuTRXrR7zo+ecwkR7x3hewafoc2D8oIa0wLddu78keUzjhCPj38HrzmmhKyVawaxt5xG8Ob8v31MsJZazzp3fqCHeRUKUqVzhuJojoPF+7zn+UGxVQ==",
+            None,
+        ),
+        (
+            "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAFW1nLAF/0/zEk9viLls9GJwrfsTeoWtEiCupNJxGHpOHZAhheKJ/ydWcdxq87W7XrchkHuFCCosmFl+Ki/RzDQGAGweg3ad+iQad4ai9PgzweniMnP1ZzG90CmQ7Cgq5r9gha1H5R3kX1dMy2ZXVfcmOK44KGclcl7RYSuEBE8DU1YyQ==",
+            None,
+        ),
+        (
+            "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fAAAAAA==",
+            None,
+        ),
+        (
+            "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8AAAAA",
+            None,
+        ),
+        // The bare `ssh-rsa` key type is the *key's* encoding (an RSA public
+        // key carries no hash); the *signature* hash is what we decide here.
+        (
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC6ouMQLXfiHJC8huDR9xNFTZ4dh+z4ToDijR7zqXENLC83hOkkM4c9TK4cKCmIG76RZ2xa+l29TdaYvjf78ihdNIJU7tElPcZTRVmwkPRJ4+m6N8bVBQNcthCjn5usOAhC/QQYxe/UpSu2v/k8/yX/LpCaEtC++aIzwDCJqN2tO0mwsKXBehG7M9OmMHkosZ5/m+zaz3ESNhmhvU4OhbNb2x5auMQYljZyn2Ho0TDSrlk8BPyLKCVPakMZjP927UO189C1GBbZFIqaMEjTvlM+A/4hIWz64OYBFfs1uoR6fsqZLHYxUefCQmDp6PPOrbbEX6kgzy8qxuJs4QAX7+55",
+            Some(HashAlg::Sha512),
+        ),
+    ];
+
+    fn pubkey(openssh: &str) -> russh::keys::PublicKey {
+        russh::keys::PublicKey::from_openssh(openssh).expect("valid public key")
+    }
+
+    /// RSA keys ask for the configured rsa-sha2 hash; everything else gets
+    /// `None` so russh's per-key-type default is untouched (red line 2).
+    #[test]
+    fn signature_hash_alg_table() {
+        for (openssh, expected) in TEST_PUBKEYS {
+            let key = pubkey(openssh);
+            assert_eq!(
+                signature_hash_alg(&key, HashAlg::Sha512),
+                *expected,
+                "for {}",
+                key.algorithm()
+            );
+        }
     }
 }
