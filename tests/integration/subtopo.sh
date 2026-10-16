@@ -248,6 +248,9 @@ subtopo_start() {
     else
       printf '[[entries]]\nusername="%s"\nhost="127.0.0.1"\nport=%s\nuser="%s"\n' \
         "$PRINCIPAL" "$ST_SSHD_PORT" "$BACKEND_USER" > "$SUBTOPO_DIR/mappings.toml"
+      # Umask-independent: the loader rejects group/other-writable tables, so
+      # pin 0644 (ambient umask 002 would otherwise leave 0664 and break boot).
+      chmod 644 "$SUBTOPO_DIR/mappings.toml"
     fi
     _mapping_toml="$(printf '[mapping]\nenabled = true\nmapping_file="%s"\nallow_any_authenticated_key = true\nrecording = %s\n' \
       "$SUBTOPO_DIR/mappings.toml" "$SUBTOP_MAPPING_RECORD")"

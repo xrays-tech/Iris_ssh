@@ -1973,6 +1973,9 @@ mod tests {
     use crate::resolve::ControlError;
     use crate::types::{Policy, ResolveRequest, ResolveResponse, Target};
     use russh::server::Handler as _;
+    // Needed for `Permissions::from_mode` in the mapping fixtures below
+    // (both the empty-table boot test and the pre-auth no-lookup test).
+    use std::os::unix::fs::PermissionsExt;
 
     struct FixControlPlane {
         result: std::result::Result<ResolveResponse, ControlError>,
@@ -3220,6 +3223,10 @@ mod tests {
         ));
         // A comment-only file: valid TOML, zero entries.
         std::fs::write(&empty_path, "# empty mapping table\n").unwrap();
+        // Make the fixture umask-independent: the loader rejects group/other
+        // writable files, so pin it to 0644 (the ambient umask may leave 0664
+        // under e.g. umask 002 and fail the boot for an unrelated reason).
+        std::fs::set_permissions(&empty_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let empty_str = empty_path.to_string_lossy();
         let config = GatewayConfig::parse(&mapping_pure_toml(&host_key, &empty_str)).unwrap();
         let ctx = GatewayContext::build(config)
@@ -3256,6 +3263,90 @@ mod tests {
                 Ok(ok_response())
             })
         }
+    }
+
+    #[tokio::test]
+    async fn mapping_preauth_probe_performs_no_resolve() {
+        // MUST1 (mirror of the OpenStack no-lookup test): in mapping mode the
+        // route is *not* ControlPlane, so `auth_publickey_offered` must skip the
+        // warm guard and touch neither the (absent) control plane nor the mapping
+        // client. The table is pure in-memory, so the whole probe is network-free.
+        let mut keys = TestKeyGuard::new();
+        let host_key = keys.add_key();
+        // A real one-entry table: the negative control must be able to resolve
+        // it, so the principal below exists in the file.
+        let mapping_path = std::env::temp_dir().join(format!(
+            "sshgw-mapping-{}-probe-{}.toml",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(
+            &mapping_path,
+            "[[entries]]\nusername = \"mapped_user\"\nhost = \"127.0.0.1\"\nport = 22\nuser = \"alex\"\n",
+        )
+        .unwrap();
+        // Pin 0644 so the fixture is umask-independent (the loader rejects
+        // group/other-writable files).
+        std::fs::set_permissions(&mapping_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mapping_str = mapping_path.to_string_lossy();
+        let config = GatewayConfig::parse(&mapping_pure_toml(&host_key, &mapping_str)).unwrap();
+
+        // The canary is injected into the *mapping* slot (the route under test),
+        // exactly as the OpenStack test injects it into the OpenStack slot: this
+        // makes "zero calls while probing" a real assertion, not a no-op.
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let canary = Arc::new(CountingResolve {
+            calls: Arc::clone(&calls),
+        });
+        let ctx = GatewayContext::build_with_clients(
+            config,
+            None,                                        // no [control_plane] in mapping mode
+            None,                                        // no [openstack]
+            Some(canary as Arc<dyn ControlPlaneClient>), // the mapping client
+        )
+        .expect("context");
+
+        // The route predicate must answer Mapping (the sole routing authority).
+        assert_eq!(
+            ctx.router.route("mapped_user"),
+            crate::resolve::ResolveRoute::Mapping,
+            "a table principal routes to the mapping table"
+        );
+
+        let mut rng = rand::rng();
+        let key =
+            russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+        let public = key.public_key();
+
+        let mut probe = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = probe
+            .auth_publickey_offered("mapped_user", public)
+            .await
+            .expect("offered never fails hard");
+        assert!(
+            matches!(auth, Auth::Accept),
+            "the probe itself must still be accepted"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "MUST1: zero resolver calls while only the route shape was checked"
+        );
+
+        // Negative control: the same principal *does* hit the mapping client
+        // once russh has verified a signature — proving the canary can see a
+        // call at all and that the real lookup happens after the probe.
+        let mut signed = GatewayServer::new(Arc::clone(&ctx)).new_client(None);
+        let auth = signed
+            .auth_publickey("mapped_user", public)
+            .await
+            .expect("auth");
+        assert!(matches!(auth, Auth::Accept));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the mapping lookup happens in auth_publickey, after the signature"
+        );
     }
 
     #[tokio::test]

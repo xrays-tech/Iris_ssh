@@ -292,7 +292,7 @@ user = "alice"              # 后端登录 user（默认同 username）
 **排障**
 | 症状 / 日志关键字 | 含义 | 处置 |
 |---|---|---|
-| `config error: mapping_file: …`（启动即拒） | 表加载失败：缺失/不可读/不可写/符号链接/越界/坏 TOML/重复 username/端口越界 | 修文件与权限（`stat`、`ls -l`），重启 |
+| `config error: mapping_file: …`（启动即拒） | 表加载失败：缺失/不可读/“group/other 可写”（权限过宽）/符号链接/越界/坏 TOML/重复 username/端口越界 | 修文件与权限（`stat`、`ls -l`），重启。注意：只读（如 `0444`）合法，拒绝的是 group/other 可写 |
 | `target=resolve` WARN，`reason="not_found"` | principal 不在表里（或含不可解析的 `@` 等） | 确认 `username` 在 `[[entries]]`；表外按设计拒绝，不是 bug |
 | `target=mapping` WARN：`the [mapping] table is empty` | 表为空，所有人被拒 | 填 `[[entries]]` 或临时关 `[mapping]` |
 | 表内但登录失败 | 后端 `authorized_keys` / `user` 不匹配 | 看 `user` 字段与后端 `authorized_keys` |

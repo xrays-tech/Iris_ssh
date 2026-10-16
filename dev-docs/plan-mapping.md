@@ -1,6 +1,6 @@
 # Development Plan: Simple Mapping Mode (username → target)
 
-Status: DRAFT (gate G2 pending @oracle review)
+Status: IMPLEMENTED (gates G1/G2/G3 passed; Phases 1-3 landed; Phase 4 verified)
 Design basis: dev-docs/design-mapping.md (G1 PASS, all 6 changes incorporated + post-review room wording fix)
 Repo conventions: doc plan names `plan-*.md`; commits merge as independent valid delivery boundaries.
 

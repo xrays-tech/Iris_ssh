@@ -1,6 +1,6 @@
 # Design: Simple Mapping Mode (username → target)
 
-Status: DRAFT (gate G1 pending @oracle review)
+Status: IMPLEMENTED (gates G1/G2/G3 passed; plan-mapping Phases 1-3 landed)
 Scope: ssh-gateway (Iris_ssh)
 
 ## 1. Problem / Goal
