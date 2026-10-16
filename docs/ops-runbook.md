@@ -67,6 +67,7 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 | | `outbound_guard` | `true` | per-channel Semaphore 背压保险丝 |
 | | `env_allowlist` | `[]` | 空=env 原样透传；非空=过滤变量名 |
 | `[backend]` | `host_key_policy` | `pinned` | `pinned` / `accept-new`；后端主机密钥信任策略 |
+| | `rsa_signature_hash` | `sha512` | `sha512` / `sha256`；RSA agent key 后端签名哈希（选 256 仅因个别极老 sshd 只认 `rsa-sha2-256`）。**恒为 rsa-sha2，绝不回退 SHA-1 `ssh-rsa`、不自动重试**（plan-openstack E.1/E.2，无兜底路径） |
 | | `private_key` / `credential_map` / `backend_auth` / `allow_agent_backend_auth` | — | **已删除**（agent-only 改造）。未知键按 TOML 解析为忽略，不会报错；写旧键的配置仍能启动，但**不再有任何效果** |
 | `[pool]` | `enabled` | `false` | **必须为 `false`**：`enabled = true` 是无条件的配置错误（启动即报错）。agent 穿透下每会话一个后端连接，没有可复用的东西；熔断/channel 上限与 `enabled` 无关，始终生效 |
 | | `channels_per_conn` | `8` | 每连接 ≤8（sshd MaxSessions 安全界） |
@@ -101,8 +102,8 @@ chmod 600 /etc/ssh-gw/host_*    # 权限不符 → 拒绝启动（fail-closed）
 
 ## 4. 认证
 
-- **客户端 → 网关**：公钥（`auth_publickey`）或用户证书（`auth_openssh_certificate`，按 CA / 有效期 / principals 校验）。`auth_publickey_offered` 仅为预热/形状预检，**不**在该阶段做最终 accept。恶意签名一律被 russh 库拒。
-- **网关 → 后端**：agent 穿透（§2.4 / §5.7）。网关以用户转发来的 ssh-agent 签名认证，且**只签控制面已授权的那个指纹**；网关自身不提供任何 key/cert 凭据。
+- **客户端 → 网关**：公钥（`auth_publickey`）或用户证书（`auth_openssh_certificate`，按 CA / 有效期 / principals 校验）。`auth_publickey_offered` 仅为预热/形状预检，**不**在该阶段做最终 accept。恶意签名一律被 russh 库拒。前腿只通告现代集：SHA-1 `ssh-rsa` 已从 server `preferred.key` 过滤（server-sig-algs 与 host-key offer 均不含），仅会用 `ssh-rsa` 的老客户端协商即被拒（plan-openstack E3，可单 commit 回退；见 known-limitations `#10`）。
+- **网关 → 后端**：agent 穿透（§2.4 / §5.7）。网关以用户转发来的 ssh-agent 签名认证，且**只签控制面已授权的那个指纹**；网关自身不提供任何 key/cert 凭据。RSA agent key 的签名哈希由 `[backend] rsa_signature_hash` 决定（默认 `sha512`，老 sshd 场景可切 `sha256`），从不签 SHA-1 `ssh-rsa`，后端拒绝即硬失败（`backend authentication as "<user>" failed`），不换弱算法重试（plan-openstack E.1/E.2）。
 - **目标来自哪里**：用户名只是一条**路由线索**，不是目标地址。启用 `[openstack]` 后规范形式的实例 UUID 走 Nova，其余源照旧走控制面（`routing="openstack_only"` 时非 UUID 直接拒绝、不回退）。目标 host 始终由 Nova 返回的地址决定，用户名里出现 host/IP 是不可能的（SSRF 红线）。预认证的 publickey 探测（`auth_publickey_offered`）在 OpenStack 路由上**只跑纯路由谓词、零网络调用**，真正的 Nova 查询发生在客户端完成签名校验之后（plan-openstack MUST1，用例 `case_openstack_preauth_no_lookup`）。
 
 ---
@@ -278,5 +279,6 @@ readinessProbe: { httpGet: { path: /readyz,  port: metrics }, periodSeconds: 5 }
   - `#4`：8h soak 未跑（`SOAK_DURATION=28800` 参数化，运维排窗）。
   - `#5`：HA 演练为 client-side readyz 近似；PuTTY/WinSCP 为算法集模拟。
   - `#9`：**OpenStack 实验室模式（方案 B）的边界** —— 授权语义、`match_image` 未实现、domain 字段已移除、缓存与 fail-open 的分工。
+  - `#10`：前腿 SHA-1 `ssh-rsa` 已禁用（E3）——仅会用 `ssh-rsa` 的老客户端无法协商；独立可回退 commit + 负例用例。
   - `#6`：offered 探测触发控制面 resolve（预热 miss，量级可接受）。
 - russh 上游限制（同算法 host key 轮换需 known_hosts 下发降级、`client::Handle` 非 Sync 限制跨会话池化）——按 §5.1/§5.3 与 known-limitations 处理。

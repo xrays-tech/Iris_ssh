@@ -45,6 +45,11 @@ env_allowlist = []      # empty = pass env through (M1); non-empty filters names
 # credential to fall back to.
 [backend]
 host_key_policy = "pinned"     # "pinned" (prod) | "accept-new" (onboarding)
+# RSA agent keys sign the backend publickey auth with rsa-sha2; choose the
+# hash for very old backends that only accept rsa-sha2-256 ("sha256").
+# SHA-1 `ssh-rsa` signatures are never produced — there is no fallback
+# path (plan-openstack E.1/E.2; red line: never downgrade).
+rsa_signature_hash = "sha512"  # "sha512" (default) | "sha256"
 
 # Opt-in connection pool. `enabled` must stay false: with one backend
 # connection per session (agent passthrough), cross-session reuse has nothing
