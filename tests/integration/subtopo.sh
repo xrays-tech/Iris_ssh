@@ -155,7 +155,12 @@ subtopo_start() {
   # gateway forwards; without an AcceptEnv line sshd drops it and the case would
   # be testing OpenSSH rather than the gateway. LANG/LC_* restated because sshd
   # only applies its built-in default while no AcceptEnv directive is present.
-  printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s\nStrictModes no\nUsePAM no\nMaxSessions 10\nAcceptEnv LANG LC_* SSHGW_AGENT_ENV\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
+  # The second ListenAddress (127.0.0.2, still this host's loopback) lets the
+  # appendix-D floating-only case publish a *distinct* floating address that is
+  # genuinely dialable — so it can prove which address was selected instead of
+  # relying on a companion refusal case. Every other case keeps dialing
+  # 127.0.0.1.
+  printf 'Port %s\nListenAddress 127.0.0.1\nListenAddress 127.0.0.2\nHostKey %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile %s\nStrictModes no\nUsePAM no\nMaxSessions 10\nAcceptEnv LANG LC_* SSHGW_AGENT_ENV\nPidFile %s/sshd.pid\nSubsystem sftp /usr/libexec/sftp-server\n' \
     "$ST_SSHD_PORT" "$SUBTOP_SSHD_HOSTKEY" "$SUBTOP_SSHD_AUTHORIZED_KEYS" "$SUBTOPO_DIR" \
     > "$SUBTOPO_DIR/sshd.cfg"
   # Backend presents a host certificate (M4-1).

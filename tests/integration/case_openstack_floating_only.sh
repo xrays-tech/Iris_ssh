@@ -7,12 +7,12 @@
 # deployment cannot reach it, and silently dialing it turns a misconfiguration
 # into a hang rather than a refusal.
 #
-# Both addresses are loopback, so the dial itself cannot distinguish them;
-# what is asserted is that a session *came up at all*. That is sufficient here
-# because the companion case (case_openstack_no_floating_rejected) proves the
-# filter is genuinely strict — with only a fixed address present the gateway
-# refuses rather than falling back — so a surviving session here means the
-# floating candidate was the one kept. The audit record names the target.
+# The two addresses are *distinct* loopbacks — fixed 127.0.0.1, floating
+# 127.0.0.2 — and the harness sshd listens on both (subtopo.sh), so this case
+# proves the selection by itself: the audit record's target_host must be the
+# floating address, which a fixed-address selection could never produce. The
+# companion case (case_openstack_no_floating_rejected) remains as extra
+# evidence that a fixed-only instance is refused rather than fallen back to.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
@@ -24,8 +24,9 @@ KEYDIR="$IT_WORK_DIR/os-keys-float"; mkdir -p "$KEYDIR"
 agent_topo_backend_keys "$KEYDIR/authorized_keys" "$IT_ASSET_DIR/user_ed25519.pub"
 
 RULES="$IT_WORK_DIR/os_rules_floating.json"
-# One instance, one network, two addresses of different kinds — the shape
-# appendix D exists for.
+# One instance, one network, two addresses of *different* loopback IPs — the
+# shape appendix D exists for, and one where the dial target itself reveals
+# which kind was kept.
 cat > "$RULES" <<'EOF'
 {
   "servers": {
@@ -33,7 +34,7 @@ cat > "$RULES" <<'EOF'
       "addresses": {
         "TEST-NET01": [
           {"addr": "127.0.0.1", "version": 4, "OS-EXT-IPS:type": "fixed"},
-          {"addr": "127.0.0.1", "version": 4, "OS-EXT-IPS:type": "floating"}
+          {"addr": "127.0.0.2", "version": 4, "OS-EXT-IPS:type": "floating"}
         ]
       },
       "metadata": {},
@@ -50,9 +51,9 @@ PRINCIPAL="550e8400-e29b-41d4-a716-446655440077"
 openstack_topo_start "$KEYDIR/authorized_keys" "$RULES"
 subtopo_agent_start "$IT_ASSET_DIR/user_ed25519"
 
-# Both candidates are 127.0.0.1, so the dial cannot tell them apart; the
-# session coming up at all is what matters, since the companion case proves
-# the filter refuses (rather than falls back) when only a fixed address exists.
+# fixed is 127.0.0.1 and floating is 127.0.0.2: the session coming up proves
+# the surviving candidate was dialable, and the audit record below proves it
+# was the *floating* one.
 run_capture subtopo_ssh_A 'printf FLOATING_ONLY_OK'
 if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q FLOATING_ONLY_OK; then
   pass "floating address selected and dialed under address_kind=floating"
@@ -64,7 +65,10 @@ fi
 
 if agent_topo_wait_for_audit "resolve_source"; then
   audit="$(agent_topo_audit_json)"
-  assert_contains "$audit" "\"target_host\":\"127.0.0.1\"" "audit names the dialed target"
+  # Self-contained proof of the kind filter: target_host must be the floating
+  # address. A selection that kept the fixed candidate would name 127.0.0.1
+  # and fail this assertion.
+  assert_contains "$audit" "\"target_host\":\"127.0.0.2\"" "audit names the floating target 127.0.0.2, not the fixed 127.0.0.1"
 else
   tail_log "$SUBTOPO_DIR/gw.log" 40
   fail "no audit record for the floating-only session"
