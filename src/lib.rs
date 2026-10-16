@@ -16,6 +16,7 @@ pub mod backend;
 pub mod ca;
 pub mod config;
 pub mod error;
+pub mod mapping;
 pub mod metrics;
 pub mod openstack;
 pub mod policy;

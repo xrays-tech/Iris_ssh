@@ -147,6 +147,9 @@ pub enum ResolveSource {
     /// Resolved from OpenStack Nova (instance UUID → IP); authorization is the
     /// gateway's own `allow_any_authenticated_key` lab mode (scheme B).
     OpenStack,
+    /// Resolved from the local mapping file (simple mapping mode); authorization
+    /// is the gateway's `allow_any_authenticated_key` lab mode (plan-mapping §5).
+    Mapping,
 }
 
 impl ResolveSource {
@@ -154,6 +157,7 @@ impl ResolveSource {
         match self {
             ResolveSource::ControlPlane => "control_plane",
             ResolveSource::OpenStack => "openstack",
+            ResolveSource::Mapping => "mapping",
         }
     }
 }
@@ -492,5 +496,7 @@ mod tests {
         assert_eq!(ResolveSource::ControlPlane.as_str(), "control_plane");
         assert_eq!(ResolveSource::OpenStack.as_str(), "openstack");
         assert_eq!(ResolveSource::OpenStack.to_string(), "openstack");
+        assert_eq!(ResolveSource::Mapping.as_str(), "mapping");
+        assert_eq!(ResolveSource::Mapping.to_string(), "mapping");
     }
 }
