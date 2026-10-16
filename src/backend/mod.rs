@@ -305,6 +305,15 @@ impl BackendDialer {
                 preferred.cipher = std::borrow::Cow::Owned(ciphers);
             }
         }
+        // Host-key hygiene for the client leg (plan-openstack E.3, "client 腿
+        // host-key 侧"): this list is what the gateway will *accept* from a
+        // backend host key. Backend host-key trust is pinned/fingerprint/CA —
+        // never a SHA-1 signature scheme — so keeping russh's default SHA-1
+        // `ssh-rsa` entry here only widens the negotiated wire surface with
+        // no benefit. Same filter as the front leg (E.3), one shared
+        // function: drop `Rsa { hash: None }`, keep everything else in order.
+        preferred.key =
+            std::borrow::Cow::Owned(crate::server::without_sha1_ssh_rsa(&preferred.key));
         let client_config = client::Config {
             preferred,
             window_size: config.relay.window_size,
@@ -475,8 +484,14 @@ impl BackendDialer {
             .map_err(|e| BackendError::Auth {
                 // The hash goes in the context, not as a retry: a backend that
                 // rejects rsa-sha2-512 fails here, loudly, rather than being
-                // retried with a weaker algorithm (red line 1).
-                user: format!("{} ({e}, rsa_hash={:?})", grant.target.user, hash_alg),
+                // retried with a weaker algorithm (red line 1). Only attach the
+                // hash field for RSA keys — for ed25519/ecdsa it would read
+                // `rsa_hash=None` and just add noise.
+                user: if let Some(hash) = hash_alg {
+                    format!("{} ({e}, rsa_hash={hash:?})", grant.target.user)
+                } else {
+                    format!("{} ({e})", grant.target.user)
+                },
             });
 
         self.settle_auth(&key, started, handle, &grant.target.user, outcome)
@@ -859,6 +874,35 @@ mod tests {
         assert_eq!(
             signature_hash_alg(&key, dialer.rsa_signature_hash),
             Some(HashAlg::Sha512)
+        );
+    }
+
+    /// E.3 client-leg hygiene: the backend dialer's *host-key* list — what it
+    /// will accept from a backend host key — must never offer SHA-1 `ssh-rsa`
+    /// (host-key trust is pinned/fingerprint/CA, never a SHA-1 signature
+    /// scheme). The modern entries survive untouched.
+    #[test]
+    fn client_leg_host_key_list_never_allows_sha1_ssh_rsa() {
+        let dialer = dialer_with_backend_toml("");
+        let key = &dialer.client_config.preferred.key;
+        assert!(
+            !key.iter()
+                .any(|a| matches!(a, russh::keys::Algorithm::Rsa { hash: None })),
+            "client leg must not negotiate SHA-1 ssh-rsa as a host-key scheme: {key:?}"
+        );
+        assert!(
+            key.iter().any(|a| matches!(
+                a,
+                russh::keys::Algorithm::Rsa {
+                    hash: Some(russh::keys::HashAlg::Sha512)
+                }
+            )),
+            "rsa-sha2-512 must survive the filter"
+        );
+        assert!(
+            key.iter()
+                .any(|a| matches!(a, russh::keys::Algorithm::Ed25519)),
+            "ed25519 must survive the filter"
         );
     }
 }

@@ -214,14 +214,17 @@ pub struct GatewayContext {
     pub server_config: Arc<ServerConfig>,
 }
 
-/// The front leg's key algorithms after the E.3 tightening: russh's default
-/// list minus the legacy SHA-1 `ssh-rsa` (`Rsa { hash: None }`). Every other
-/// entry — rsa-sha2-512, rsa-sha2-256, ed25519, ecdsa, sk-* — survives in
-/// order, so the only behaviour change is that a SHA-1 RSA signature can no
-/// longer be negotiated on the front leg. RSA remains reachable through
-/// rsa-sha2 only; the filter names no other algorithm, so a future non-RSA
-/// entry is kept by default (plan-openstack E.3, revertable as this commit).
-fn without_sha1_ssh_rsa(key: &[russh::keys::Algorithm]) -> Vec<russh::keys::Algorithm> {
+/// The modern key-algorithm list: russh's default minus the legacy SHA-1
+/// `ssh-rsa` (`Rsa { hash: None }`). Shared by **both legs** since the
+/// appendix-E client-leg review item: the server side filters it out of
+/// `ServerConfig.preferred.key` (front leg: no SHA-1 user signature, no
+/// SHA-1 host-key offer — plan-openstack E.3), and [`crate::backend`]'s
+/// dialer applies it to its `client::Config` host-key list (client leg:
+/// backend host-key trust is fingerprint/pinned/CA, never a SHA-1 signature
+/// scheme, so advertising one is pure hygiene debt). Every other entry —
+/// rsa-sha2-512, rsa-sha2-256, ed25519, ecdsa, sk-* — survives in order; the
+/// filter names no non-RSA algorithm, so future entries are kept by default.
+pub(crate) fn without_sha1_ssh_rsa(key: &[russh::keys::Algorithm]) -> Vec<russh::keys::Algorithm> {
     key.iter()
         .filter(|algo| !matches!(**algo, russh::keys::Algorithm::Rsa { hash: None }))
         .cloned()
